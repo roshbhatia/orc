@@ -1,5 +1,5 @@
 {
-  description = "Nix-first TypeScript CLI template";
+  description = "Effect-based control plane for agent harnesses";
 
   nixConfig = {
     extra-substituters = [ "https://nix-community.cachix.org" ];
@@ -35,7 +35,7 @@
           pkgs = pkgsFor.${system};
         in
         pkgs.writeShellApplication {
-          name = "ts-cli-template-format";
+          name = "orc-format";
           runtimeInputs = [
             pkgs.fd
             pkgs.nixfmt

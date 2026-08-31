@@ -1,26 +1,33 @@
 {
-  "name": "example",
+  "name": "@roshbhatia/orc",
   "version": "0.1.0",
+  "packageManager": "bun@1.3.14",
   "type": "module",
   "module": "src/main.ts",
   "bin": {
-    "example": "src/main.ts"
+    "orc": "src/main.ts"
   },
   "scripts": {
-    "build": "bun build src/main.ts --outdir dist --target bun --format esm",
+    "build": "bun build src/main.ts --outdir dist --target bun --format esm --packages external",
     "check": "bun run format:check && bun run typecheck && bun test",
     "format": "biome check --write .",
     "format:check": "biome check .",
     "nix:lock": "bunx bun2nix -o bun.nix",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsgo --noEmit"
   },
   "dependencies": {
     "@roshbhatia/ts-utils": "https://github.com/roshbhatia/ts-utils/archive/refs/tags/v0.1.0.tar.gz",
-    "effect": "3.22.1"
+    "@opentui/core": "0.4.5",
+    "@opentui/solid": "0.4.5",
+    "effect": "4.0.0-beta.83",
+    "solid-js": "1.9.12"
   },
   "devDependencies": {
+    "@tsconfig/bun": "1.0.9",
     "@types/bun": "1.3.13",
+    "@types/node": "24.12.2",
+    "@typescript/native-preview": "7.0.0-dev.20251207.1",
     "bun2nix": "2.1.2",
-    "typescript": "5.9.3"
+    "typescript": "5.8.2"
   }
 }

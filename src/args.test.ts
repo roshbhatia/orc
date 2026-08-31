@@ -3,17 +3,46 @@ import { Effect, Exit } from "effect";
 import { parseArgs } from "./args.ts";
 
 describe("parseArgs", () => {
-  test("parses JSON output", () => {
-    expect(Effect.runSync(parseArgs(["--json", "Roshan"]))).toEqual({
-      json: true,
-      name: "Roshan",
-      version: false,
+  test("opens the TUI by default", () => {
+    const command = Effect.runSync(parseArgs([]));
+    expect(command.tag).toBe("tui");
+  });
+
+  test("parses a session contract", () => {
+    expect(
+      Effect.runSync(
+        parseArgs([
+          "connect",
+          "--harness",
+          "codex",
+          "--role",
+          "researcher",
+          "--purpose",
+          "inspect storage",
+          "--goal",
+          "find migration risks",
+          "--expected-output",
+          "risk list",
+          "--completion",
+          "judge",
+        ]),
+      ),
+    ).toMatchObject({
+      completion: "judge",
+      expectedOutput: "risk list",
+      goal: "find migration risks",
+      harness: "codex",
+      purpose: "inspect storage",
+      role: "researcher",
+      tag: "connect",
     });
   });
 
-  test("rejects unknown options", () => {
-    expect(Exit.isFailure(Effect.runSyncExit(parseArgs(["--unknown"])))).toBe(
-      true,
-    );
+  test("rejects unknown roles", () => {
+    expect(
+      Exit.isFailure(
+        Effect.runSyncExit(parseArgs(["connect", "--role", "manager"])),
+      ),
+    ).toBe(true);
   });
 });

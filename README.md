@@ -1,23 +1,58 @@
-# ts-cli-template
+# Orc
 
-A Nix-first template for TypeScript command-line tools built with Bun and
-Effect.
+Orc is a local control plane for agent harnesses. It records session contracts,
+shows their tree, and opens native harness sessions through existing terminal
+tools.
 
-The example keeps stdout machine-readable, models argument failures as Effect
-errors, and consumes shared terminal vocabulary from `ts-utils`.
+Orc uses the same TypeScript stack as OpenCode: Bun, Effect, TypeScript Native
+Preview, Solid, and OpenTUI.
 
-## Start a project
+## Use Orc
 
-Create a repository from this template. Then replace the package and binary
-names.
+Open the dashboard for the current repository:
 
 ```bash
-rg -l 'example|ts-cli-template' | xargs sed -i '' -e 's/example/PROJECT/g' -e 's/ts-cli-template/PROJECT/g'
-bun install
-bun run nix:lock
+orc
 ```
 
-## Development
+Register an orchestrator session:
+
+```bash
+orc connect \
+  --harness codex \
+  --role orchestrator \
+  --purpose "Build Orc" \
+  --goal "Ship a usable local control plane" \
+  --expected-output "Passing checks and a tested TUI" \
+  --native-id "$CODEX_THREAD_ID"
+```
+
+Register a child session with `--parent <orc-session-id>`. Add `--zmx
+<session-name>` when ZMX owns the harness process.
+
+```bash
+orc status --json
+orc list --json
+orc attach <orc-session-id> --direction right
+orc traces <orc-session-id> --direction right
+orc disconnect <orc-session-id>
+```
+
+Orc becomes active when the first session connects. It becomes idle when the
+last active session disconnects. Orc does not require a broker process.
+
+## Dashboard keys
+
+```text
+j, down       select next session
+k, up         select previous session
+tab           switch Explorer and Runs
+enter         attach through ZMX in a WezTerm split
+t             open Traces in a WezTerm split
+q, escape     quit
+```
+
+## Develop Orc
 
 ```bash
 nix develop --accept-flake-config
@@ -25,13 +60,6 @@ bun install --frozen-lockfile
 bun run check
 nix build --accept-flake-config
 nix flake check --accept-flake-config
-```
-
-## Example
-
-```bash
-nix run . -- Roshan
-nix run . -- --json Roshan
 ```
 
 Run `bun run nix:lock` after a dependency change.

@@ -8,7 +8,7 @@
     }
   },
   "files": {
-    "includes": ["**", "!!dist", "!!bun.nix"]
+    "includes": ["**", "!!dist", "!!result", "!!bun.nix"]
   },
   "formatter": {
     "enabled": true,

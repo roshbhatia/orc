@@ -1,15 +1,20 @@
 {
   biome,
+  bun,
   bun2nix,
+  makeWrapper,
   stdenv,
 }:
-bun2nix.mkDerivation {
-  pname = "example";
+stdenv.mkDerivation {
+  pname = "orc";
   version = "0.1.0";
   src = ./.;
-  module = "src/main.ts";
 
-  nativeBuildInputs = [ biome ];
+  nativeBuildInputs = [
+    biome
+    bun2nix.hook
+    makeWrapper
+  ];
   bunDeps = bun2nix.fetchBunDeps { bunNix = ./bun.nix; };
   bunInstallFlags =
     if stdenv.hostPlatform.isDarwin then
@@ -21,6 +26,9 @@ bun2nix.mkDerivation {
       [ "--linker=hoisted" ];
 
   doCheck = true;
+  dontStrip = true;
+  dontUseBunBuild = true;
+  dontUseBunInstall = true;
   checkPhase = ''
     runHook preCheck
     biome check .
@@ -28,4 +36,16 @@ bun2nix.mkDerivation {
     bun test
     runHook postCheck
   '';
+
+  installPhase = ''
+    runHook preInstall
+    mkdir -p "$out/lib/orc" "$out/bin"
+    cp -R src node_modules package.json tsconfig.json "$out/lib/orc/"
+    makeWrapper ${bun}/bin/bun "$out/bin/orc" \
+      --add-flags "--preload $out/lib/orc/node_modules/@opentui/solid/scripts/preload.js" \
+      --add-flags "$out/lib/orc/src/main.ts"
+    runHook postInstall
+  '';
+
+  meta.mainProgram = "orc";
 }
