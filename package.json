@@ -16,7 +16,7 @@
     "typecheck": "tsgo --noEmit"
   },
   "dependencies": {
-    "@roshbhatia/ts-utils": "https://github.com/roshbhatia/ts-utils/archive/refs/tags/v0.1.0.tar.gz",
+    "@roshbhatia/ts-utils": "https://github.com/roshbhatia/ts-utils/archive/refs/tags/v0.2.0.tar.gz",
     "@opentui/core": "0.4.5",
     "@opentui/solid": "0.4.5",
     "effect": "4.0.0-beta.83",
