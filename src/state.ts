@@ -89,6 +89,7 @@ const migrateSession = (value: unknown, now: string): Session | null => {
     expectedOutput: stringValue(item, "expectedOutput", "A verified result"),
     goal: stringValue(item, "goal", "Complete the assigned work"),
     harness: stringValue(item, "harness", "unknown"),
+    model: nullableString(item, "model"),
     id,
     nativeId,
     nodeId: null,
@@ -130,12 +131,37 @@ const migrateV1 = (value: unknown): WorkspaceState | null => {
   };
 };
 
+const normalizeV2 = (value: unknown): unknown => {
+  const source = record(value);
+  if (source?.schemaVersion !== "orc.state/v2") return value;
+  const sessions = Array.isArray(source.sessions)
+    ? source.sessions.map((value) => {
+        const session = record(value);
+        return session ? { model: null, ...session } : value;
+      })
+    : [];
+  const runs = Array.isArray(source.runs)
+    ? source.runs.map((value) => {
+        const run = record(value);
+        if (!run) return value;
+        const nodes = Array.isArray(run.nodes)
+          ? run.nodes.map((value) => {
+              const node = record(value);
+              return node ? { model: null, ...node } : value;
+            })
+          : [];
+        return { agents: [], ...run, nodes };
+      })
+    : [];
+  return { ...source, runs, sessions };
+};
+
 const decodeState = (
   value: unknown,
 ): Effect.Effect<WorkspaceState, StateError> => {
   const migrated = migrateV1(value);
   return Schema.decodeUnknownEffect(WorkspaceStateSchema)(
-    migrated ?? value,
+    normalizeV2(migrated ?? value),
   ).pipe(
     Effect.mapError(
       (cause) =>

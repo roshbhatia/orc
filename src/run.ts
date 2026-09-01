@@ -9,6 +9,7 @@ import {
   launch,
   openTraces,
   readWorkspace,
+  setRunAgent,
   updateNodeStatus,
   updateRunStatus,
   updateSessionStatus,
@@ -40,6 +41,7 @@ usage:
   orc session current|list [--json]
   orc session update <id> --status <status>
   orc run create|list|show|update
+  orc run agent <run-id> --role <role> --harness <name> [--model <name>]
   orc node upsert|update
   orc launch <harness> [--zmx <name>] -- [args]
   orc attach|traces <session-id> [--direction <direction>]
@@ -47,7 +49,7 @@ usage:
   orc mcp
 
 contract options:
-  --harness <name>  --role <role>  --title <name>
+  --harness <name>  --model <name>  --role <role>  --title <name>
   --purpose <reason>  --goal <goal>  --expected-output <contract>
   --success <criterion>  --completion <orchestrator|judge>
   --review-by <node-id>  --parent <session-id>
@@ -151,6 +153,9 @@ const program = (
         return 0;
       case "run-create":
         streams.stdout(JSON.stringify(yield* createRun(command)));
+        return 0;
+      case "run-agent-set":
+        streams.stdout(JSON.stringify(yield* setRunAgent(command)));
         return 0;
       case "run-list": {
         const runs = runsByRecency((yield* readWorkspace(command.scope)).runs);

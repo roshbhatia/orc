@@ -8,6 +8,7 @@ const session = (id: string, updatedAt: string): Session => ({
   expectedOutput: "verified result",
   goal: "complete work",
   harness: "codex",
+  model: null,
   id,
   nativeId: id,
   nodeId: null,

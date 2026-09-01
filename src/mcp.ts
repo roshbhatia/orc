@@ -4,6 +4,7 @@ import {
   currentSession,
   readWorkspace,
   registerSession,
+  setRunAgent,
   updateNodeStatus,
   updateRunStatus,
   updateSessionStatus,
@@ -52,6 +53,7 @@ const tools: ReadonlyArray<ToolDefinition> = [
     inputSchema: objectSchema(
       {
         harness: { type: "string" },
+        model: { type: "string" },
         role: { type: "string" },
         title: { type: "string" },
         purpose: { type: "string" },
@@ -63,6 +65,19 @@ const tools: ReadonlyArray<ToolDefinition> = [
         nodeId: { type: "string" },
       },
       ["harness", "role", "goal"],
+    ),
+  },
+  {
+    name: "orc_run_agent_set",
+    description: "Set the harness and model used for one agent role in a run.",
+    inputSchema: objectSchema(
+      {
+        runId: { type: "string" },
+        role: { type: "string" },
+        harness: { type: "string" },
+        model: { type: "string" },
+      },
+      ["runId", "role", "harness"],
     ),
   },
   {
@@ -81,6 +96,8 @@ const tools: ReadonlyArray<ToolDefinition> = [
         name: { type: "string" },
         goal: { type: "string" },
         expectedOutput: { type: "string" },
+        harness: { type: "string" },
+        model: { type: "string" },
       },
       ["name", "goal", "expectedOutput"],
     ),
@@ -114,6 +131,7 @@ const tools: ReadonlyArray<ToolDefinition> = [
         purpose: { type: "string" },
         role: { type: "string" },
         harness: { type: "string" },
+        model: { type: "string" },
         goal: { type: "string" },
         expectedOutput: { type: "string" },
         successCriteria: { items: { type: "string" }, type: "array" },
@@ -217,6 +235,7 @@ const callTool = async (name: string, input: unknown): Promise<unknown> => {
             expectedOutput: string(args, "expectedOutput", "A verified result"),
             goal: string(args, "goal"),
             harness: string(args, "harness"),
+            model: string(args, "model") || undefined,
             hookInput: false,
             id: undefined,
             nativeId: undefined,
@@ -261,10 +280,25 @@ const callTool = async (name: string, input: unknown): Promise<unknown> => {
           createRun({
             expectedOutput: string(args, "expectedOutput"),
             goal: string(args, "goal"),
+            harness: string(args, "harness") || undefined,
+            model: string(args, "model") || undefined,
             name: string(args, "name"),
             orchestratorId: context.session.id,
             scope: context.scope,
             tag: "run-create",
+          }),
+        ),
+      );
+    case "orc_run_agent_set":
+      return toolResult(
+        await scoped(
+          setRunAgent({
+            harness: string(args, "harness"),
+            id: string(args, "runId"),
+            model: string(args, "model") || undefined,
+            role: role(args),
+            scope: context.scope,
+            tag: "run-agent-set",
           }),
         ),
       );
@@ -301,8 +335,9 @@ const callTool = async (name: string, input: unknown): Promise<unknown> => {
             dependsOn: strings(args, "dependsOn"),
             expectedOutput: string(args, "expectedOutput"),
             goal: string(args, "goal"),
-            harness: string(args, "harness", "unknown"),
+            harness: string(args, "harness"),
             id: string(args, "id"),
+            model: string(args, "model") || undefined,
             purpose: string(args, "purpose", string(args, "name")),
             reviewBy: string(args, "reviewBy") || undefined,
             role: role(args),

@@ -49,7 +49,7 @@ const sessionRows = (state: WorkspaceState): ReadonlyArray<Row> =>
       kind: "session",
       session,
       status: session.status,
-      subtitle: `${session.role} · ${session.harness}`,
+      subtitle: `${session.role} · ${session.harness}${session.model ? ` · ${session.model}` : ""}`,
       title: session.title,
     }));
 
@@ -81,7 +81,7 @@ const runRows = (state: WorkspaceState): ReadonlyArray<Row> =>
             }
           : {}),
         status: node.status,
-        subtitle: `${node.role} · ${node.harness}`,
+        subtitle: `${node.role} · ${node.harness}${node.model ? ` · ${node.model}` : ""}`,
         title: node.name,
       })),
     ]);
@@ -159,6 +159,12 @@ const details = (row: Row | undefined): string => {
       `goal             ${row.run.goal}`,
       `expected output  ${row.run.expectedOutput}`,
       `stages           ${row.run.nodes.length}`,
+      "",
+      "agent defaults",
+      ...row.run.agents.map(
+        (agent) =>
+          `${agent.role.padEnd(16)} ${agent.harness}${agent.model ? ` · ${agent.model}` : ""}`,
+      ),
       `run              ${row.run.id}`,
     ].join("\n");
   }
@@ -171,6 +177,8 @@ const details = (row: Row | undefined): string => {
         node.name,
         "",
         `role             ${node.role}`,
+        `harness          ${node.harness}`,
+        `model            ${node.model ?? "default"}`,
         `status           ${node.status}`,
         `purpose          ${node.purpose}`,
         `goal             ${node.goal}`,
@@ -188,6 +196,7 @@ const details = (row: Row | undefined): string => {
         "",
         `role             ${session.role}`,
         `harness          ${session.harness}`,
+        `model            ${session.model ?? "default"}`,
         `status           ${session.status}`,
         `purpose          ${session.purpose}`,
         `goal             ${session.goal}`,

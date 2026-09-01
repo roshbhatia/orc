@@ -15,6 +15,18 @@ export const SessionRoleSchema = Schema.Literals([
 
 export type SessionRole = typeof SessionRoleSchema.Type;
 
+export const agentRoles: ReadonlyArray<SessionRole> = [
+  "planner",
+  "researcher",
+  "implementer",
+  "critic",
+  "judge",
+  "verifier",
+  "operator",
+  "generalist",
+  "worker",
+];
+
 export const LifecycleStatusSchema = Schema.Literals([
   "queued",
   "working",
@@ -35,11 +47,20 @@ export const CompletionTargetSchema = Schema.Literals([
 
 export type CompletionTarget = typeof CompletionTargetSchema.Type;
 
+export const AgentConfigSchema = Schema.Struct({
+  role: SessionRoleSchema,
+  harness: Schema.String,
+  model: Schema.NullOr(Schema.String),
+});
+
+export type AgentConfig = typeof AgentConfigSchema.Type;
+
 export const SessionSchema = Schema.Struct({
   id: Schema.String,
   nativeId: Schema.String,
   traceId: Schema.NullOr(Schema.String),
   harness: Schema.String,
+  model: Schema.NullOr(Schema.String),
   role: SessionRoleSchema,
   title: Schema.String,
   purpose: Schema.String,
@@ -67,6 +88,7 @@ export const WorkflowNodeSchema = Schema.Struct({
   purpose: Schema.String,
   role: SessionRoleSchema,
   harness: Schema.String,
+  model: Schema.NullOr(Schema.String),
   goal: Schema.String,
   expectedOutput: Schema.String,
   successCriteria: Schema.Array(Schema.String),
@@ -95,6 +117,7 @@ export const WorkflowRunSchema = Schema.Struct({
   expectedOutput: Schema.String,
   status: LifecycleStatusSchema,
   orchestratorId: Schema.NullOr(Schema.String),
+  agents: Schema.Array(AgentConfigSchema),
   nodes: Schema.Array(WorkflowNodeSchema),
   edges: Schema.Array(WorkflowEdgeSchema),
   createdAt: Schema.String,

@@ -2,6 +2,7 @@ import { Effect } from "effect";
 import type { Command, Direction } from "./args.ts";
 import {
   activeSessions,
+  agentRoles,
   type Session,
   type WorkflowNode,
   type WorkflowRun,
@@ -85,6 +86,7 @@ const upsertSession = (
         expectedOutput: command.expectedOutput,
         goal: command.goal,
         harness: command.harness,
+        model: command.model ?? current?.model ?? null,
         id: current?.id ?? id,
         nativeId,
         nodeId:
@@ -230,7 +232,16 @@ export const createRun = (
   Effect.gen(function* () {
     const resolved = yield* resolveScope(command.scope);
     const now = new Date().toISOString();
+    const state = yield* resolved.store.read(resolved.scope);
+    const orchestratorId =
+      command.orchestratorId ?? currentSession(state)?.id ?? null;
+    const orchestrator = orchestratorId
+      ? state.sessions.find((session) => session.id === orchestratorId)
+      : undefined;
+    const harness = command.harness ?? orchestrator?.harness ?? "unknown";
+    const model = command.model ?? orchestrator?.model ?? null;
     const run: WorkflowRun = {
+      agents: agentRoles.map((role) => ({ harness, model, role })),
       createdAt: now,
       edges: [],
       expectedOutput: command.expectedOutput,
@@ -238,10 +249,7 @@ export const createRun = (
       id: generatedId("run"),
       name: command.name,
       nodes: [],
-      orchestratorId:
-        command.orchestratorId ??
-        currentSession(yield* resolved.store.read(resolved.scope))?.id ??
-        null,
+      orchestratorId,
       status: "working",
       updatedAt: now,
     };
@@ -253,6 +261,22 @@ export const createRun = (
     }));
     return run;
   });
+
+export const setRunAgent = (
+  command: Extract<Command, { readonly tag: "run-agent-set" }>,
+): Effect.Effect<WorkflowRun, StateError, StateStoreService> =>
+  updateRun(command.scope, command.id, (run) => ({
+    ...run,
+    agents: [
+      {
+        harness: command.harness,
+        model: command.model ?? null,
+        role: command.role,
+      },
+      ...run.agents.filter((agent) => agent.role !== command.role),
+    ],
+    updatedAt: new Date().toISOString(),
+  }));
 
 const updateRun = (
   scope: string,
@@ -286,40 +310,57 @@ export const updateRunStatus = (
 
 export const upsertNode = (
   command: Extract<Command, { readonly tag: "node-upsert" }>,
-): Effect.Effect<WorkflowNode, StateError, StateStoreService> => {
-  const now = new Date().toISOString();
-  const node: WorkflowNode = {
-    attempt: command.attempt,
-    completion: command.completion,
-    expectedOutput: command.expectedOutput,
-    goal: command.goal,
-    harness: command.harness,
-    id: command.id,
-    name: command.title,
-    purpose: command.purpose,
-    reviewBy: command.reviewBy ?? null,
-    role: command.role,
-    sessionId: command.sessionId ?? null,
-    status: command.status,
-    successCriteria: command.successCriteria,
-    updatedAt: now,
-  };
-  return updateRun(command.scope, command.runId, (run) => ({
-    ...run,
-    edges: [
-      ...run.edges.filter(
-        (edge) => edge.to !== node.id || edge.relationship !== "depends-on",
-      ),
-      ...command.dependsOn.map((dependency) => ({
-        from: dependency,
-        relationship: "depends-on",
-        to: node.id,
-      })),
-    ],
-    nodes: [node, ...run.nodes.filter((candidate) => candidate.id !== node.id)],
-    updatedAt: now,
-  })).pipe(Effect.map(() => node));
-};
+): Effect.Effect<WorkflowNode, StateError, StateStoreService> =>
+  Effect.gen(function* () {
+    const now = new Date().toISOString();
+    let node: WorkflowNode | undefined;
+    yield* updateRun(command.scope, command.runId, (run) => {
+      const agent = run.agents.find(
+        (candidate) => candidate.role === command.role,
+      );
+      node = {
+        attempt: command.attempt,
+        completion: command.completion,
+        expectedOutput: command.expectedOutput,
+        goal: command.goal,
+        harness: command.harness || agent?.harness || "unknown",
+        id: command.id,
+        model: command.model ?? agent?.model ?? null,
+        name: command.title,
+        purpose: command.purpose,
+        reviewBy: command.reviewBy ?? null,
+        role: command.role,
+        sessionId: command.sessionId ?? null,
+        status: command.status,
+        successCriteria: command.successCriteria,
+        updatedAt: now,
+      };
+      return {
+        ...run,
+        edges: [
+          ...run.edges.filter(
+            (edge) =>
+              edge.to !== node?.id || edge.relationship !== "depends-on",
+          ),
+          ...command.dependsOn.map((dependency) => ({
+            from: dependency,
+            relationship: "depends-on",
+            to: node?.id ?? command.id,
+          })),
+        ],
+        nodes: [
+          node,
+          ...run.nodes.filter((candidate) => candidate.id !== node?.id),
+        ],
+        updatedAt: now,
+      };
+    });
+    if (!node)
+      return yield* new StateError({
+        message: "upsert node produced no result",
+      });
+    return node;
+  });
 
 export const updateNodeStatus = (
   command: Extract<Command, { readonly tag: "node-update" }>,
@@ -425,6 +466,7 @@ export const launch = (
       expectedOutput: "A verified result",
       goal: `Run ${command.harness}`,
       harness: command.harness,
+      model: command.model,
       hookInput: false,
       id: sessionId,
       nativeId,
@@ -461,6 +503,7 @@ export const launch = (
           env: {
             ...process.env,
             ORC_AGENT: command.harness,
+            ...(command.model ? { ORC_MODEL: command.model } : {}),
             ORC_NATIVE_SESSION_ID: nativeId,
             ...(current ? { ORC_PARENT_SESSION_ID: current.id } : {}),
             ORC_SCOPE: resolved.scope,

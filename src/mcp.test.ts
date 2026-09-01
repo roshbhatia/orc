@@ -47,6 +47,7 @@ describe("MCP", () => {
           expectedOutput: "verified result",
           goal: "test MCP gating",
           harness: "codex",
+          model: undefined,
           id: "orc-test",
           nativeId: "native-test",
           parentId: undefined,

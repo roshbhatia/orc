@@ -9,6 +9,7 @@ export type Direction = "right" | "left" | "top" | "bottom";
 
 interface ContractOptions {
   readonly harness: string;
+  readonly model: string | undefined;
   readonly role: SessionRole;
   readonly title: string;
   readonly purpose: string;
@@ -71,6 +72,16 @@ export type Command =
       readonly goal: string;
       readonly expectedOutput: string;
       readonly orchestratorId: string | undefined;
+      readonly harness: string | undefined;
+      readonly model: string | undefined;
+    }
+  | {
+      readonly tag: "run-agent-set";
+      readonly scope: string;
+      readonly id: string;
+      readonly role: SessionRole;
+      readonly harness: string;
+      readonly model: string | undefined;
     }
   | {
       readonly tag: "run-list";
@@ -122,6 +133,7 @@ export type Command =
       readonly tag: "launch";
       readonly scope: string;
       readonly harness: string;
+      readonly model: string | undefined;
       readonly zmxSession: string | undefined;
       readonly args: ReadonlyArray<string>;
     };
@@ -264,6 +276,7 @@ const parseDirection = (
 
 const contractOptions = new Set([
   "--harness",
+  "--model",
   "--role",
   "--title",
   "--purpose",
@@ -276,6 +289,7 @@ const contractOptions = new Set([
 
 const parseContract = (
   options: ParsedOptions,
+  defaultHarness = "unknown",
 ): Effect.Effect<ContractOptions, ArgumentError> =>
   Effect.gen(function* () {
     const role = yield* parseRole(one(options, "--role") ?? "worker");
@@ -285,7 +299,8 @@ const parseContract = (
       completion,
       expectedOutput: one(options, "--expected-output") ?? "A verified result",
       goal: one(options, "--goal") ?? "Complete the assigned work",
-      harness: one(options, "--harness") ?? "unknown",
+      harness: one(options, "--harness") ?? defaultHarness,
+      model: one(options, "--model"),
       purpose,
       reviewBy: one(options, "--review-by"),
       role,
@@ -405,17 +420,49 @@ const parseRun = (
     if (subcommand === "create") {
       const options = yield* parseOptions(
         args,
-        new Set(["--name", "--goal", "--expected-output", "--orchestrator"]),
+        new Set([
+          "--name",
+          "--goal",
+          "--expected-output",
+          "--orchestrator",
+          "--harness",
+          "--model",
+        ]),
       );
       const goal = one(options, "--goal") ?? "Complete the workflow";
       return {
         expectedOutput:
           one(options, "--expected-output") ?? "A verified result",
         goal,
+        harness: one(options, "--harness"),
+        model: one(options, "--model"),
         name: one(options, "--name") ?? goal,
         orchestratorId: one(options, "--orchestrator"),
         scope: options.scope,
         tag: "run-create",
+      };
+    }
+    if (subcommand === "agent") {
+      const options = yield* parseOptions(
+        args,
+        new Set(["--role", "--harness", "--model"]),
+      );
+      const id = yield* requireOne(
+        options.positionals,
+        "run agent requires one run id",
+      );
+      const harness = one(options, "--harness");
+      if (!harness)
+        return yield* new ArgumentError({
+          message: "run agent requires --harness",
+        });
+      return {
+        harness,
+        id,
+        model: one(options, "--model"),
+        role: yield* parseRole(one(options, "--role") ?? "worker"),
+        scope: options.scope,
+        tag: "run-agent-set",
       };
     }
     return yield* new ArgumentError({
@@ -478,7 +525,7 @@ const parseNode = (
         message: "--attempt must be a non-negative integer",
       });
     return {
-      ...(yield* parseContract(options)),
+      ...(yield* parseContract(options, "")),
       attempt,
       dependsOn: options.values["--depends-on"] ?? [],
       id,
@@ -561,7 +608,7 @@ export const parseArgs = (
       };
     }
     if (name === "launch") {
-      const options = yield* parseOptions(rest, new Set(["--zmx"]));
+      const options = yield* parseOptions(rest, new Set(["--zmx", "--model"]));
       const harness = yield* requireOne(
         options.positionals,
         "launch requires one harness command",
@@ -569,6 +616,7 @@ export const parseArgs = (
       return {
         args: options.remainder,
         harness,
+        model: one(options, "--model"),
         scope: options.scope,
         tag: "launch",
         zmxSession: one(options, "--zmx"),

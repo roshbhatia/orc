@@ -113,6 +113,10 @@ describe("run", () => {
               "Verify parity",
               "--expected-output",
               "A released CLI",
+              "--harness",
+              "codex",
+              "--model",
+              "gpt-5.6",
             ],
             created.streams,
             "test",
@@ -120,6 +124,29 @@ describe("run", () => {
         ),
       ).toBe(0);
       const runId = JSON.parse(created.stdout[0] ?? "").id as string;
+
+      const configured = capture();
+      expect(
+        await Effect.runPromise(
+          run(
+            [
+              "run",
+              "agent",
+              runId,
+              "--scope",
+              directory,
+              "--role",
+              "researcher",
+              "--harness",
+              "claude",
+              "--model",
+              "opus",
+            ],
+            configured.streams,
+            "test",
+          ),
+        ),
+      ).toBe(0);
 
       const node = capture();
       expect(
@@ -166,11 +193,17 @@ describe("run", () => {
         goal: "Verify parity",
         nodes: [
           {
+            harness: "codex",
             id: "implement",
+            model: "gpt-5.6",
             role: "implementer",
             successCriteria: ["MCP tools are gated"],
           },
         ],
+        agents: expect.arrayContaining([
+          { harness: "codex", model: "gpt-5.6", role: "implementer" },
+          { harness: "claude", model: "opus", role: "researcher" },
+        ]),
       });
     } finally {
       if (previousStateHome === undefined) {
