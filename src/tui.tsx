@@ -1,203 +1,344 @@
 import { basename } from "node:path";
 import { createCliRenderer } from "@opentui/core";
 import { render, useKeyboard, useRenderer } from "@opentui/solid";
-import { defaultPalette } from "@roshbhatia/ts-utils";
-import { createMemo, createSignal } from "solid-js";
-import type { Session, WorkspaceState } from "./domain.ts";
+import { defaultPalette, type Key, spinnerFrames } from "@roshbhatia/ts-utils";
+import { createMemo, createSignal, onCleanup, onMount } from "solid-js";
+import type {
+  LifecycleStatus,
+  Session,
+  WorkflowRun,
+  WorkspaceState,
+} from "./domain.ts";
+import { fullKeyHelp, keyHelp, tuiActionFor } from "./keymap.ts";
 
-type Tab = "explorer" | "runs";
+type Tab = "explorer" | "runs" | "sessions";
+type DetailTab = "details" | "session" | "changes";
 
-const statusMark = (session: Session): string => {
-  switch (session.status) {
-    case "working":
-      return "*";
-    case "waiting":
-      return "o";
-    case "blocked":
-      return "!";
-    case "failed":
-      return "x";
-    case "done":
-      return "+";
-    case "disconnected":
-      return "-";
-  }
-};
+interface Row {
+  readonly id: string;
+  readonly kind: "run" | "node" | "session";
+  readonly depth: number;
+  readonly title: string;
+  readonly subtitle: string;
+  readonly goal: string;
+  readonly status: LifecycleStatus;
+  readonly session?: Session;
+  readonly run?: WorkflowRun;
+}
 
 const truncate = (value: string, width: number): string =>
   value.length <= width ? value : `${value.slice(0, Math.max(0, width - 1))}…`;
 
-const orderedTree = (state: WorkspaceState): ReadonlyArray<Session> => {
-  const ids = new Set(state.sessions.map((session) => session.id));
-  const recent = [...state.sessions].sort((left, right) =>
-    right.updatedAt.localeCompare(left.updatedAt),
+const statusMark = (status: LifecycleStatus, frame: number): string => {
+  if (status === "working")
+    return spinnerFrames[frame % spinnerFrames.length] ?? "|";
+  if (status === "done") return "+";
+  if (status === "failed") return "x";
+  if (status === "blocked") return "!";
+  if (status === "waiting" || status === "queued") return "o";
+  return "-";
+};
+
+const sessionRows = (state: WorkspaceState): ReadonlyArray<Row> =>
+  [...state.sessions]
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+    .map((session) => ({
+      depth: 0,
+      goal: session.goal,
+      id: session.id,
+      kind: "session",
+      session,
+      status: session.status,
+      subtitle: `${session.role} · ${session.harness}`,
+      title: session.title,
+    }));
+
+const runRows = (state: WorkspaceState): ReadonlyArray<Row> =>
+  [...state.runs]
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+    .flatMap((run) => [
+      {
+        depth: 0,
+        goal: run.goal,
+        id: run.id,
+        kind: "run" as const,
+        run,
+        status: run.status,
+        subtitle: `${run.nodes.length} stages`,
+        title: run.name,
+      },
+      ...run.nodes.map((node) => ({
+        depth: 1,
+        goal: node.goal,
+        id: `${run.id}:${node.id}`,
+        kind: "node" as const,
+        run,
+        ...(state.sessions.find((session) => session.id === node.sessionId)
+          ? {
+              session: state.sessions.find(
+                (session) => session.id === node.sessionId,
+              ) as Session,
+            }
+          : {}),
+        status: node.status,
+        subtitle: `${node.role} · ${node.harness}`,
+        title: node.name,
+      })),
+    ]);
+
+const explorerRows = (state: WorkspaceState): ReadonlyArray<Row> => {
+  const sessions = sessionRows(state);
+  const orchestrators = sessions.filter(
+    (row) => row.session?.role === "orchestrator",
   );
-  const roots = recent.filter(
-    (session) => !session.parentId || !ids.has(session.parentId),
+  const children = sessions.filter(
+    (row) => row.session?.role !== "orchestrator",
   );
-  const ordered: Array<Session> = [];
-  const seen = new Set<string>();
-  const visit = (session: Session): void => {
-    if (seen.has(session.id)) {
-      return;
-    }
-    seen.add(session.id);
-    ordered.push(session);
-    for (const child of recent.filter(
-      (candidate) => candidate.parentId === session.id,
+  const rows: Array<Row> = [];
+  for (const root of orchestrators) {
+    rows.push(root);
+    for (const run of runRows(state).filter(
+      (row) => row.kind === "run" && row.run?.orchestratorId === root.id,
     )) {
-      visit(child);
+      rows.push({ ...run, depth: 1 });
+      for (const node of runRows(state).filter(
+        (row) => row.kind === "node" && row.run?.id === run.run?.id,
+      )) {
+        rows.push({ ...node, depth: 2 });
+      }
     }
-  };
-  for (const root of roots) {
-    visit(root);
+    for (const child of children.filter(
+      (row) => row.session?.parentId === root.id && !row.session?.runId,
+    )) {
+      rows.push({ ...child, depth: 1 });
+    }
   }
-  for (const session of recent) {
-    visit(session);
+  for (const row of sessions) {
+    if (
+      !rows.some((candidate) => candidate.id === row.id) &&
+      !row.session?.runId
+    )
+      rows.push(row);
   }
-  return ordered;
+  return rows;
 };
 
-const depthOf = (
-  session: Session,
-  sessions: ReadonlyArray<Session>,
-): number => {
-  const byId = new Map(sessions.map((candidate) => [candidate.id, candidate]));
-  const seen = new Set<string>();
-  let depth = 0;
-  let parentId = session.parentId;
-  while (parentId && !seen.has(parentId)) {
-    seen.add(parentId);
-    const parent = byId.get(parentId);
-    if (!parent) {
-      break;
-    }
-    depth++;
-    parentId = parent.parentId;
-  }
-  return depth;
-};
+const rowsFor = (state: WorkspaceState, tab: Tab): ReadonlyArray<Row> =>
+  tab === "runs"
+    ? runRows(state)
+    : tab === "sessions"
+      ? sessionRows(state)
+      : explorerRows(state);
 
-const explorerText = (
-  state: WorkspaceState,
-  sessions: ReadonlyArray<Session>,
+const listText = (
+  rows: ReadonlyArray<Row>,
   selected: number,
-): string => {
-  if (sessions.length === 0) {
+  frame: number,
+): string =>
+  rows.length === 0
+    ? "No records."
+    : rows
+        .map((row, index) => {
+          const indent = "  ".repeat(row.depth);
+          const branch = row.depth > 0 ? "└─ " : "";
+          const cursor = index === selected ? ">" : " ";
+          return [
+            `${cursor} ${indent}${branch}${statusMark(row.status, frame)} ${truncate(row.title, 66)}  ${row.status}`,
+            `  ${indent}   ${truncate(row.subtitle, 54)}  ${truncate(row.goal, 76)}`,
+          ].join("\n");
+        })
+        .join("\n");
+
+const details = (row: Row | undefined): string => {
+  if (!row) return "Select a record.";
+  if (row.kind === "run" && row.run) {
     return [
-      "No sessions are registered.",
+      row.run.name,
       "",
-      "Run orc connect from an agent session.",
+      `status           ${row.run.status}`,
+      `goal             ${row.run.goal}`,
+      `expected output  ${row.run.expectedOutput}`,
+      `stages           ${row.run.nodes.length}`,
+      `run              ${row.run.id}`,
     ].join("\n");
   }
-  return sessions
-    .map((session, index) => {
-      const depth = depthOf(session, state.sessions);
-      const cursor = index === selected ? ">" : " ";
-      const branch = depth > 0 ? `${"  ".repeat(depth - 1)}+- ` : "";
+  if (row.kind === "node" && row.run) {
+    const node = row.run.nodes.find(
+      (candidate) => `${row.run?.id}:${candidate.id}` === row.id,
+    );
+    if (node)
       return [
-        `${cursor} ${branch}${statusMark(session)} ${truncate(session.purpose, 42)}`,
-        `  ${"  ".repeat(depth)}${session.role} · ${session.harness} · ${session.status}`,
-        `  ${"  ".repeat(depth)}goal: ${truncate(session.goal, 64)}`,
+        node.name,
+        "",
+        `role             ${node.role}`,
+        `status           ${node.status}`,
+        `purpose          ${node.purpose}`,
+        `goal             ${node.goal}`,
+        `expected output  ${node.expectedOutput}`,
+        `success          ${node.successCriteria.join("; ") || "unspecified"}`,
+        `completion       ${node.completion}`,
+        `review by        ${node.reviewBy ?? "orchestrator"}`,
+        `session          ${node.sessionId ?? "unassigned"}`,
       ].join("\n");
-    })
-    .join("\n\n");
-};
-
-const runsText = (
-  sessions: ReadonlyArray<Session>,
-  selected: number,
-): string => {
-  if (sessions.length === 0) {
-    return "No active pipeline nodes.";
   }
-  return sessions
-    .map((session, index) => {
-      const cursor = index === selected ? ">" : " ";
-      return [
-        `${cursor} ${statusMark(session)} ${truncate(session.goal, 64)}`,
-        `  ${session.role} · returns to ${session.completion}`,
-      ].join("\n");
-    })
-    .join("\n\n");
-};
-
-const detailsText = (session: Session | undefined): string => {
-  if (!session) {
-    return "Select a session to inspect its contract.";
-  }
-  return [
-    session.purpose,
-    "",
-    `role             ${session.role}`,
-    `harness          ${session.harness}`,
-    `status           ${session.status}`,
-    `goal             ${session.goal}`,
-    `expected output  ${session.expectedOutput}`,
-    `completion       ${session.completion}`,
-    `native session   ${session.nativeId}`,
-    `orc session      ${session.id}`,
-    `parent           ${session.parentId ?? "root"}`,
-    `zmx              ${session.zmxSession ?? "unavailable"}`,
-  ].join("\n");
+  const session = row.session;
+  return session
+    ? [
+        session.title,
+        "",
+        `role             ${session.role}`,
+        `harness          ${session.harness}`,
+        `status           ${session.status}`,
+        `purpose          ${session.purpose}`,
+        `goal             ${session.goal}`,
+        `expected output  ${session.expectedOutput}`,
+        `success          ${session.successCriteria.join("; ") || "unspecified"}`,
+        `completion       ${session.completion}`,
+        `native session   ${session.nativeId}`,
+        `orc session      ${session.id}`,
+        `parent           ${session.parentId ?? "root"}`,
+        `zmx              ${session.zmxSession ?? "unavailable"}`,
+      ].join("\n")
+    : "Select a record.";
 };
 
 export interface TuiActions {
+  readonly read: () => Promise<WorkspaceState>;
   readonly attach: (session: Session) => Promise<void>;
   readonly traces: (session: Session) => Promise<void>;
+  readonly changes: () => Promise<string>;
 }
 
 interface AppProps {
-  readonly state: WorkspaceState;
+  readonly initialState: WorkspaceState;
   readonly actions: TuiActions;
 }
 
+const tabs: ReadonlyArray<Tab> = ["explorer", "runs", "sessions"];
+const detailTabs: ReadonlyArray<DetailTab> = ["details", "session", "changes"];
+
 const App = (props: AppProps) => {
   const renderer = useRenderer();
-  const sessions = createMemo(() => orderedTree(props.state));
+  const [state, setState] = createSignal(props.initialState);
   const [tab, setTab] = createSignal<Tab>("explorer");
+  const [detailTab, setDetailTab] = createSignal<DetailTab>("details");
   const [selected, setSelected] = createSignal(0);
-  const [footer, setFooter] = createSignal(
-    "j/k select  enter attach  t traces  tab view  q quit",
+  const [frame, setFrame] = createSignal(0);
+  const [scroll, setScroll] = createSignal(0);
+  const [changes, setChanges] = createSignal(
+    "Load workspace changes from the changes action.",
   );
-  const current = createMemo(() => sessions()[selected()]);
+  const [message, setMessage] = createSignal("");
+  const [showHelp, setShowHelp] = createSignal(false);
+  const rows = createMemo(() => rowsFor(state(), tab()));
+  const current = createMemo(
+    () => rows()[Math.min(selected(), Math.max(0, rows().length - 1))],
+  );
+
+  const refresh = async (): Promise<void> => {
+    try {
+      setState(await props.actions.read());
+      setSelected((value) => Math.min(value, Math.max(0, rows().length - 1)));
+    } catch (cause) {
+      setMessage(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  onMount(() => {
+    const refreshTimer = setInterval(() => void refresh(), 1000);
+    const spinnerTimer = setInterval(() => setFrame((value) => value + 1), 120);
+    onCleanup(() => {
+      clearInterval(refreshTimer);
+      clearInterval(spinnerTimer);
+    });
+  });
 
   const perform = async (
-    label: string,
+    name: string,
     action: (session: Session) => Promise<void>,
   ): Promise<void> => {
-    const session = current();
+    const session = current()?.session;
     if (!session) {
+      setMessage("Select a session.");
       return;
     }
-    setFooter(`${label} ${session.purpose}`);
     try {
       await action(session);
-      setFooter(`${label} opened for ${session.purpose}`);
+      setMessage(`${name}: ${session.title}`);
     } catch (cause) {
-      setFooter(cause instanceof Error ? cause.message : String(cause));
+      setMessage(cause instanceof Error ? cause.message : String(cause));
     }
   };
 
   useKeyboard((key) => {
-    const count = sessions().length;
-    if (key.name === "q" || key.name === "escape") {
-      renderer.destroy();
-    } else if (key.name === "tab") {
-      setTab((value) => (value === "explorer" ? "runs" : "explorer"));
-    } else if (key.name === "j" || key.name === "down") {
-      if (count > 0) {
-        setSelected((value) => (value + 1) % count);
-      }
-    } else if (key.name === "k" || key.name === "up") {
-      if (count > 0) {
-        setSelected((value) => (value - 1 + count) % count);
-      }
-    } else if (key.name === "return") {
-      void perform("attach", props.actions.attach);
-    } else if (key.name === "t") {
-      void perform("traces", props.actions.traces);
+    const action = tuiActionFor(key as Key);
+    const count = rows().length;
+    if (showHelp() && action !== "help" && action !== "quit") {
+      setShowHelp(false);
+      return;
     }
+    if (action === "quit") renderer.destroy();
+    else if (action === "help") setShowHelp((value) => !value);
+    else if (action === "next" && count > 0)
+      setSelected((value) => (value + 1) % count);
+    else if (action === "previous" && count > 0)
+      setSelected((value) => (value - 1 + count) % count);
+    else if (action === "tab-next" || action === "tab-previous") {
+      const delta = action === "tab-next" ? 1 : -1;
+      setTab(
+        (value) =>
+          tabs[(tabs.indexOf(value) + delta + tabs.length) % tabs.length] ??
+          "explorer",
+      );
+      setSelected(0);
+    } else if (action === "left" || action === "right") {
+      const delta = action === "right" ? 1 : -1;
+      setDetailTab(
+        (value) =>
+          detailTabs[
+            (detailTabs.indexOf(value) + delta + detailTabs.length) %
+              detailTabs.length
+          ] ?? "details",
+      );
+      setScroll(0);
+    } else if (action === "page-up")
+      setScroll((value) => Math.max(0, value - 8));
+    else if (action === "page-down") setScroll((value) => value + 8);
+    else if (action === "refresh") void refresh();
+    else if (action === "open") {
+      const row = current();
+      if (row?.kind === "run") setTab("runs");
+      else void perform("attach", props.actions.attach);
+    } else if (action === "traces")
+      void perform("traces", props.actions.traces);
+    else if (action === "changes") {
+      setDetailTab("changes");
+      void props.actions
+        .changes()
+        .then(setChanges)
+        .catch((cause: unknown) =>
+          setMessage(cause instanceof Error ? cause.message : String(cause)),
+        );
+    }
+  });
+
+  const detailText = createMemo(() => {
+    if (showHelp()) return ["Keys", "", ...fullKeyHelp()].join("\n");
+    if (detailTab() === "changes") return changes();
+    if (detailTab() === "session") {
+      const session = current()?.session;
+      return session
+        ? [
+            `${session.title} · ${session.status}`,
+            "",
+            session.goal,
+            "",
+            `Open Traces for the full transcript.`,
+            `Attach through ZMX to interact.`,
+          ].join("\n")
+        : "Select a session.";
+    }
+    return details(current());
   });
 
   return (
@@ -207,38 +348,54 @@ const App = (props: AppProps) => {
       height="100%"
       width="100%"
     >
-      <text fg={defaultPalette.accent} height={1}>
-        {`orc  ${basename(props.state.scope)}  ${props.state.sessions.length} sessions  ${props.state.active ? "active" : "idle"}`}
-      </text>
+      <text
+        fg={defaultPalette.accent}
+        height={1}
+      >{`orc  ${basename(state().scope)}  ${state().active ? "active" : "idle"}  ${state().sessions.length} sessions`}</text>
       <text fg={defaultPalette.text} height={1}>
-        {tab() === "explorer" ? "[explorer]  runs" : " explorer  [runs]"}
+        {tabs
+          .map((value) => (value === tab() ? `[${value}]` : value))
+          .join("  ")}
       </text>
-      <box flexDirection="row" flexGrow={1} gap={1}>
-        <box
-          border
-          borderColor={defaultPalette.border}
-          flexGrow={1}
-          padding={1}
-          title={tab()}
-        >
-          <text fg={defaultPalette.text}>
-            {tab() === "explorer"
-              ? explorerText(props.state, sessions(), selected())
-              : runsText(sessions(), selected())}
-          </text>
-        </box>
-        <box
-          border
-          borderColor={defaultPalette.border}
-          padding={1}
-          title="details"
-          width="38%"
-        >
-          <text fg={defaultPalette.text}>{detailsText(current())}</text>
-        </box>
+      <box
+        border
+        borderColor={defaultPalette.border}
+        flexGrow={1}
+        padding={1}
+        title={tab()}
+      >
+        <text fg={defaultPalette.text}>
+          {listText(rows(), selected(), frame())}
+        </text>
       </box>
-      <text fg={defaultPalette.muted} height={1}>
-        {footer()}
+      <box
+        border
+        borderColor={defaultPalette.border}
+        height="36%"
+        padding={1}
+        title={detailTabs
+          .map((value) => (value === detailTab() ? `[${value}]` : value))
+          .join("  ")}
+      >
+        <text fg={defaultPalette.text}>
+          {detailText().split("\n").slice(scroll()).join("\n")}
+        </text>
+      </box>
+      <text
+        fg={message() ? defaultPalette.warning : defaultPalette.muted}
+        height={1}
+      >
+        {message() ||
+          keyHelp([
+            "next",
+            "previous",
+            "open",
+            "traces",
+            "changes",
+            "tab-next",
+            "help",
+            "quit",
+          ])}
       </text>
     </box>
   );
@@ -256,6 +413,6 @@ export const openTui = async (
   const destroyed = new Promise<void>((resolve) =>
     renderer.once("destroy", resolve),
   );
-  await render(() => <App actions={actions} state={state} />, renderer);
+  await render(() => <App actions={actions} initialState={state} />, renderer);
   await destroyed;
 };

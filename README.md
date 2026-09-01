@@ -41,16 +41,8 @@ orc disconnect <orc-session-id>
 Orc becomes active when the first session connects. It becomes idle when the
 last active session disconnects. Orc does not require a broker process.
 
-## Dashboard keys
-
-```text
-j, down       select next session
-k, up         select previous session
-tab           switch Explorer and Runs
-enter         attach through ZMX in a WezTerm split
-t             open Traces in a WezTerm split
-q, escape     quit
-```
+The dashboard generates its footer and help view from the same bindings that
+handle input. A binding change updates both views.
 
 ## Develop Orc
 

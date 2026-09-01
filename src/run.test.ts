@@ -92,4 +92,93 @@ describe("run", () => {
       await rm(directory, { force: true, recursive: true });
     }
   });
+
+  test("creates a workflow graph with contracts", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "orc-graph-test-"));
+    const previousStateHome = process.env.XDG_STATE_HOME;
+    process.env.XDG_STATE_HOME = directory;
+    try {
+      const created = capture();
+      expect(
+        await Effect.runPromise(
+          run(
+            [
+              "run",
+              "create",
+              "--scope",
+              directory,
+              "--name",
+              "Ship Orc",
+              "--goal",
+              "Verify parity",
+              "--expected-output",
+              "A released CLI",
+            ],
+            created.streams,
+            "test",
+          ),
+        ),
+      ).toBe(0);
+      const runId = JSON.parse(created.stdout[0] ?? "").id as string;
+
+      const node = capture();
+      expect(
+        await Effect.runPromise(
+          run(
+            [
+              "node",
+              "upsert",
+              "implement",
+              "--scope",
+              directory,
+              "--run",
+              runId,
+              "--title",
+              "Implement parity",
+              "--role",
+              "implementer",
+              "--goal",
+              "Match the control API",
+              "--expected-output",
+              "Passing tests",
+              "--success",
+              "MCP tools are gated",
+              "--status",
+              "working",
+            ],
+            node.streams,
+            "test",
+          ),
+        ),
+      ).toBe(0);
+
+      const shown = capture();
+      expect(
+        await Effect.runPromise(
+          run(
+            ["run", "show", runId, "--scope", directory, "--json"],
+            shown.streams,
+            "test",
+          ),
+        ),
+      ).toBe(0);
+      expect(JSON.parse(shown.stdout[0] ?? "")).toMatchObject({
+        goal: "Verify parity",
+        nodes: [
+          {
+            id: "implement",
+            role: "implementer",
+            successCriteria: ["MCP tools are gated"],
+          },
+        ],
+      });
+    } finally {
+      if (previousStateHome === undefined) {
+        delete process.env.XDG_STATE_HOME;
+      } else {
+        process.env.XDG_STATE_HOME = previousStateHome;
+      }
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
 });

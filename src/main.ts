@@ -1,7 +1,7 @@
 import { Effect } from "effect";
 import { run } from "./run.ts";
 
-const version = "0.1.0";
+const version = "0.2.0";
 
 const streams = {
   stderr: (value: string) => console.error(value),

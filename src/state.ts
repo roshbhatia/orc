@@ -1,8 +1,16 @@
-import { mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { Context, Data, Effect, Layer, Schema } from "effect";
 import {
   emptyWorkspace,
+  type Session,
   type WorkspaceState,
   WorkspaceStateSchema,
 } from "./domain.ts";
@@ -18,6 +26,10 @@ export interface StateStoreService {
   ) => Effect.Effect<string, StateError>;
   readonly read: (scope: string) => Effect.Effect<WorkspaceState, StateError>;
   readonly write: (state: WorkspaceState) => Effect.Effect<void, StateError>;
+  readonly update: (
+    scope: string,
+    transform: (state: WorkspaceState) => WorkspaceState,
+  ) => Effect.Effect<WorkspaceState, StateError>;
 }
 
 export const StateStore = Context.Service<StateStoreService>(
@@ -30,10 +42,9 @@ const stateRoot = (): string => {
     return join(configured, "orc");
   }
   const home = process.env.HOME;
-  if (!home) {
-    return join(process.cwd(), ".orc-state");
-  }
-  return join(home, ".local", "state", "orc");
+  return home
+    ? join(home, ".local", "state", "orc")
+    : join(process.cwd(), ".orc-state");
 };
 
 const scopeKey = (scope: string): string => {
@@ -45,18 +56,96 @@ const scopeKey = (scope: string): string => {
 export const statePath = (scope: string): string =>
   join(stateRoot(), `${scopeKey(scope)}.json`);
 
+const record = (value: unknown): Readonly<Record<string, unknown>> | null =>
+  typeof value === "object" && value !== null
+    ? (value as Readonly<Record<string, unknown>>)
+    : null;
+
+const stringValue = (
+  value: Readonly<Record<string, unknown>>,
+  name: string,
+  fallback: string,
+): string => (typeof value[name] === "string" ? value[name] : fallback);
+
+const nullableString = (
+  value: Readonly<Record<string, unknown>>,
+  name: string,
+): string | null => (typeof value[name] === "string" ? value[name] : null);
+
+const migrateSession = (value: unknown, now: string): Session | null => {
+  const item = record(value);
+  if (!item) {
+    return null;
+  }
+  const id = stringValue(item, "id", "");
+  if (!id) {
+    return null;
+  }
+  const nativeId = stringValue(item, "nativeId", id);
+  return {
+    completion: "orchestrator",
+    connectedAt: stringValue(item, "connectedAt", now),
+    directory: stringValue(item, "directory", ""),
+    expectedOutput: stringValue(item, "expectedOutput", "A verified result"),
+    goal: stringValue(item, "goal", "Complete the assigned work"),
+    harness: stringValue(item, "harness", "unknown"),
+    id,
+    nativeId,
+    nodeId: null,
+    parentId: nullableString(item, "parentId"),
+    purpose: stringValue(item, "purpose", "Agent session"),
+    registration: "connected",
+    reviewBy: null,
+    role: item.role === "orchestrator" ? "orchestrator" : "worker",
+    runId: null,
+    status: item.status === "disconnected" ? "disconnected" : "working",
+    successCriteria: [],
+    title: stringValue(item, "purpose", id),
+    traceId: nativeId,
+    updatedAt: stringValue(item, "updatedAt", now),
+    zmxSession: nullableString(item, "zmxSession"),
+  };
+};
+
+const migrateV1 = (value: unknown): WorkspaceState | null => {
+  const source = record(value);
+  if (source?.schemaVersion !== "orc.state/v1") {
+    return null;
+  }
+  const scope = stringValue(source, "scope", "");
+  const now = stringValue(source, "updatedAt", new Date().toISOString());
+  const sessions = Array.isArray(source.sessions)
+    ? source.sessions.flatMap((item) => {
+        const session = migrateSession(item, now);
+        return session ? [session] : [];
+      })
+    : [];
+  return {
+    active: source.active === true,
+    runs: [],
+    schemaVersion: "orc.state/v2",
+    scope,
+    sessions,
+    updatedAt: now,
+  };
+};
+
 const decodeState = (
   value: unknown,
-): Effect.Effect<WorkspaceState, StateError> =>
-  Schema.decodeUnknownEffect(WorkspaceStateSchema)(value).pipe(
+): Effect.Effect<WorkspaceState, StateError> => {
+  const migrated = migrateV1(value);
+  return Schema.decodeUnknownEffect(WorkspaceStateSchema)(
+    migrated ?? value,
+  ).pipe(
     Effect.mapError(
       (cause) =>
         new StateError({
-          message: "state file does not match orc.state/v1",
+          message: "state file does not match orc.state/v2",
           cause,
         }),
     ),
   );
+};
 
 const resolveScope = (directory: string): Effect.Effect<string, StateError> =>
   Effect.tryPromise({
@@ -65,8 +154,8 @@ const resolveScope = (directory: string): Effect.Effect<string, StateError> =>
       new StateError({ message: `resolve scope: ${directory}`, cause }),
   });
 
-const isMissingFile = (cause: unknown): boolean =>
-  cause instanceof Error && "code" in cause && cause.code === "ENOENT";
+const isCode = (cause: unknown, code: string): boolean =>
+  cause instanceof Error && "code" in cause && cause.code === code;
 
 const read = (scope: string): Effect.Effect<WorkspaceState, StateError> =>
   Effect.tryPromise({
@@ -82,7 +171,7 @@ const read = (scope: string): Effect.Effect<WorkspaceState, StateError> =>
     ),
     Effect.flatMap(decodeState),
     Effect.catch((cause) => {
-      if (isMissingFile(cause)) {
+      if (isCode(cause, "ENOENT")) {
         return Effect.succeed(emptyWorkspace(scope));
       }
       return Effect.fail(
@@ -93,23 +182,65 @@ const read = (scope: string): Effect.Effect<WorkspaceState, StateError> =>
     }),
   );
 
+const writeFileAtomic = async (state: WorkspaceState): Promise<void> => {
+  const target = statePath(state.scope);
+  const temporary = `${target}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+  await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, {
+    mode: 0o600,
+  });
+  await rename(temporary, target);
+};
+
 const write = (state: WorkspaceState): Effect.Effect<void, StateError> =>
   Effect.tryPromise({
-    try: async () => {
-      const target = statePath(state.scope);
-      const temporary = `${target}.${process.pid}.tmp`;
-      await mkdir(dirname(target), { recursive: true, mode: 0o700 });
-      await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, {
-        mode: 0o600,
-      });
-      await rename(temporary, target);
-    },
+    try: () => writeFileAtomic(state),
     catch: (cause) =>
       new StateError({ message: "write workspace state", cause }),
+  });
+
+const acquireLock = async (target: string): Promise<void> => {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try {
+      await mkdir(target, { mode: 0o700 });
+      return;
+    } catch (cause) {
+      if (!isCode(cause, "EEXIST")) {
+        throw cause;
+      }
+      await Bun.sleep(10);
+    }
+  }
+  throw new Error(`timed out waiting for state lock: ${target}`);
+};
+
+const update = (
+  scope: string,
+  transform: (state: WorkspaceState) => WorkspaceState,
+): Effect.Effect<WorkspaceState, StateError> =>
+  Effect.tryPromise({
+    try: async () => {
+      const lock = `${statePath(scope)}.lock`;
+      await mkdir(dirname(lock), { recursive: true, mode: 0o700 });
+      await acquireLock(lock);
+      try {
+        const current = await Effect.runPromise(read(scope));
+        const next = transform(current);
+        await writeFileAtomic(next);
+        return next;
+      } finally {
+        await rm(lock, { force: true, recursive: true });
+      }
+    },
+    catch: (cause) =>
+      cause instanceof StateError
+        ? cause
+        : new StateError({ message: "update workspace state", cause }),
   });
 
 export const StateStoreLive = Layer.succeed(StateStore, {
   read,
   resolveScope,
+  update,
   write,
 });

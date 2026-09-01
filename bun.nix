@@ -569,9 +569,9 @@
     url = "https://registry.npmjs.org/supports-preserve-symlinks-flag/-/supports-preserve-symlinks-flag-1.0.0.tgz";
     hash = "sha512-ot0WnXS9fgdkgIcePe6RHNk1WA8+muPa6cSjeR3V8K27q9BB1rTE3R1p7Hv0z1ZyAc8s6Vvv8DIyWf681MAt0w==";
   };
-  "tarball:https://github.com/roshbhatia/ts-utils/archive/refs/tags/v0.2.0.tar.gz" = builtins.fetchTarball {
-    url = "https://github.com/roshbhatia/ts-utils/archive/refs/tags/v0.2.0.tar.gz";
-    sha256 = "sha256-05SG8xGZpYpo8yjTYwUerB/97TDOOu2B+9xhwVwdQ80=";
+  "tarball:https://github.com/roshbhatia/ts-utils/archive/refs/tags/v0.3.0.tar.gz" = builtins.fetchTarball {
+    url = "https://github.com/roshbhatia/ts-utils/archive/refs/tags/v0.3.0.tar.gz";
+    sha256 = "sha256-7P3sAtoHzAHmD8WOqU/TBOjO7WKtbJyDlo7PGg74mK0=";
   };
   "toml@4.3.0" = fetchurl {
     url = "https://registry.npmjs.org/toml/-/toml-4.3.0.tgz";

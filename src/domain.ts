@@ -5,57 +5,122 @@ export const SessionRoleSchema = Schema.Literals([
   "planner",
   "researcher",
   "implementer",
+  "critic",
   "judge",
+  "verifier",
+  "operator",
+  "generalist",
   "worker",
 ] as const);
 
 export type SessionRole = typeof SessionRoleSchema.Type;
 
-export const SessionStatusSchema = Schema.Literals([
+export const LifecycleStatusSchema = Schema.Literals([
+  "queued",
   "working",
   "waiting",
   "blocked",
   "failed",
   "done",
+  "cancelled",
   "disconnected",
 ] as const);
 
-export type SessionStatus = typeof SessionStatusSchema.Type;
+export type LifecycleStatus = typeof LifecycleStatusSchema.Type;
+
+export const CompletionTargetSchema = Schema.Literals([
+  "orchestrator",
+  "judge",
+] as const);
+
+export type CompletionTarget = typeof CompletionTargetSchema.Type;
 
 export const SessionSchema = Schema.Struct({
   id: Schema.String,
   nativeId: Schema.String,
+  traceId: Schema.NullOr(Schema.String),
   harness: Schema.String,
   role: SessionRoleSchema,
+  title: Schema.String,
   purpose: Schema.String,
   goal: Schema.String,
   expectedOutput: Schema.String,
-  completion: Schema.Literals(["orchestrator", "judge"] as const),
+  successCriteria: Schema.Array(Schema.String),
+  completion: CompletionTargetSchema,
+  reviewBy: Schema.NullOr(Schema.String),
   parentId: Schema.NullOr(Schema.String),
+  runId: Schema.NullOr(Schema.String),
+  nodeId: Schema.NullOr(Schema.String),
   zmxSession: Schema.NullOr(Schema.String),
-  status: SessionStatusSchema,
+  directory: Schema.String,
+  registration: Schema.Literals(["connected", "hook", "managed"] as const),
+  status: LifecycleStatusSchema,
   connectedAt: Schema.String,
   updatedAt: Schema.String,
 });
 
 export type Session = typeof SessionSchema.Type;
 
+export const WorkflowNodeSchema = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  purpose: Schema.String,
+  role: SessionRoleSchema,
+  harness: Schema.String,
+  goal: Schema.String,
+  expectedOutput: Schema.String,
+  successCriteria: Schema.Array(Schema.String),
+  completion: CompletionTargetSchema,
+  reviewBy: Schema.NullOr(Schema.String),
+  sessionId: Schema.NullOr(Schema.String),
+  status: LifecycleStatusSchema,
+  attempt: Schema.Number,
+  updatedAt: Schema.String,
+});
+
+export type WorkflowNode = typeof WorkflowNodeSchema.Type;
+
+export const WorkflowEdgeSchema = Schema.Struct({
+  from: Schema.String,
+  to: Schema.String,
+  relationship: Schema.String,
+});
+
+export type WorkflowEdge = typeof WorkflowEdgeSchema.Type;
+
+export const WorkflowRunSchema = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  goal: Schema.String,
+  expectedOutput: Schema.String,
+  status: LifecycleStatusSchema,
+  orchestratorId: Schema.NullOr(Schema.String),
+  nodes: Schema.Array(WorkflowNodeSchema),
+  edges: Schema.Array(WorkflowEdgeSchema),
+  createdAt: Schema.String,
+  updatedAt: Schema.String,
+});
+
+export type WorkflowRun = typeof WorkflowRunSchema.Type;
+
 export const WorkspaceStateSchema = Schema.Struct({
-  schemaVersion: Schema.Literal("orc.state/v1"),
+  schemaVersion: Schema.Literal("orc.state/v2"),
   scope: Schema.String,
   active: Schema.Boolean,
   updatedAt: Schema.String,
   sessions: Schema.Array(SessionSchema),
+  runs: Schema.Array(WorkflowRunSchema),
 });
 
 export type WorkspaceState = typeof WorkspaceStateSchema.Type;
 
 export const emptyWorkspace = (scope: string): WorkspaceState => ({
-  schemaVersion: "orc.state/v1",
+  schemaVersion: "orc.state/v2",
   scope,
   active: false,
   updatedAt: new Date(0).toISOString(),
   sessions: [],
+  runs: [],
 });
 
 export const activeSessions = (state: WorkspaceState): ReadonlyArray<Session> =>
@@ -63,6 +128,7 @@ export const activeSessions = (state: WorkspaceState): ReadonlyArray<Session> =>
     (session) =>
       session.status !== "done" &&
       session.status !== "failed" &&
+      session.status !== "cancelled" &&
       session.status !== "disconnected",
   );
 
@@ -70,5 +136,12 @@ export const sessionsByRecency = (
   sessions: ReadonlyArray<Session>,
 ): ReadonlyArray<Session> =>
   [...sessions].sort((left, right) =>
+    right.updatedAt.localeCompare(left.updatedAt),
+  );
+
+export const runsByRecency = (
+  runs: ReadonlyArray<WorkflowRun>,
+): ReadonlyArray<WorkflowRun> =>
+  [...runs].sort((left, right) =>
     right.updatedAt.localeCompare(left.updatedAt),
   );
