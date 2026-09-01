@@ -23,7 +23,7 @@ const session = (id: string, updatedAt: string): Session => ({
   title: id,
   traceId: id,
   updatedAt,
-  zmxSession: null,
+  providerRef: null,
 });
 
 describe("sessionsByRecency", () => {

@@ -259,7 +259,7 @@ const callTool = async (name: string, input: unknown): Promise<unknown> => {
               "title",
               string(args, "purpose", "Agent session"),
             ),
-            zmxSession: undefined,
+            providerRef: undefined,
           }),
         ),
       );

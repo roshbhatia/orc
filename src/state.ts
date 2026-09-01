@@ -104,7 +104,8 @@ const migrateSession = (value: unknown, now: string): Session | null => {
     title: stringValue(item, "purpose", id),
     traceId: nativeId,
     updatedAt: stringValue(item, "updatedAt", now),
-    zmxSession: nullableString(item, "zmxSession"),
+    providerRef:
+      nullableString(item, "providerRef") ?? nullableString(item, "zmxSession"),
   };
 };
 
@@ -137,7 +138,13 @@ const normalizeV2 = (value: unknown): unknown => {
   const sessions = Array.isArray(source.sessions)
     ? source.sessions.map((value) => {
         const session = record(value);
-        return session ? { model: null, ...session } : value;
+        return session
+          ? {
+              model: null,
+              providerRef: nullableString(session, "zmxSession"),
+              ...session,
+            }
+          : value;
       })
     : [];
   const runs = Array.isArray(source.runs)

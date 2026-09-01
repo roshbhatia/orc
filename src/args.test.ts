@@ -45,4 +45,33 @@ describe("parseArgs", () => {
       ),
     ).toBe(true);
   });
+
+  test("parses provider actions without host tool vocabulary", () => {
+    expect(
+      Effect.runSync(
+        parseArgs([
+          "launch",
+          "codex",
+          "--managed",
+          "agent-session",
+          "--",
+          "--resume",
+        ]),
+      ),
+    ).toMatchObject({
+      args: ["--resume"],
+      harness: "codex",
+      managedId: "agent-session",
+      tag: "launch",
+    });
+    expect(
+      Effect.runSync(
+        parseArgs(["inspect", "session-id", "--direction", "left"]),
+      ),
+    ).toMatchObject({
+      direction: "left",
+      id: "session-id",
+      tag: "inspect",
+    });
+  });
 });

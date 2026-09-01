@@ -6,8 +6,8 @@ import {
   createRun,
   currentSession,
   disconnect,
+  inspectSession,
   launch,
-  openTraces,
   readWorkspace,
   setRunAgent,
   updateNodeStatus,
@@ -23,6 +23,7 @@ import {
 } from "./domain.ts";
 import { registerFromHook } from "./hook.ts";
 import { runMcp } from "./mcp.ts";
+import { providerOutput } from "./provider.ts";
 import { StateError, StateStoreLive } from "./state.ts";
 import { openTui } from "./tui.tsx";
 
@@ -43,8 +44,8 @@ usage:
   orc run create|list|show|update
   orc run agent <run-id> --role <role> --harness <name> [--model <name>]
   orc node upsert|update
-  orc launch <harness> [--zmx <name>] -- [args]
-  orc attach|traces <session-id> [--direction <direction>]
+  orc launch <harness> [--managed <id>] -- [args]
+  orc attach|inspect <session-id> [--direction <direction>]
   orc disconnect [session-id]
   orc mcp
 
@@ -52,7 +53,7 @@ contract options:
   --harness <name>  --model <name>  --role <role>  --title <name>
   --purpose <reason>  --goal <goal>  --expected-output <contract>
   --success <criterion>  --completion <orchestrator|judge>
-  --review-by <node-id>  --parent <session-id>
+  --review-by <node-id>  --parent <session-id>  --provider-ref <id>
 
 Orc activates with the first registered session and idles after the last disconnect.`;
 
@@ -63,23 +64,6 @@ const displayList = (state: WorkspaceState): string =>
         `${session.id}\t${session.status}\t${session.role}\t${session.title}`,
     )
     .join("\n");
-
-const changesOutput = async (scope: string): Promise<string> => {
-  const child = Bun.spawn(
-    ["changes", "-r", "-root", scope, "-color", "always"],
-    {
-      cwd: scope,
-      stderr: "pipe",
-      stdout: "pipe",
-    },
-  );
-  const stdout = await new Response(child.stdout).text();
-  const stderr = await new Response(child.stderr).text();
-  const code = await child.exited;
-  if (code !== 0)
-    throw new Error(stderr.trim() || `changes exited with code ${code}`);
-  return stdout.trim() || "No workspace changes.";
-};
 
 const program = (
   args: ReadonlyArray<string>,
@@ -197,8 +181,8 @@ const program = (
       case "attach":
         yield* attach(command);
         return 0;
-      case "traces":
-        yield* openTraces(command);
+      case "inspect":
+        yield* inspectSession(command);
         return 0;
       case "tui": {
         const state = yield* readWorkspace(command.scope);
@@ -214,20 +198,27 @@ const program = (
                     tag: "attach",
                   }).pipe(Effect.provide(StateStoreLive)),
                 ),
-              changes: () => changesOutput(state.scope),
+              changes: () =>
+                Effect.runPromise(
+                  providerOutput({
+                    action: "changes",
+                    scope: state.scope,
+                    version: "orc.provider/v1",
+                  }),
+                ),
               read: () =>
                 Effect.runPromise(
                   readWorkspace(state.scope).pipe(
                     Effect.provide(StateStoreLive),
                   ),
                 ),
-              traces: (session) =>
+              inspect: (session) =>
                 Effect.runPromise(
-                  openTraces({
+                  inspectSession({
                     direction: "right",
                     id: session.id,
                     scope: state.scope,
-                    tag: "traces",
+                    tag: "inspect",
                   }).pipe(Effect.provide(StateStoreLive)),
                 ),
             }),

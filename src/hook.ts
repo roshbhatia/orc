@@ -82,7 +82,7 @@ export const registerFromHook = (
         parentId: command.parentId ?? process.env.ORC_PARENT_SESSION_ID,
         role,
         title: context.title ?? command.title,
-        zmxSession: command.zmxSession ?? process.env.ORC_ZMX_SESSION,
+        providerRef: command.providerRef ?? process.env.ORC_PROVIDER_REF,
       },
       {
         directory,

@@ -7,7 +7,7 @@
 }:
 stdenv.mkDerivation {
   pname = "orc";
-  version = "0.2.0";
+  version = "0.3.0";
   src = ./.;
 
   nativeBuildInputs = [
@@ -33,7 +33,7 @@ stdenv.mkDerivation {
     runHook preCheck
     biome check .
     bun run typecheck
-    bun test
+    bun test --path-ignore-patterns 'result/**'
     runHook postCheck
   '';
 

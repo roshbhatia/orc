@@ -72,7 +72,7 @@ export const SessionSchema = Schema.Struct({
   parentId: Schema.NullOr(Schema.String),
   runId: Schema.NullOr(Schema.String),
   nodeId: Schema.NullOr(Schema.String),
-  zmxSession: Schema.NullOr(Schema.String),
+  providerRef: Schema.NullOr(Schema.String),
   directory: Schema.String,
   registration: Schema.Literals(["connected", "hook", "managed"] as const),
   status: LifecycleStatusSchema,

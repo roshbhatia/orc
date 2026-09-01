@@ -206,7 +206,7 @@ const details = (row: Row | undefined): string => {
         `native session   ${session.nativeId}`,
         `orc session      ${session.id}`,
         `parent           ${session.parentId ?? "root"}`,
-        `zmx              ${session.zmxSession ?? "unavailable"}`,
+        `provider ref     ${session.providerRef ?? "unavailable"}`,
       ].join("\n")
     : "Select a record.";
 };
@@ -214,7 +214,7 @@ const details = (row: Row | undefined): string => {
 export interface TuiActions {
   readonly read: () => Promise<WorkspaceState>;
   readonly attach: (session: Session) => Promise<void>;
-  readonly traces: (session: Session) => Promise<void>;
+  readonly inspect: (session: Session) => Promise<void>;
   readonly changes: () => Promise<string>;
 }
 
@@ -318,8 +318,8 @@ const App = (props: AppProps) => {
       const row = current();
       if (row?.kind === "run") setTab("runs");
       else void perform("attach", props.actions.attach);
-    } else if (action === "traces")
-      void perform("traces", props.actions.traces);
+    } else if (action === "inspect")
+      void perform("inspect", props.actions.inspect);
     else if (action === "changes") {
       setDetailTab("changes");
       void props.actions
@@ -342,8 +342,8 @@ const App = (props: AppProps) => {
             "",
             session.goal,
             "",
-            `Open Traces for the full transcript.`,
-            `Attach through ZMX to interact.`,
+            "Inspect this session for its transcript and tool activity.",
+            "Attach to continue the native harness session.",
           ].join("\n")
         : "Select a session.";
     }
@@ -399,7 +399,7 @@ const App = (props: AppProps) => {
             "next",
             "previous",
             "open",
-            "traces",
+            "inspect",
             "changes",
             "tab-next",
             "help",

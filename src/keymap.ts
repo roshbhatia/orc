@@ -11,7 +11,7 @@ export type TuiAction =
   | "left"
   | "right"
   | "open"
-  | "traces"
+  | "inspect"
   | "changes"
   | "tab-next"
   | "tab-previous"
@@ -52,7 +52,12 @@ export const keyBindings: ReadonlyArray<KeyBinding<TuiAction>> = [
     help: "enter",
     keys: [{ name: "return" }],
   },
-  { action: "traces", description: "traces", help: "t", keys: [{ name: "t" }] },
+  {
+    action: "inspect",
+    description: "inspect",
+    help: "i",
+    keys: [{ name: "i" }],
+  },
   {
     action: "changes",
     description: "changes",

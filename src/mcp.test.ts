@@ -58,7 +58,7 @@ describe("MCP", () => {
           successCriteria: [],
           tag: "connect",
           title: "MCP test",
-          zmxSession: undefined,
+          providerRef: undefined,
         }).pipe(Effect.provide(StateStoreLive)),
       );
       const output = await handleMcpRequest({

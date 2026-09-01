@@ -1,5 +1,5 @@
 import { Effect } from "effect";
-import type { Command, Direction } from "./args.ts";
+import type { Command } from "./args.ts";
 import {
   activeSessions,
   agentRoles,
@@ -8,6 +8,7 @@ import {
   type WorkflowRun,
   type WorkspaceState,
 } from "./domain.ts";
+import { invokeProvider, providerOutput, resolveProvider } from "./provider.ts";
 import { StateError, StateStore, type StateStoreService } from "./state.ts";
 
 export const inferredNativeId = (): string =>
@@ -103,7 +104,7 @@ const upsertSession = (
         title: command.title,
         traceId: overrides.traceId ?? nativeId,
         updatedAt: now,
-        zmxSession: command.zmxSession ?? null,
+        providerRef: command.providerRef ?? null,
       };
       result = session;
       return {
@@ -385,34 +386,6 @@ export const updateNodeStatus = (
   );
 };
 
-const splitFlag = (direction: Direction): string => `--${direction}`;
-
-const spawnSplit = (
-  scope: string,
-  direction: Direction,
-  command: ReadonlyArray<string>,
-): Effect.Effect<void, StateError> =>
-  Effect.tryPromise({
-    try: async () => {
-      const args = [
-        "wezterm",
-        "cli",
-        "split-pane",
-        "--no-auto-start",
-        splitFlag(direction),
-        "--cwd",
-        scope,
-      ];
-      if (process.env.WEZTERM_PANE)
-        args.push("--pane-id", process.env.WEZTERM_PANE);
-      args.push("--", ...command);
-      const child = Bun.spawn(args, { stderr: "inherit", stdout: "inherit" });
-      const code = await child.exited;
-      if (code !== 0) throw new Error(`wezterm split exited with code ${code}`);
-    },
-    catch: (cause) => new StateError({ message: "open WezTerm split", cause }),
-  });
-
 const selectedSession = (
   state: WorkspaceState,
   id: string,
@@ -429,28 +402,28 @@ export const attach = (
   Effect.gen(function* () {
     const state = yield* readWorkspace(command.scope);
     const session = yield* selectedSession(state, command.id);
-    if (!session.zmxSession)
-      return yield* new StateError({
-        message: `session ${session.id} has no ZMX attachment`,
-      });
-    yield* spawnSplit(state.scope, command.direction, [
-      "zmx",
-      "attach",
-      session.zmxSession,
-    ]);
+    yield* providerOutput({
+      action: "attach",
+      direction: command.direction,
+      scope: state.scope,
+      session,
+      version: "orc.provider/v1",
+    });
   });
 
-export const openTraces = (
-  command: Extract<Command, { readonly tag: "traces" }>,
+export const inspectSession = (
+  command: Extract<Command, { readonly tag: "inspect" }>,
 ): Effect.Effect<void, StateError, StateStoreService> =>
   Effect.gen(function* () {
     const state = yield* readWorkspace(command.scope);
     const session = yield* selectedSession(state, command.id);
-    yield* spawnSplit(state.scope, command.direction, [
-      "traces",
-      "--session",
-      session.traceId ?? session.nativeId,
-    ]);
+    yield* providerOutput({
+      action: "inspect",
+      direction: command.direction,
+      scope: state.scope,
+      session,
+      version: "orc.provider/v1",
+    });
   });
 
 export const launch = (
@@ -461,7 +434,8 @@ export const launch = (
     const nativeId = crypto.randomUUID();
     const sessionId = inferredSessionId(command.harness, nativeId);
     const current = currentSession(yield* resolved.store.read(resolved.scope));
-    yield* registerSession({
+    if (command.managedId) yield* resolveProvider("launch");
+    const session = yield* registerSession({
       completion: "orchestrator",
       expectedOutput: "A verified result",
       goal: `Run ${command.harness}`,
@@ -484,48 +458,60 @@ export const launch = (
       successCriteria: [],
       tag: "session-register",
       title: command.harness,
-      zmxSession: command.zmxSession,
+      providerRef: command.managedId,
     });
-    const executable = command.zmxSession
-      ? [
-          "zmx",
-          "run",
-          command.zmxSession,
-          "--",
-          command.harness,
-          ...command.args,
-        ]
-      : [command.harness, ...command.args];
-    return yield* Effect.tryPromise({
-      try: async () => {
-        const child = Bun.spawn(executable, {
-          cwd: resolved.scope,
-          env: {
-            ...process.env,
-            ORC_AGENT: command.harness,
-            ...(command.model ? { ORC_MODEL: command.model } : {}),
-            ORC_NATIVE_SESSION_ID: nativeId,
-            ...(current ? { ORC_PARENT_SESSION_ID: current.id } : {}),
-            ORC_SCOPE: resolved.scope,
-            ORC_SESSION_ID: sessionId,
-            ...(command.zmxSession
-              ? { ORC_ZMX_SESSION: command.zmxSession }
-              : {}),
+    const executable = [command.harness, ...command.args];
+    const environment = {
+      ...process.env,
+      ORC_AGENT: command.harness,
+      ...(command.model ? { ORC_MODEL: command.model } : {}),
+      ORC_NATIVE_SESSION_ID: nativeId,
+      ...(current ? { ORC_PARENT_SESSION_ID: current.id } : {}),
+      ...(command.managedId ? { ORC_PROVIDER_REF: command.managedId } : {}),
+      ORC_SCOPE: resolved.scope,
+      ORC_SESSION_ID: sessionId,
+    };
+    const execute = command.managedId
+      ? invokeProvider(
+          {
+            action: "launch",
+            command: executable,
+            managedId: command.managedId,
+            scope: resolved.scope,
+            session,
+            version: "orc.provider/v1",
           },
-          stderr: "inherit",
-          stdin: "inherit",
-          stdout: "inherit",
+          environment,
+          "inherit",
+        ).pipe(Effect.map((response) => response.code))
+      : Effect.tryPromise({
+          try: async () => {
+            const child = Bun.spawn(executable, {
+              cwd: resolved.scope,
+              env: environment,
+              stderr: "inherit",
+              stdin: "inherit",
+              stdout: "inherit",
+            });
+            return await child.exited;
+          },
+          catch: (cause) =>
+            new StateError({ message: `launch ${command.harness}`, cause }),
         });
-        return await child.exited;
-      },
-      catch: (cause) =>
-        new StateError({ message: `launch ${command.harness}`, cause }),
-    }).pipe(
+    return yield* execute.pipe(
       Effect.tap((code) =>
         updateSessionStatus({
           id: sessionId,
           scope: resolved.scope,
           status: code === 0 ? "done" : "failed",
+          tag: "session-update",
+        }),
+      ),
+      Effect.tapError(() =>
+        updateSessionStatus({
+          id: sessionId,
+          scope: resolved.scope,
+          status: "failed",
           tag: "session-update",
         }),
       ),

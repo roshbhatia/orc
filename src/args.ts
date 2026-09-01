@@ -34,7 +34,7 @@ export type Command =
       readonly id: string | undefined;
       readonly nativeId: string | undefined;
       readonly parentId: string | undefined;
-      readonly zmxSession: string | undefined;
+      readonly providerRef: string | undefined;
     } & ContractOptions)
   | {
       readonly tag: "disconnect";
@@ -52,7 +52,7 @@ export type Command =
       readonly parentId: string | undefined;
       readonly runId: string | undefined;
       readonly nodeId: string | undefined;
-      readonly zmxSession: string | undefined;
+      readonly providerRef: string | undefined;
     } & ContractOptions)
   | {
       readonly tag: "session-current" | "session-list";
@@ -124,7 +124,7 @@ export type Command =
       readonly direction: Direction;
     }
   | {
-      readonly tag: "traces";
+      readonly tag: "inspect";
       readonly scope: string;
       readonly id: string;
       readonly direction: Direction;
@@ -134,7 +134,7 @@ export type Command =
       readonly scope: string;
       readonly harness: string;
       readonly model: string | undefined;
-      readonly zmxSession: string | undefined;
+      readonly managedId: string | undefined;
       readonly args: ReadonlyArray<string>;
     };
 
@@ -358,7 +358,7 @@ const parseSession = (
         "--run",
         "--node",
         "--source",
-        "--zmx",
+        "--provider-ref",
       ]),
       new Set(["--hook-input", "--quiet"]),
     );
@@ -380,7 +380,7 @@ const parseSession = (
       scope: options.scope,
       source,
       tag: "session-register",
-      zmxSession: one(options, "--zmx"),
+      providerRef: one(options, "--provider-ref"),
     };
   });
 
@@ -570,7 +570,7 @@ export const parseArgs = (
           "--id",
           "--native-id",
           "--parent",
-          "--zmx",
+          "--provider-ref",
         ]),
       );
       return {
@@ -580,7 +580,7 @@ export const parseArgs = (
         parentId: one(options, "--parent"),
         scope: options.scope,
         tag: "connect",
-        zmxSession: one(options, "--zmx"),
+        providerRef: one(options, "--provider-ref"),
       };
     }
     if (name === "disconnect") {
@@ -595,7 +595,7 @@ export const parseArgs = (
         tag: "disconnect",
       };
     }
-    if (name === "attach" || name === "traces") {
+    if (name === "attach" || name === "inspect") {
       const options = yield* parseOptions(rest, new Set(["--direction"]));
       return {
         direction: yield* parseDirection(one(options, "--direction")),
@@ -608,7 +608,10 @@ export const parseArgs = (
       };
     }
     if (name === "launch") {
-      const options = yield* parseOptions(rest, new Set(["--zmx", "--model"]));
+      const options = yield* parseOptions(
+        rest,
+        new Set(["--managed", "--model"]),
+      );
       const harness = yield* requireOne(
         options.positionals,
         "launch requires one harness command",
@@ -619,7 +622,7 @@ export const parseArgs = (
         model: one(options, "--model"),
         scope: options.scope,
         tag: "launch",
-        zmxSession: one(options, "--zmx"),
+        managedId: one(options, "--managed"),
       };
     }
     return yield* new ArgumentError({ message: `unknown command: ${name}` });
