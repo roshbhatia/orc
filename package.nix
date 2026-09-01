@@ -7,7 +7,7 @@
 }:
 stdenv.mkDerivation {
   pname = "orc";
-  version = "0.5.0";
+  version = "0.5.1";
   src = ./.;
 
   nativeBuildInputs = [

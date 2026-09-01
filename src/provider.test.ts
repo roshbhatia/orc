@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Effect, Exit } from "effect";
@@ -108,6 +115,31 @@ const testEnvironment = (
 });
 
 describe("provider", () => {
+  test("discovers a symlinked provider manifest", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "orc-provider-link-"));
+    const printf = Bun.which("printf");
+    if (!printf) throw new Error("test requires printf on PATH");
+    await writeProvider(directory, {
+      capabilities: ["changes.inspect"],
+      name: "linked",
+      plan: {
+        command: [printf, "provider output"],
+        version: "orc.provider/v1",
+      },
+    });
+    const manifest = join(directory, "linked.json");
+    const target = join(directory, "linked-manifest");
+    await rename(manifest, target);
+    await symlink(target, manifest);
+    try {
+      expect(
+        await Effect.runPromise(listProviders(testEnvironment(directory))),
+      ).toMatchObject([{ name: "linked" }]);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   test("discovers one capability provider and executes its command plan", async () => {
     const directory = await mkdtemp(join(tmpdir(), "orc-provider-test-"));
     const capture = join(directory, "request.json");

@@ -227,7 +227,11 @@ const discoverProviders = (
       for (const entry of entries.sort((left, right) =>
         left.name.localeCompare(right.name),
       )) {
-        if (!entry.isFile() || extname(entry.name) !== ".json") continue;
+        if (
+          (!entry.isFile() && !entry.isSymbolicLink()) ||
+          extname(entry.name) !== ".json"
+        )
+          continue;
         const path = join(directory, entry.name);
         manifests.push(
           parseManifest(await Bun.file(path).json(), path, environment),
