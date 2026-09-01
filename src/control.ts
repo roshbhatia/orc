@@ -9,7 +9,11 @@ import {
   type WorkflowRun,
   type WorkspaceState,
 } from "./domain.ts";
-import { invokeProvider, providerOutput, resolveProvider } from "./provider.ts";
+import {
+  invokeProvider,
+  providerOutput,
+  resolveProviderChain,
+} from "./provider.ts";
 import { StateError, StateStore, type StateStoreService } from "./state.ts";
 
 export const inferredNativeId = (): string =>
@@ -429,7 +433,7 @@ export const launch = (
     const nativeId = crypto.randomUUID();
     const sessionId = inferredSessionId(command.harness, nativeId);
     const current = currentSession(yield* resolved.store.read(resolved.scope));
-    if (command.managedId) yield* resolveProvider("launch");
+    if (command.managedId) yield* resolveProviderChain("launch");
     const session = yield* registerSession({
       completion: "orchestrator",
       expectedOutput: "A verified result",

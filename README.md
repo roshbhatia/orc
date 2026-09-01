@@ -37,32 +37,48 @@ orc inspect <orc-session-id> --direction right
 orc disconnect <orc-session-id>
 ```
 
-Orc routes each host action to an external provider. Configure the routes in
-`$XDG_CONFIG_HOME/orc/providers.json`:
+Orc discovers external providers from `$XDG_CONFIG_HOME/orc/providers/*.json`.
+Each manifest advertises capabilities and one command:
 
 ```json
 {
-  "providers": {
-    "attach": "sysinit",
-    "inspect": "sysinit",
-    "changes": "sysinit",
-    "launch": "sysinit"
-  }
+  "version": "orc.provider/v1",
+  "name": "terminal",
+  "command": "/path/to/orc-provider-terminal",
+  "capabilities": ["terminal.open"],
+  "priority": 10
 }
 ```
 
-A provider name resolves to `orc-<name>` on `PATH`. The same executable can
-serve several routes and compose other commands. Orc passes `attach`, `inspect`,
-`changes`, or `launch` as the first argument. The provider reads one
-`orc.provider/v1` JSON request from `ORC_PROVIDER_REQUEST`.
+The command can use an absolute path or a name on `PATH`. Orc selects the
+highest-priority provider for each capability. Equal top priorities produce an
+ambiguity error.
 
-Orc selects one provider for each action. A recipe provider owns command
-composition. This lets terminal actions retain their process and TTY behavior.
+Actions resolve to capability chains:
 
-`ORC_PROVIDER_<ACTION>` overrides one route. `ORC_PROVIDER` supplies a common
-fallback. `ORC_PROVIDER_CONFIG` selects another config file. A provider reports
-success through its exit status. The `changes` action writes display output to
-standard output.
+```text
+attach   session.attach -> terminal.open
+inspect  session.inspect -> terminal.open
+changes  changes.inspect
+launch   session.launch
+```
+
+Orc writes one `orc.provider/v1` request to each provider's standard input.
+The request includes the capability and the prior command plan. A provider
+writes the next command plan to standard output:
+
+```json
+{
+  "version": "orc.provider/v1",
+  "command": ["session-tool", "attach", "session-id"],
+  "cwd": "/work/project",
+  "environment": {}
+}
+```
+
+The final plan runs with inherited terminal state. Captured actions preserve
+standard output, standard error, and terminal colors. `ORC_PROVIDER_DIR` selects
+another manifest directory for tests or temporary configurations.
 
 Without a provider, Orc still records sessions, runs, nodes, and contracts.
 Direct `orc launch` also works. Use `--managed <id>` to delegate a launch.
