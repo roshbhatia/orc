@@ -282,6 +282,7 @@ const callTool = async (name: string, input: unknown): Promise<unknown> => {
             expectedOutput: string(args, "expectedOutput"),
             goal: string(args, "goal"),
             harness: string(args, "harness") || undefined,
+            json: false,
             model: string(args, "model") || undefined,
             name: string(args, "name"),
             orchestratorId: context.session.id,

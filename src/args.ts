@@ -75,6 +75,7 @@ export type Command =
   | {
       readonly tag: "run-create";
       readonly scope: string;
+      readonly json: boolean;
       readonly name: string;
       readonly goal: string;
       readonly expectedOutput: string;
@@ -442,6 +443,7 @@ const parseRun = (
           one(options, "--expected-output") ?? "A verified result",
         goal,
         harness: one(options, "--harness"),
+        json: options.json,
         model: one(options, "--model"),
         name: one(options, "--name") ?? goal,
         orchestratorId: one(options, "--orchestrator"),

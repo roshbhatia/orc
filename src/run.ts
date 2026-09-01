@@ -271,6 +271,7 @@ const nestedCommands: Readonly<Record<string, ReadonlyArray<CliCommand>>> = {
         },
         { description: "Select the default harness", name: "--harness" },
         { description: "Select the default model", name: "--model" },
+        jsonOption,
       ],
     },
     {
@@ -605,9 +606,11 @@ const program = (
       case "session-update":
         streams.stdout(JSON.stringify(yield* updateSessionStatus(command)));
         return 0;
-      case "run-create":
-        streams.stdout(JSON.stringify(yield* createRun(command)));
+      case "run-create": {
+        const created = yield* createRun(command);
+        streams.stdout(command.json ? JSON.stringify(created) : created.id);
         return 0;
+      }
       case "run-agent-set":
         streams.stdout(JSON.stringify(yield* setRunAgent(command)));
         return 0;

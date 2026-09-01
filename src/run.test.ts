@@ -136,7 +136,30 @@ describe("run", () => {
           ),
         ),
       ).toBe(0);
-      const runId = JSON.parse(created.stdout[0] ?? "").id as string;
+      const runId = created.stdout[0] ?? "";
+      expect(runId).toMatch(/^run-/);
+
+      const createdJson = capture();
+      expect(
+        await Effect.runPromise(
+          run(
+            [
+              "run",
+              "create",
+              "--scope",
+              directory,
+              "--name",
+              "JSON run",
+              "--json",
+            ],
+            createdJson.streams,
+            "test",
+          ),
+        ),
+      ).toBe(0);
+      expect(JSON.parse(createdJson.stdout[0] ?? "")).toMatchObject({
+        name: "JSON run",
+      });
 
       const configured = capture();
       expect(
