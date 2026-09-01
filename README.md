@@ -6,6 +6,8 @@ workflow graphs. External providers add host integrations.
 Orc uses the same TypeScript stack as OpenCode: Bun, Effect, Solid, and
 OpenTUI.
 
+![Orc workflow graph](docs/orc.png)
+
 ## Terms
 
 - A session is one harness instance, such as one Codex or Claude conversation.
@@ -116,6 +118,7 @@ bun install --frozen-lockfile
 bun run check
 nix build --accept-flake-config
 nix flake check --accept-flake-config
+./hack/screenshots.sh
 ```
 
 Run `bun run nix:lock` after a dependency change.

@@ -64,12 +64,20 @@
 
       devShells = eachSystem (system: {
         default = pkgsFor.${system}.mkShellNoCC {
-          packages = with pkgsFor.${system}; [
-            biome
-            bun
-            fish
-            ripgrep
-          ] ++ [ inputs.bun2nix.packages.${system}.default ];
+          packages =
+            with pkgsFor.${system};
+            [
+              biome
+              bun
+              ffmpeg
+              fish
+              jq
+              ripgrep
+              shellcheck
+              shfmt
+              vhs
+            ]
+            ++ [ inputs.bun2nix.packages.${system}.default ];
           shellHook = ''
             export BUN2NIX_NATIVE=${inputs.nixpkgs.lib.getExe inputs.bun2nix.packages.${system}.default}
           '';
