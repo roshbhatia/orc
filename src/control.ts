@@ -3,6 +3,7 @@ import type { Command } from "./args.ts";
 import {
   activeSessions,
   agentRoles,
+  inferredSessionId,
   type Session,
   type WorkflowNode,
   type WorkflowRun,
@@ -19,12 +20,6 @@ export const inferredNativeId = (): string =>
   process.env.CLAUDE_SESSION_ID ??
   process.env.OPENCODE_SESSION_ID ??
   `process-${process.ppid}`;
-
-const inferredSessionId = (harness: string, nativeId: string): string => {
-  const hasher = new Bun.CryptoHasher("sha256");
-  hasher.update(`${harness}:\0:${nativeId}`);
-  return `${harness}-${hasher.digest("hex").slice(0, 12)}`;
-};
 
 const generatedId = (prefix: string): string =>
   `${prefix}-${crypto.randomUUID().slice(0, 12)}`;
@@ -88,7 +83,7 @@ const upsertSession = (
         goal: command.goal,
         harness: command.harness,
         model: command.model ?? current?.model ?? null,
-        id: current?.id ?? id,
+        id: current?.id || id,
         nativeId,
         nodeId:
           command.tag === "session-register" ? (command.nodeId ?? null) : null,

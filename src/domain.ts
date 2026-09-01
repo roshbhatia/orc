@@ -1,5 +1,14 @@
 import { Schema } from "effect";
 
+export const inferredSessionId = (
+  harness: string,
+  nativeId: string,
+): string => {
+  const hasher = new Bun.CryptoHasher("sha256");
+  hasher.update(`${harness}:\0:${nativeId}`);
+  return `${harness}-${hasher.digest("hex").slice(0, 12)}`;
+};
+
 export const SessionRoleSchema = Schema.Literals([
   "orchestrator",
   "planner",

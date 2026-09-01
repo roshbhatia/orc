@@ -10,6 +10,7 @@ import { dirname, join } from "node:path";
 import { Context, Data, Effect, Layer, Schema } from "effect";
 import {
   emptyWorkspace,
+  inferredSessionId,
   type Session,
   type WorkspaceState,
   WorkspaceStateSchema,
@@ -138,11 +139,17 @@ const normalizeV2 = (value: unknown): unknown => {
   const sessions = Array.isArray(source.sessions)
     ? source.sessions.map((value) => {
         const session = record(value);
+        const harness = session
+          ? stringValue(session, "harness", "unknown")
+          : "unknown";
+        const nativeId = session ? stringValue(session, "nativeId", "") : "";
+        const id = session ? stringValue(session, "id", "").trim() : "";
         return session
           ? {
               model: null,
               providerRef: nullableString(session, "zmxSession"),
               ...session,
+              id: id || inferredSessionId(harness, nativeId),
             }
           : value;
       })
