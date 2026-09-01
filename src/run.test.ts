@@ -19,6 +19,19 @@ const capture = () => {
 };
 
 describe("run", () => {
+  test("generates Fish completions from the command catalog", async () => {
+    const output = capture();
+    expect(
+      await Effect.runPromise(
+        run(["completion", "fish"], output.streams, "test"),
+      ),
+    ).toBe(0);
+    expect(output.stdout.join("\n")).toContain(
+      "complete -c orc -n '__fish_use_subcommand' -a 'connect'",
+    );
+    expect(output.stdout.join("\n")).toContain("-l role");
+  });
+
   test("connects, lists, and disconnects one session", async () => {
     const directory = await mkdtemp(join(tmpdir(), "orc-run-test-"));
     const previousStateHome = process.env.XDG_STATE_HOME;

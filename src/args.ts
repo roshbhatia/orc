@@ -6,6 +6,7 @@ import type {
 } from "./domain.ts";
 
 export type Direction = "right" | "left" | "top" | "bottom";
+export type CompletionShell = "fish";
 
 interface ContractOptions {
   readonly harness: string;
@@ -24,6 +25,7 @@ export type Command =
   | { readonly tag: "tui"; readonly scope: string }
   | { readonly tag: "help" }
   | { readonly tag: "version" }
+  | { readonly tag: "completion"; readonly shell: CompletionShell }
   | { readonly tag: "mcp" }
   | { readonly tag: "prompt"; readonly scope: string }
   | { readonly tag: "status"; readonly scope: string; readonly json: boolean }
@@ -547,6 +549,14 @@ export const parseArgs = (
       return { tag: "help" };
     if (name === "--version" || name === "-v" || name === "version")
       return { tag: "version" };
+    if (name === "completion") {
+      const shell = yield* requireOne(rest, "completion requires one shell");
+      if (shell !== "fish")
+        return yield* new ArgumentError({
+          message: `unsupported completion shell: ${shell}`,
+        });
+      return { shell, tag: "completion" };
+    }
     if (name === "mcp") return { tag: "mcp" };
     if (name === "session") return yield* parseSession(rest);
     if (name === "run") return yield* parseRun(rest);

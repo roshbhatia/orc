@@ -8,6 +8,13 @@ describe("parseArgs", () => {
     expect(command.tag).toBe("tui");
   });
 
+  test("parses Fish completion generation", () => {
+    expect(Effect.runSync(parseArgs(["completion", "fish"]))).toEqual({
+      shell: "fish",
+      tag: "completion",
+    });
+  });
+
   test("parses a session contract", () => {
     expect(
       Effect.runSync(

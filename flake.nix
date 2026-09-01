@@ -70,6 +70,7 @@
             biome
             bun
             bun2nix
+            fish
             ripgrep
           ];
         };
