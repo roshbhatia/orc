@@ -6,6 +6,9 @@ import { Effect, Exit } from "effect";
 import type { Session } from "./domain.ts";
 import {
   type CommandPlan,
+  describeSession,
+  discoverSessionBindings,
+  listProviders,
   type ProviderCapability,
   providerOutput,
   resolveCommandPlan,
@@ -32,6 +35,7 @@ const session = (scope: string): Session => ({
   parentId: null,
   providerRef: "managed-session",
   purpose: "test providers",
+  providers: [],
   registration: "managed",
   reviewBy: null,
   role: "worker",
@@ -56,13 +60,30 @@ const writeProvider = async (
     readonly priority?: number;
   },
 ): Promise<string> => {
+  return writeProviderResponse(directory, {
+    ...options,
+    response: options.plan,
+  });
+};
+
+const writeProviderResponse = async (
+  directory: string,
+  options: {
+    readonly capabilities: ReadonlyArray<ProviderCapability>;
+    readonly capture?: string;
+    readonly kind?: string;
+    readonly name: string;
+    readonly priority?: number;
+    readonly response: unknown;
+  },
+): Promise<string> => {
   const executable = join(directory, `provider-${options.name}`);
   const capture = options.capture
     ? `request=$(cat)\nprintf %s "$request" > ${shellQuote(options.capture)}\n`
     : "cat >/dev/null\n";
   await writeFile(
     executable,
-    `#!/bin/sh\nset -eu\n${capture}printf %s ${shellQuote(JSON.stringify(options.plan))}\n`,
+    `#!/bin/sh\nset -eu\n${capture}printf %s ${shellQuote(JSON.stringify(options.response))}\n`,
     { mode: 0o700 },
   );
   await writeFile(
@@ -70,6 +91,7 @@ const writeProvider = async (
     JSON.stringify({
       capabilities: options.capabilities,
       command: executable,
+      ...(options.kind ? { kind: options.kind } : {}),
       name: options.name,
       priority: options.priority ?? 0,
       version: "orc.provider/v1",
@@ -176,6 +198,61 @@ describe("provider", () => {
     }
   });
 
+  test("composes harness, persistence, and display providers", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "orc-provider-attach-"));
+    const persistenceCapture = join(directory, "persistence.json");
+    const terminalCapture = join(directory, "terminal.json");
+    const printf = Bun.which("printf");
+    if (!printf) throw new Error("test requires printf on PATH");
+    const harnessPlan: CommandPlan = {
+      command: [printf, "harness"],
+      version: "orc.provider/v1",
+    };
+    const persistencePlan: CommandPlan = {
+      command: [printf, "persisted"],
+      version: "orc.provider/v1",
+    };
+    await writeProvider(directory, {
+      capabilities: ["session.attach"],
+      name: "harness",
+      plan: harnessPlan,
+    });
+    await writeProvider(directory, {
+      capabilities: ["session.persist"],
+      capture: persistenceCapture,
+      name: "persistence",
+      plan: persistencePlan,
+    });
+    await writeProvider(directory, {
+      capabilities: ["terminal.open"],
+      capture: terminalCapture,
+      name: "display",
+      plan: { command: [printf, "displayed"], version: "orc.provider/v1" },
+    });
+    try {
+      await Effect.runPromise(
+        providerOutput(
+          {
+            action: "attach",
+            direction: "right",
+            scope: directory,
+            session: session(directory),
+            version: "orc.provider/v1",
+          },
+          testEnvironment(directory),
+        ),
+      );
+      expect(
+        JSON.parse(await readFile(persistenceCapture, "utf8")),
+      ).toMatchObject({ plan: harnessPlan });
+      expect(JSON.parse(await readFile(terminalCapture, "utf8"))).toMatchObject(
+        { plan: persistencePlan },
+      );
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   test("selects the highest-priority provider", async () => {
     const directory = await mkdtemp(join(tmpdir(), "orc-provider-priority-"));
     const printf = Bun.which("printf");
@@ -197,6 +274,101 @@ describe("provider", () => {
         resolveProviderChain("changes", testEnvironment(directory)),
       );
       expect(chain.map((provider) => provider.name)).toEqual(["preferred"]);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  test("falls back when a higher-priority provider declines", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "orc-provider-fallback-"));
+    const printf = Bun.which("printf");
+    if (!printf) throw new Error("test requires printf on PATH");
+    await writeProviderResponse(directory, {
+      capabilities: ["changes.inspect"],
+      name: "optional",
+      priority: 20,
+      response: { status: "declined", version: "orc.provider/v1" },
+    });
+    await writeProvider(directory, {
+      capabilities: ["changes.inspect"],
+      name: "fallback",
+      plan: { command: [printf, "fallback"], version: "orc.provider/v1" },
+      priority: 10,
+    });
+    try {
+      expect(
+        await Effect.runPromise(
+          providerOutput(changesRequest(directory), testEnvironment(directory)),
+        ),
+      ).toBe("fallback");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  test("discovers provider facets and session descriptions", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "orc-provider-bind-"));
+    await writeProviderResponse(directory, {
+      capabilities: ["session.bind"],
+      kind: "display",
+      name: "display",
+      response: {
+        binding: {
+          kind: "display",
+          label: "pane 7",
+          ref: "7",
+          status: "active",
+        },
+        version: "orc.provider/v1",
+      },
+    });
+    await writeProviderResponse(directory, {
+      capabilities: ["session.describe"],
+      kind: "activity",
+      name: "activity",
+      response: {
+        description: {
+          goal: "Build the provider model",
+          title: "Orc providers",
+        },
+        version: "orc.provider/v1",
+      },
+    });
+    try {
+      expect(
+        await Effect.runPromise(
+          discoverSessionBindings(
+            directory,
+            session(directory),
+            testEnvironment(directory),
+          ),
+        ),
+      ).toEqual([
+        {
+          kind: "display",
+          label: "pane 7",
+          provider: "display",
+          ref: "7",
+          status: "active",
+        },
+      ]);
+      expect(
+        await Effect.runPromise(
+          describeSession(
+            directory,
+            session(directory),
+            testEnvironment(directory),
+          ),
+        ),
+      ).toEqual({ goal: "Build the provider model", title: "Orc providers" });
+      expect(
+        (
+          await Effect.runPromise(listProviders(testEnvironment(directory)))
+        ).map(({ kind, name }) => ({ kind, name })),
+      ).toEqual([
+        { kind: "activity", name: "activity" },
+        { kind: "display", name: "display" },
+      ]);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }
@@ -241,7 +413,6 @@ describe("provider", () => {
 
   test("keeps host tool names outside Orc core", async () => {
     const files = [
-      "README.md",
       "src/args.ts",
       "src/control.ts",
       "src/domain.ts",

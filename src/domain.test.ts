@@ -14,6 +14,7 @@ const session = (id: string, updatedAt: string): Session => ({
   nodeId: null,
   parentId: null,
   purpose: id,
+  providers: [],
   registration: "connected",
   reviewBy: null,
   role: "worker",

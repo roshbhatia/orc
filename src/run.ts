@@ -1,5 +1,5 @@
 import { Effect } from "effect";
-import { parseArgs } from "./args.ts";
+import { type CompletionShell, parseArgs } from "./args.ts";
 import {
   attach,
   connect,
@@ -9,6 +9,7 @@ import {
   inspectSession,
   launch,
   readWorkspace,
+  reconcileWorkspace,
   setRunAgent,
   updateNodeStatus,
   updateRunStatus,
@@ -23,7 +24,7 @@ import {
 } from "./domain.ts";
 import { registerFromHook } from "./hook.ts";
 import { runMcp } from "./mcp.ts";
-import { providerOutput } from "./provider.ts";
+import { listProviders, providerOutput } from "./provider.ts";
 import { StateError, StateStoreLive } from "./state.ts";
 import { openTui } from "./tui.tsx";
 
@@ -118,6 +119,11 @@ const cliCommands: ReadonlyArray<CliCommand> = [
     options: [scopeOption, jsonOption],
   },
   {
+    description: "List provider manifests",
+    name: "providers",
+    options: [scopeOption, jsonOption],
+  },
+  {
     description: "Register the current session",
     name: "connect",
     options: [
@@ -198,7 +204,7 @@ const cliCommands: ReadonlyArray<CliCommand> = [
   {
     description: "Generate shell completions",
     name: "completion",
-    usage: "fish",
+    usage: "bash|zsh|fish|nu",
   },
   { description: "Show command help", name: "help" },
   { description: "Show the Orc version", name: "version" },
@@ -207,8 +213,20 @@ const cliCommands: ReadonlyArray<CliCommand> = [
 const nestedCommands: Readonly<Record<string, ReadonlyArray<CliCommand>>> = {
   completion: [
     {
+      description: "Generate Bash completions",
+      name: "bash",
+    },
+    {
       description: "Generate Fish completions",
       name: "fish",
+    },
+    {
+      description: "Generate Nushell completions",
+      name: "nu",
+    },
+    {
+      description: "Generate Zsh completions",
+      name: "zsh",
     },
   ],
   node: [
@@ -366,6 +384,97 @@ export const fishCompletion = (): string => {
   return lines.join("\n");
 };
 
+const allCommandNames = (): ReadonlyArray<string> => [
+  ...cliCommands.map((command) => command.name),
+  ...Object.entries(nestedCommands).flatMap(([parent, commands]) =>
+    commands.map((command) => `${parent} ${command.name}`),
+  ),
+];
+
+const allOptionNames = (): ReadonlyArray<string> => [
+  ...new Set(
+    [
+      ...cliCommands.flatMap((command) => command.options ?? []),
+      ...Object.values(nestedCommands).flatMap((commands) =>
+        commands.flatMap((command) => command.options ?? []),
+      ),
+    ].map((option) => option.name),
+  ),
+];
+
+export const bashCompletion = (): string =>
+  `
+_orc_complete() {
+  local current="\${COMP_WORDS[COMP_CWORD]}"
+  local words="${[...allCommandNames(), ...allOptionNames()].join(" ")}"
+  COMPREPLY=($(compgen -W "$words" -- "$current"))
+}
+complete -F _orc_complete orc
+`.trim();
+
+const zshQuote = (value: string): string => value.replaceAll("'", "'\\''");
+
+export const zshCompletion = (): string =>
+  `
+#compdef orc
+_orc() {
+  local -a commands options
+  commands=(
+${cliCommands.map((command) => `    '${zshQuote(command.name)}:${zshQuote(command.description)}'`).join("\n")}
+  )
+  options=(${allOptionNames().map(zshQuote).join(" ")})
+  if (( CURRENT == 2 )); then
+    _describe 'command' commands
+  else
+    compadd -- $options
+  fi
+}
+compdef _orc orc
+`.trim();
+
+const nuFlag = (option: CliOption): string =>
+  option.flag
+    ? `  ${option.name}`
+    : `  ${option.name}: ${option.values ? `string@"nu-complete orc ${option.name.slice(2)}"` : "string"}`;
+
+export const nuCompletion = (): string => {
+  const valueCompleters = [
+    ...new Map(
+      [
+        ...cliCommands.flatMap((command) => command.options ?? []),
+        ...Object.values(nestedCommands).flatMap((commands) =>
+          commands.flatMap((command) => command.options ?? []),
+        ),
+      ]
+        .filter((option) => option.values)
+        .map((option) => [option.name, option] as const),
+    ).values(),
+  ].map(
+    (option) =>
+      `def "nu-complete orc ${option.name.slice(2)}" [] { [${option.values?.map((value) => JSON.stringify(value)).join(" ")}] }`,
+  );
+  const declarations = [
+    ...cliCommands.map((command) => {
+      const options = command.options ?? [];
+      return `export extern "orc ${command.name}" [\n${options.map(nuFlag).join("\n")}\n  ...args: string\n]`;
+    }),
+    ...Object.entries(nestedCommands).flatMap(([parent, commands]) =>
+      commands.map(
+        (command) =>
+          `export extern "orc ${parent} ${command.name}" [\n${(command.options ?? []).map(nuFlag).join("\n")}\n  ...args: string\n]`,
+      ),
+    ),
+  ];
+  return [...valueCompleters, ...declarations].join("\n\n");
+};
+
+export const completionText = (shell: CompletionShell): string => {
+  if (shell === "bash") return bashCompletion();
+  if (shell === "zsh") return zshCompletion();
+  if (shell === "nu") return nuCompletion();
+  return fishCompletion();
+};
+
 const helpOptions = [
   ...cliCommands.flatMap((command) => command.options ?? []),
   ...Object.values(nestedCommands).flatMap((commands) =>
@@ -424,7 +533,7 @@ const program = (
         streams.stdout(version);
         return 0;
       case "completion":
-        streams.stdout(fishCompletion());
+        streams.stdout(completionText(command.shell));
         return 0;
       case "mcp":
         yield* Effect.tryPromise({
@@ -459,6 +568,20 @@ const program = (
         const state = yield* readWorkspace(command.scope);
         streams.stdout(
           command.json ? JSON.stringify(state.sessions) : displayList(state),
+        );
+        return 0;
+      }
+      case "provider-list": {
+        const providers = yield* listProviders();
+        streams.stdout(
+          command.json
+            ? JSON.stringify(providers)
+            : providers
+                .map(
+                  (provider) =>
+                    `${provider.name}\t${provider.kind}\t${provider.capabilities.join(",")}`,
+                )
+                .join("\n"),
         );
         return 0;
       }
@@ -532,7 +655,8 @@ const program = (
         yield* inspectSession(command);
         return 0;
       case "tui": {
-        const state = yield* readWorkspace(command.scope);
+        const state = yield* reconcileWorkspace(command.scope);
+        const providers = yield* listProviders();
         yield* Effect.tryPromise({
           try: () =>
             openTui(state, {
@@ -553,20 +677,21 @@ const program = (
                     version: "orc.provider/v1",
                   }),
                 ),
+              activity: (session) =>
+                Effect.runPromise(
+                  providerOutput({
+                    action: "activity",
+                    scope: state.scope,
+                    session,
+                    version: "orc.provider/v1",
+                  }),
+                ),
+              providers,
               read: () =>
                 Effect.runPromise(
-                  readWorkspace(state.scope).pipe(
+                  reconcileWorkspace(state.scope).pipe(
                     Effect.provide(StateStoreLive),
                   ),
-                ),
-              inspect: (session) =>
-                Effect.runPromise(
-                  inspectSession({
-                    direction: "right",
-                    id: session.id,
-                    scope: state.scope,
-                    tag: "inspect",
-                  }).pipe(Effect.provide(StateStoreLive)),
                 ),
             }),
           catch: (cause) =>

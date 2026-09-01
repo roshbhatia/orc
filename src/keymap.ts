@@ -11,8 +11,14 @@ export type TuiAction =
   | "left"
   | "right"
   | "open"
-  | "inspect"
+  | "activity"
   | "changes"
+  | "tree"
+  | "graph"
+  | "focus-left"
+  | "focus-right"
+  | "detail-previous"
+  | "detail-next"
   | "tab-next"
   | "tab-previous"
   | "page-up"
@@ -53,10 +59,46 @@ export const keyBindings: ReadonlyArray<KeyBinding<TuiAction>> = [
     keys: [{ name: "return" }],
   },
   {
-    action: "inspect",
-    description: "inspect",
+    action: "activity",
+    description: "activity",
     help: "i",
     keys: [{ name: "i" }],
+  },
+  {
+    action: "tree",
+    description: "tree view",
+    help: "t",
+    keys: [{ name: "t" }],
+  },
+  {
+    action: "graph",
+    description: "graph view",
+    help: "g",
+    keys: [{ name: "g" }],
+  },
+  {
+    action: "focus-left",
+    description: "focus main pane",
+    help: "ctrl-h",
+    keys: [{ ctrl: true, name: "h" }],
+  },
+  {
+    action: "focus-right",
+    description: "focus details pane",
+    help: "ctrl-l",
+    keys: [{ ctrl: true, name: "l" }],
+  },
+  {
+    action: "detail-previous",
+    description: "previous detail tab",
+    help: "[",
+    keys: [{ name: "[" }],
+  },
+  {
+    action: "detail-next",
+    description: "next detail tab",
+    help: "]",
+    keys: [{ name: "]" }],
   },
   {
     action: "changes",

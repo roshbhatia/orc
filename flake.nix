@@ -12,8 +12,6 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     systems.url = "github:nix-systems/default";
     bun2nix.url = "github:nix-community/bun2nix/2.1.2";
-    bun2nix.inputs.nixpkgs.follows = "nixpkgs";
-    bun2nix.inputs.systems.follows = "systems";
   };
 
   outputs =
@@ -69,10 +67,12 @@
           packages = with pkgsFor.${system}; [
             biome
             bun
-            bun2nix
             fish
             ripgrep
-          ];
+          ] ++ [ inputs.bun2nix.packages.${system}.default ];
+          shellHook = ''
+            export BUN2NIX_NATIVE=${inputs.nixpkgs.lib.getExe inputs.bun2nix.packages.${system}.default}
+          '';
         };
       });
     };

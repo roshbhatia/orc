@@ -6,7 +6,7 @@ import type {
 } from "./domain.ts";
 
 export type Direction = "right" | "left" | "top" | "bottom";
-export type CompletionShell = "fish";
+export type CompletionShell = "bash" | "fish" | "nu" | "zsh";
 
 interface ContractOptions {
   readonly harness: string;
@@ -30,6 +30,11 @@ export type Command =
   | { readonly tag: "prompt"; readonly scope: string }
   | { readonly tag: "status"; readonly scope: string; readonly json: boolean }
   | { readonly tag: "list"; readonly scope: string; readonly json: boolean }
+  | {
+      readonly tag: "provider-list";
+      readonly scope: string;
+      readonly json: boolean;
+    }
   | ({
       readonly tag: "connect";
       readonly scope: string;
@@ -551,13 +556,26 @@ export const parseArgs = (
       return { tag: "version" };
     if (name === "completion") {
       const shell = yield* requireOne(rest, "completion requires one shell");
-      if (shell !== "fish")
+      if (
+        shell !== "bash" &&
+        shell !== "fish" &&
+        shell !== "nu" &&
+        shell !== "zsh"
+      )
         return yield* new ArgumentError({
           message: `unsupported completion shell: ${shell}`,
         });
       return { shell, tag: "completion" };
     }
     if (name === "mcp") return { tag: "mcp" };
+    if (name === "providers") {
+      const options = yield* parseOptions(rest, new Set());
+      return {
+        json: options.json,
+        scope: options.scope,
+        tag: "provider-list",
+      };
+    }
     if (name === "session") return yield* parseSession(rest);
     if (name === "run") return yield* parseRun(rest);
     if (name === "node") return yield* parseNode(rest);

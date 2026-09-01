@@ -64,6 +64,27 @@ export const AgentConfigSchema = Schema.Struct({
 
 export type AgentConfig = typeof AgentConfigSchema.Type;
 
+export const ProviderKindSchema = Schema.Literals([
+  "persistence",
+  "display",
+  "activity",
+  "changes",
+  "harness",
+  "integration",
+] as const);
+
+export type ProviderKind = typeof ProviderKindSchema.Type;
+
+export const ProviderBindingSchema = Schema.Struct({
+  provider: Schema.String,
+  kind: ProviderKindSchema,
+  ref: Schema.NullOr(Schema.String),
+  status: Schema.Literals(["active", "available", "unavailable"] as const),
+  label: Schema.String,
+});
+
+export type ProviderBinding = typeof ProviderBindingSchema.Type;
+
 export const SessionSchema = Schema.Struct({
   id: Schema.String,
   nativeId: Schema.String,
@@ -82,6 +103,7 @@ export const SessionSchema = Schema.Struct({
   runId: Schema.NullOr(Schema.String),
   nodeId: Schema.NullOr(Schema.String),
   providerRef: Schema.NullOr(Schema.String),
+  providers: Schema.Array(ProviderBindingSchema),
   directory: Schema.String,
   registration: Schema.Literals(["connected", "hook", "managed"] as const),
   status: LifecycleStatusSchema,
@@ -136,7 +158,7 @@ export const WorkflowRunSchema = Schema.Struct({
 export type WorkflowRun = typeof WorkflowRunSchema.Type;
 
 export const WorkspaceStateSchema = Schema.Struct({
-  schemaVersion: Schema.Literal("orc.state/v2"),
+  schemaVersion: Schema.Literal("orc.state/v3"),
   scope: Schema.String,
   active: Schema.Boolean,
   updatedAt: Schema.String,
@@ -147,7 +169,7 @@ export const WorkspaceStateSchema = Schema.Struct({
 export type WorkspaceState = typeof WorkspaceStateSchema.Type;
 
 export const emptyWorkspace = (scope: string): WorkspaceState => ({
-  schemaVersion: "orc.state/v2",
+  schemaVersion: "orc.state/v3",
   scope,
   active: false,
   updatedAt: new Date(0).toISOString(),

@@ -96,6 +96,7 @@ const migrateSession = (value: unknown, now: string): Session | null => {
     nodeId: null,
     parentId: nullableString(item, "parentId"),
     purpose: stringValue(item, "purpose", "Agent session"),
+    providers: [],
     registration: "connected",
     reviewBy: null,
     role: item.role === "orchestrator" ? "orchestrator" : "worker",
@@ -110,7 +111,7 @@ const migrateSession = (value: unknown, now: string): Session | null => {
   };
 };
 
-const migrateV1 = (value: unknown): WorkspaceState | null => {
+const migrateV1 = (value: unknown): unknown | null => {
   const source = record(value);
   if (source?.schemaVersion !== "orc.state/v1") {
     return null;
@@ -170,17 +171,56 @@ const normalizeV2 = (value: unknown): unknown => {
   return { ...source, runs, sessions };
 };
 
+const migrateV2 = (value: unknown): unknown => {
+  const normalized = record(normalizeV2(value));
+  if (normalized?.schemaVersion !== "orc.state/v2") return value;
+  const sessions = Array.isArray(normalized.sessions)
+    ? normalized.sessions.map((value) => {
+        const session = record(value);
+        if (!session) return value;
+        const providerRef = nullableString(session, "providerRef");
+        return {
+          ...session,
+          providers: providerRef
+            ? [
+                {
+                  kind: "persistence",
+                  label: providerRef,
+                  provider: "legacy",
+                  ref: providerRef,
+                  status: "active",
+                },
+              ]
+            : [],
+        };
+      })
+    : [];
+  return { ...normalized, schemaVersion: "orc.state/v3", sessions };
+};
+
+const normalizeV3 = (value: unknown): unknown => {
+  const source = record(value);
+  if (source?.schemaVersion !== "orc.state/v3") return value;
+  const sessions = Array.isArray(source.sessions)
+    ? source.sessions.map((value) => {
+        const session = record(value);
+        return session ? { providers: [], ...session } : value;
+      })
+    : [];
+  return { ...source, sessions };
+};
+
 const decodeState = (
   value: unknown,
 ): Effect.Effect<WorkspaceState, StateError> => {
-  const migrated = migrateV1(value);
+  const migrated = migrateV2(migrateV1(value) ?? value);
   return Schema.decodeUnknownEffect(WorkspaceStateSchema)(
-    normalizeV2(migrated ?? value),
+    normalizeV3(migrated),
   ).pipe(
     Effect.mapError(
       (cause) =>
         new StateError({
-          message: "state file does not match orc.state/v2",
+          message: "state file does not match orc.state/v3",
           cause,
         }),
     ),

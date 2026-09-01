@@ -1,10 +1,18 @@
 # Orc
 
-Orc is a local control plane for agent harnesses. It records session contracts,
-shows their tree, and delegates host actions through an optional provider.
+Orc is a local control plane for agent harnesses. It records agent sessions and
+workflow graphs. External providers add host integrations.
 
-Orc uses the same TypeScript stack as OpenCode: Bun, Effect, TypeScript Native
-Preview, Solid, and OpenTUI.
+Orc uses the same TypeScript stack as OpenCode: Bun, Effect, Solid, and
+OpenTUI.
+
+## Terms
+
+- A session is one harness instance, such as one Codex or Claude conversation.
+- A workflow is one goal and its generated execution graph.
+- A node is one workflow stage with a role, contract, state, and optional
+  session.
+- Explorer is a view that nests workflows and sessions under each orchestrator.
 
 ## Use Orc
 
@@ -13,6 +21,16 @@ Open the dashboard for the current repository:
 ```bash
 orc
 ```
+
+The dashboard has three main tabs:
+
+- Explorer shows the complete hierarchy.
+- Workflow shows one workflow as a tree or graph.
+- Providers shows the discovered provider manifests.
+
+Press `Enter` on a workflow to open it. Press `Enter` on a session to attach.
+Use `t` and `g` for workflow tree and graph views. Use `hjkl` in the graph.
+Use `i` for activity and `c` for changes. Use `[` and `]` for detail tabs.
 
 Register an orchestrator session:
 
@@ -26,68 +44,69 @@ orc connect \
   --native-id "$CODEX_THREAD_ID"
 ```
 
-Register a child session with `--parent <orc-session-id>`. Add
-`--provider-ref <id>` when a provider owns the harness process.
+Register a child session with `--parent <orc-session-id>`.
 
 ```bash
 orc status --json
 orc list --json
+orc providers --json
 orc attach <orc-session-id> --direction right
 orc inspect <orc-session-id> --direction right
 orc disconnect <orc-session-id>
 ```
 
-Orc discovers external providers from `$XDG_CONFIG_HOME/orc/providers/*.json`.
-Each manifest advertises capabilities and one command:
+## Providers
+
+Orc discovers manifests from `~/.config/orc/providers/*.json`. Set
+`ORC_PROVIDER_DIR` to use another directory.
+
+Each provider advertises one kind and a set of capabilities:
 
 ```json
 {
   "version": "orc.provider/v1",
-  "name": "terminal",
-  "command": "/path/to/orc-provider-terminal",
-  "capabilities": ["terminal.open"],
-  "priority": 10
+  "name": "wezterm",
+  "kind": "display",
+  "command": "/path/to/orc-provider-wezterm",
+  "capabilities": ["session.bind", "terminal.open"],
+  "priority": 100
 }
 ```
 
-The command can use an absolute path or a name on `PATH`. Orc selects the
-highest-priority provider for each capability. Equal top priorities produce an
-ambiguity error.
+Provider kinds describe session facets:
 
-Actions resolve to capability chains:
+- `harness` resumes the native harness session.
+- `persistence` keeps a process available after its display closes.
+- `display` opens the selected command for the user.
+- `activity` supplies messages, reasoning summaries, and tool activity.
+- `changes` supplies repository changes.
+
+Several providers can bind to one session. Orc reconciles every recorded
+session when the dashboard opens. It also reconciles new hook registrations.
+
+An active Zmx binding requires the harness process to start inside Zmx. Zmx
+cannot wrap a process that already runs. An existing session can still gain a
+Zmx binding when its next harness resume starts through Zmx.
+
+Actions resolve through capability chains:
 
 ```text
-attach   session.attach -> terminal.open
-inspect  session.inspect -> terminal.open
-changes  changes.inspect
-launch   session.launch
+attach    session.attach -> terminal.open
+inspect   session.inspect -> terminal.open
+activity  session.inspect
+changes   changes.inspect
+launch    session.launch
 ```
 
-Orc writes one `orc.provider/v1` request to each provider's standard input.
-The request includes the capability and the prior command plan. A provider
-writes the next command plan to standard output:
+Orc writes one `orc.provider/v1` request to each provider command. A provider
+can return a command plan, a session binding, a description, or an explicit
+decline. An explicit decline lets the next provider handle that capability.
 
-```json
-{
-  "version": "orc.provider/v1",
-  "command": ["session-tool", "attach", "session-id"],
-  "cwd": "/work/project",
-  "environment": {}
-}
-```
+The final command plan inherits terminal state. Captured actions preserve ANSI
+color. Orc itself does not import Zmx, WezTerm, Traces, or Changes.
 
-The final plan runs with inherited terminal state. Captured actions preserve
-standard output, standard error, and terminal colors. `ORC_PROVIDER_DIR` selects
-another manifest directory for tests or temporary configurations.
-
-Without a provider, Orc still records sessions, runs, nodes, and contracts.
-Direct `orc launch` also works. Use `--managed <id>` to delegate a launch.
-
-Orc becomes active when the first session connects. It becomes idle when the
-last active session disconnects. Orc does not require a broker process.
-
-The dashboard generates its footer and help view from the same bindings that
-handle input. A binding change updates both views.
+Without providers, Orc still records sessions, workflows, nodes, and contracts.
+Orc requires no broker process.
 
 ## Develop Orc
 

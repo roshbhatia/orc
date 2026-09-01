@@ -10,6 +10,8 @@ import {
   type WorkspaceState,
 } from "./domain.ts";
 import {
+  describeSession,
+  discoverSessionBindings,
   invokeProvider,
   providerOutput,
   resolveProviderChain,
@@ -93,6 +95,7 @@ const upsertSession = (
           command.tag === "session-register" ? (command.nodeId ?? null) : null,
         parentId: chooseParent(state, command.role, command.parentId),
         purpose: command.purpose,
+        providers: current?.providers ?? [],
         registration,
         reviewBy: command.reviewBy ?? null,
         role: command.role,
@@ -182,6 +185,78 @@ export const readWorkspace = (
   Effect.gen(function* () {
     const resolved = yield* resolveScope(scope);
     return yield* resolved.store.read(resolved.scope);
+  });
+
+const mergeBindings = (
+  current: Session["providers"],
+  discovered: Session["providers"],
+): Session["providers"] => [
+  ...discovered,
+  ...current.filter(
+    (binding) =>
+      !discovered.some(
+        (candidate) =>
+          candidate.provider === binding.provider &&
+          candidate.kind === binding.kind,
+      ),
+  ),
+];
+
+const genericTitle = (session: Session): boolean =>
+  session.title === "Agent session" ||
+  session.title === session.id ||
+  session.title === session.harness;
+
+const genericGoal = (session: Session): boolean =>
+  session.goal === "Complete the assigned work" ||
+  session.goal === `Run ${session.harness}`;
+
+export const reconcileSession = (
+  scope: string,
+  id: string,
+): Effect.Effect<Session, StateError, StateStoreService> =>
+  Effect.gen(function* () {
+    const resolved = yield* resolveScope(scope);
+    const state = yield* resolved.store.read(resolved.scope);
+    const session = yield* selectedSession(state, id);
+    const [providers, description] = yield* Effect.all([
+      discoverSessionBindings(resolved.scope, session),
+      describeSession(resolved.scope, session),
+    ]);
+    let result = session;
+    yield* resolved.store.update(resolved.scope, (current) => {
+      const now = new Date().toISOString();
+      const sessions = current.sessions.map((candidate) => {
+        if (candidate.id !== id) return candidate;
+        result = {
+          ...candidate,
+          goal:
+            genericGoal(candidate) && description.goal
+              ? description.goal
+              : candidate.goal,
+          providers: mergeBindings(candidate.providers, providers),
+          title:
+            genericTitle(candidate) && description.title
+              ? description.title
+              : candidate.title,
+          updatedAt: now,
+        };
+        return result;
+      });
+      return { ...current, sessions, updatedAt: now };
+    });
+    return result;
+  });
+
+export const reconcileWorkspace = (
+  scope: string,
+): Effect.Effect<WorkspaceState, StateError, StateStoreService> =>
+  Effect.gen(function* () {
+    const state = yield* readWorkspace(scope);
+    yield* Effect.forEach(state.sessions, (session) =>
+      reconcileSession(state.scope, session.id).pipe(Effect.ignore),
+    );
+    return yield* readWorkspace(state.scope);
   });
 
 export const currentSession = (state: WorkspaceState): Session | undefined => {

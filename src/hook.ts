@@ -1,6 +1,6 @@
 import { Effect } from "effect";
 import type { Command } from "./args.ts";
-import { readWorkspace, registerSession } from "./control.ts";
+import { readWorkspace, reconcileSession, registerSession } from "./control.ts";
 import type { Session } from "./domain.ts";
 import { StateError, type StateStoreService } from "./state.ts";
 
@@ -75,7 +75,7 @@ export const registerFromHook = (
       command.hookInput && !process.env.ORC_PARENT_SESSION_ID
         ? "orchestrator"
         : command.role;
-    return yield* registerSession(
+    const session = yield* registerSession(
       {
         ...command,
         goal: context.goal ?? command.goal,
@@ -89,5 +89,8 @@ export const registerFromHook = (
         ...(context.nativeId ? { nativeId: context.nativeId } : {}),
         ...(context.traceId ? { traceId: context.traceId } : {}),
       },
+    );
+    return yield* reconcileSession(directory, session.id).pipe(
+      Effect.catch(() => Effect.succeed(session)),
     );
   });
