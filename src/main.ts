@@ -1,7 +1,8 @@
 import { Effect } from "effect";
+import packageJson from "../package.json" with { type: "json" };
 import { run } from "./run.ts";
 
-const version = "0.2.0";
+const version = packageJson.version;
 
 const streams = {
   stderr: (value: string) => console.error(value),

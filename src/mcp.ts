@@ -1,4 +1,5 @@
 import { Effect } from "effect";
+import packageJson from "../package.json" with { type: "json" };
 import {
   createRun,
   currentSession,
@@ -378,7 +379,7 @@ export const handleMcpRequest = async (
       return response(request.id, {
         capabilities: { tools: { listChanged: false } },
         protocolVersion: "2025-06-18",
-        serverInfo: { name: "orc", version: "0.2.0" },
+        serverInfo: { name: "orc", version: packageJson.version },
       });
     if (request.method === "ping") return response(request.id, {});
     if (request.method === "tools/list")
