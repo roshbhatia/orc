@@ -1,0 +1,38 @@
+[package]
+name = "orc"
+version = "0.7.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Local control plane for agent harnesses"
+license = "MIT"
+repository = "https://github.com/roshbhatia/orc"
+
+[dependencies]
+anyhow = "1"
+ansi-to-tui = "8.0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+clap_complete = "4.5"
+clap_complete_nushell = "4.5"
+crossterm = "0.29"
+hex = "0.4"
+rataflow = { version = "0.1.0", default-features = false, features = ["crossterm", "sugiyama"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+schemars = { version = "1", features = ["chrono04"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+unicode-width = "0.2"
+uuid = { version = "1", features = ["v4"] }
+wait-timeout = "0.2"
+which = "8"
+
+[dev-dependencies]
+insta = "1"
+
+[profile.release]
+lto = "thin"
+strip = true

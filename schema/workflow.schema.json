@@ -1,0 +1,507 @@
+{
+  "$defs": {
+    "ApprovalGate": {
+      "properties": {
+        "authority": {
+          "$ref": "#/$defs/GateAuthority",
+          "default": "user"
+        },
+        "before": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "before",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "ApprovalMode": {
+      "enum": [
+        "full_auto",
+        "supervised",
+        "manual"
+      ],
+      "type": "string"
+    },
+    "ApprovalPolicy": {
+      "properties": {
+        "gates": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ApprovalGate"
+          },
+          "type": "array"
+        },
+        "mode": {
+          "$ref": "#/$defs/ApprovalMode",
+          "default": "supervised"
+        }
+      },
+      "type": "object"
+    },
+    "CompletionTarget": {
+      "enum": [
+        "orchestrator",
+        "judge"
+      ],
+      "type": "string"
+    },
+    "ContextMode": {
+      "enum": [
+        "accumulate",
+        "last_only",
+        "explicit"
+      ],
+      "type": "string"
+    },
+    "FailureMode": {
+      "enum": [
+        "fail_fast",
+        "continue_on_error",
+        "all_or_nothing"
+      ],
+      "type": "string"
+    },
+    "ForEach": {
+      "properties": {
+        "as": {
+          "default": "item",
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "type": "object"
+    },
+    "GateAuthority": {
+      "enum": [
+        "user",
+        "orchestrator_then_user",
+        "orchestrator"
+      ],
+      "type": "string"
+    },
+    "Limits": {
+      "properties": {
+        "budget_usd": {
+          "default": null,
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_iterations": {
+          "default": 50,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "timeout_seconds": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ParallelGroup": {
+      "properties": {
+        "agent": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agents": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "description": {
+          "default": "",
+          "type": "string"
+        },
+        "failure_mode": {
+          "$ref": "#/$defs/FailureMode",
+          "default": "fail_fast"
+        },
+        "for_each": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ForEach"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "max_concurrent": {
+          "default": null,
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "default": "",
+          "type": "string"
+        },
+        "routes": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Route"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "RetryPolicy": {
+      "properties": {
+        "attempts": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "backoff_seconds": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "Route": {
+      "properties": {
+        "to": {
+          "type": "string"
+        },
+        "when": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "to"
+      ],
+      "type": "object"
+    },
+    "Runtime": {
+      "properties": {
+        "execution": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "harness": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasoning": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SessionRole": {
+      "enum": [
+        "orchestrator",
+        "planner",
+        "researcher",
+        "implementer",
+        "critic",
+        "judge",
+        "verifier",
+        "operator",
+        "generalist",
+        "worker"
+      ],
+      "type": "string"
+    },
+    "Step": {
+      "properties": {
+        "command": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "completion": {
+          "$ref": "#/$defs/CompletionTarget",
+          "default": "orchestrator"
+        },
+        "depends_on": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "duration": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expected_output": {
+          "default": "A verified result",
+          "type": "string"
+        },
+        "goal": {
+          "default": "",
+          "type": "string"
+        },
+        "input_mapping": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "max_depth": {
+          "default": null,
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "default": "",
+          "type": "string"
+        },
+        "prompt": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "purpose": {
+          "default": "",
+          "type": "string"
+        },
+        "requires_approval": {
+          "default": false,
+          "type": "boolean"
+        },
+        "retry": {
+          "$ref": "#/$defs/RetryPolicy",
+          "default": {
+            "attempts": 0,
+            "backoff_seconds": 0
+          }
+        },
+        "review_by": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "$ref": "#/$defs/SessionRole",
+          "default": "worker"
+        },
+        "routes": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Route"
+          },
+          "type": "array"
+        },
+        "runtime": {
+          "$ref": "#/$defs/Runtime",
+          "default": {
+            "execution": null,
+            "harness": null,
+            "model": null,
+            "reasoning": null
+          }
+        },
+        "success_criteria": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "timeout_seconds": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "type": {
+          "$ref": "#/$defs/StepKind",
+          "default": "agent"
+        },
+        "value": {
+          "default": null
+        },
+        "workflow": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "StepKind": {
+      "enum": [
+        "agent",
+        "script",
+        "set",
+        "wait",
+        "workflow",
+        "terminate",
+        "human_gate"
+      ],
+      "type": "string"
+    },
+    "WorkflowDefaults": {
+      "properties": {
+        "context": {
+          "$ref": "#/$defs/ContextMode",
+          "default": "explicit"
+        },
+        "runtime": {
+          "$ref": "#/$defs/Runtime",
+          "default": {
+            "execution": null,
+            "harness": null,
+            "model": null,
+            "reasoning": null
+          }
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "approval": {
+      "$ref": "#/$defs/ApprovalPolicy",
+      "default": {
+        "gates": [],
+        "mode": "supervised"
+      }
+    },
+    "defaults": {
+      "$ref": "#/$defs/WorkflowDefaults",
+      "default": {
+        "context": "explicit",
+        "runtime": {
+          "execution": null,
+          "harness": null,
+          "model": null,
+          "reasoning": null
+        }
+      }
+    },
+    "description": {
+      "default": "",
+      "type": "string"
+    },
+    "entry_point": {
+      "default": "",
+      "type": "string"
+    },
+    "expected_output": {
+      "default": "A verified result",
+      "type": "string"
+    },
+    "goal": {
+      "default": "",
+      "type": "string"
+    },
+    "input": {
+      "additionalProperties": true,
+      "default": {},
+      "type": "object"
+    },
+    "limits": {
+      "$ref": "#/$defs/Limits",
+      "default": {
+        "budget_usd": null,
+        "max_iterations": 50,
+        "timeout_seconds": null
+      }
+    },
+    "name": {
+      "default": "",
+      "type": "string"
+    },
+    "parallel": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ParallelGroup"
+      },
+      "type": "array"
+    },
+    "steps": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Step"
+      },
+      "type": "array"
+    },
+    "version": {
+      "default": "orc.workflow/v1",
+      "type": "string"
+    }
+  },
+  "title": "Definition",
+  "type": "object"
+}

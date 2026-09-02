@@ -5,18 +5,26 @@
 ![Orc animated workflow graph](docs/orc.gif)
 
 Orc is a local control plane for agent harnesses. It records agent sessions and
-workflow graphs. External providers add host integrations.
+executes versioned workflow graphs. External providers add harness, execution,
+persistence, display, activity, and change integrations.
 
-Orc uses the same TypeScript stack as OpenCode: Bun, Effect, Solid, and
-OpenTUI.
+The core is a standalone Rust CLI. Its full-screen interface uses Ratatui and
+Rataflow. Orc does not require a broker, terminal multiplexer, or specific
+agent harness.
 
 ## Terms
 
-- A session is one harness instance, such as one Codex or Claude conversation.
-- A workflow is one goal and its generated execution graph.
-- A node is one workflow stage with a role, contract, state, and optional
+- An orchestrator is the root harness session for one workspace.
+- A workflow is a versioned YAML definition stored in Orc's Git catalog.
+- A run is one execution of a workflow definition.
+- A node is one stage with a role, contract, state, and optional harness
   session.
-- Explorer is a view that nests workflows and sessions under each orchestrator.
+- A provider is an external command that implements one or more Orc
+  capabilities.
+
+Sessions and workflow state are bound to the canonical repository directory.
+Resuming a harness in that directory can adopt it as the current orchestrator
+without reviving an unrelated workspace.
 
 ## Use Orc
 
@@ -26,15 +34,21 @@ Open the dashboard for the current repository:
 orc
 ```
 
-The dashboard has three main tabs:
+The dashboard has two main tabs:
 
-- Explorer shows the complete hierarchy.
-- Workflow shows one workflow as a tree or graph.
+- Explorer shows the active run as a graph. It also includes tree and fleet
+  views.
 - Providers shows the discovered provider manifests.
 
-Press `Enter` on a workflow to open it. Press `Enter` on a session to attach.
-Use `t` and `g` for workflow tree and graph views. Use `hjkl` in the graph.
-Use `i` for activity and `c` for changes. Use `[` and `]` for detail tabs.
+The graph always places the orchestrator above its stages. Dependency arrows
+flow down. Review feedback and report-back arrows remain visible without
+changing the layout. Press `Enter` on a run to open its graph. Press `Enter` on
+a session to attach through providers.
+
+Use `g`, `t`, and `f` for graph, tree, and fleet views. Use `hjkl` inside the
+focused pane. Use `Ctrl-h/j/k/l` to move between the graph, details, and output
+panes. `Tab` and `Shift-Tab` change the Log, Activity, Output, and Changes
+views. Press `?` for generated key help.
 
 Register an orchestrator session:
 
@@ -53,7 +67,7 @@ Register a child session with `--parent <orc-session-id>`.
 ```bash
 orc status --json
 orc list --json
-orc providers --json
+orc provider list --json
 orc attach <orc-session-id> --direction right
 orc inspect <orc-session-id> --direction right
 orc disconnect <orc-session-id>
@@ -65,6 +79,38 @@ Use `orc session adopt` inside a pre-existing harness session to make it the
 new orchestrator for the current directory. Orc archives the previous active
 orchestrator incarnation. Use `orc session archive` when an unhooked harness
 ends. Harness exit hooks should call `orc session archive --hook-input --quiet`.
+
+## Run a workflow
+
+Create a starter definition in the current workspace's workflow catalog:
+
+```bash
+orc workflow init provider-migration
+orc workflow edit provider-migration
+orc workflow validate "$(orc workflow path provider-migration)"
+orc workflow plan provider-migration
+orc workflow start provider-migration --background
+```
+
+An orchestrator can also propose and start definitions through Orc's MCP
+tools. Orc validates the proposal before it commits the YAML definition. Ready
+nodes run concurrently. Each agent node chooses a harness, model, and execution
+provider. A nested workflow node composes another definition.
+
+Approval modes control human gates:
+
+- `full_auto` runs every ready node.
+- `supervised` pauses only at declared or node-level gates.
+- `manual` pauses before every node.
+
+Use `orc run approve <run-id>` to continue a waiting run. Use
+`orc guide <session-id> --text '...'` for a provider-supported correction.
+Use `orc run cancel <run-id>` to stop a run.
+
+Workflow definitions live under `~/.local/share/orc/workflows` by default.
+Each workspace gets a directory inside that Git repository. Use
+`orc workflow history`, `orc workflow search`, and `orc workflow path` to
+inspect prior definitions.
 
 ## Providers
 
@@ -111,22 +157,25 @@ An active Zmx binding requires the harness process to start inside Zmx. Zmx
 cannot wrap a process that already runs. An existing session can still gain a
 Zmx binding when its next harness resume starts through Zmx.
 
-Actions resolve through capability chains:
+Actions resolve through capability chains. Optional steps are marked with `?`:
 
 ```text
-attach    session.attach -> terminal.open
+attach    session.attach -> session.persist? -> terminal.open
 inspect   session.inspect -> terminal.open
 activity  session.inspect
 changes   changes.inspect
-launch    session.launch
+launch    session.launch -> session.persist? -> execution.run
+execute   execution.run
 ```
 
 Orc writes one `orc.provider/v1` request to each provider command. A provider
 can return a command plan, a session binding, a description, or an explicit
 decline. An explicit decline lets the next provider handle that capability.
 
-The final command plan inherits terminal state. Captured actions preserve ANSI
-color. Orc itself does not import Zmx, WezTerm, Traces, or Changes.
+The final command plan inherits terminal state. Captured output preserves ANSI
+color in the TUI. Reconciliation caches content-addressed binding and
+description responses for the configured TTL. Orc itself does not import Zmx,
+WezTerm, Traces, or Changes.
 
 The optional provider packages live in [`extras/`](extras/README.md). Install
 only the adapters your environment uses:
@@ -153,6 +202,13 @@ cache:
 providers:
   directory: ~/.config/orc/providers
   timeoutMs: 5000
+workflows:
+  repository: ~/.local/share/orc/workflows
+  autoCommit: true
+  maxDepth: 10
+ui:
+  refreshMs: 750
+  inspectorPercent: 38
 ```
 
 Every scalar supports a nested environment override:
@@ -161,510 +217,775 @@ Every scalar supports a nested environment override:
 ORC_CACHE_PROVIDER_TTL_MS=0 orc status
 ORC_PROVIDERS_DIRECTORY=/tmp/orc-providers orc providers
 ORC_PROVIDERS_TIMEOUT_MS=10000 orc
+ORC_WORKFLOWS_REPOSITORY=/tmp/orc-workflows orc workflow list
+ORC_UI_REFRESH_MS=1000 orc
 ```
 
 `ORC_PROVIDER_DIR` and `ORC_PROVIDER_TIMEOUT_MS` remain compatibility aliases.
 The generated schema supports YAML editor validation.
 
 <!-- BEGIN GENERATED:commands -->
-## Command reference
-
 ### `orc tui`
 
 Open the control plane
 
 ```text
-orc tui
-```
+Open the control plane
+
+Usage: tui [OPTIONS]
 
 Options:
-
-- `--scope <value>`: Select a workspace scope
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+  -h, --help           Print help
+```
 
 ### `orc status`
 
 Show workspace status
 
 ```text
-orc status
-```
+Show workspace status
+
+Usage: status [OPTIONS]
 
 Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--json`: Print JSON
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --json
+  -h, --help           Print help
+```
 
 ### `orc list`
 
 List registered sessions
 
 ```text
-orc list
-```
+List registered sessions
+
+Usage: list [OPTIONS]
 
 Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--json`: Print JSON
-
-### `orc providers`
-
-List provider manifests
-
-```text
-orc providers
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --json
+  -h, --help           Print help
 ```
-
-Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--json`: Print JSON
-
-### `orc provider`
-
-Inspect and validate providers
-
-```text
-orc provider list|validate
-```
-
 
 ### `orc connect`
 
 Register the current session
 
 ```text
-orc connect
-```
+Register the current session
+
+Usage: connect [OPTIONS]
 
 Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--harness <value>`: Select an agent harness
-- `--model <value>`: Select a harness model
-- `--role <orchestrator|planner|researcher|implementer|critic|judge|verifier|operator|generalist|worker>`: Set the agent role
-- `--title <value>`: Set the display title
-- `--purpose <value>`: Explain why the agent exists
-- `--goal <value>`: Set the agent goal
-- `--expected-output <value>`: Describe the expected output
-- `--success <value>`: Add one success criterion
-- `--completion <orchestrator|judge>`: Select the completion target
-- `--review-by <value>`: Set the review node
-- `--id <value>`: Set the Orc session id
-- `--native-id <value>`: Set the harness session id
-- `--parent <value>`: Set the parent session
-- `--provider-ref <value>`: Set the provider session reference
+      --scope <SCOPE>                      [env: ORC_SCOPE=] [default: .]
+      --harness <HARNESS>                  [default: unknown]
+      --model <MODEL>
+      --role <ROLE>                        [default: worker]
+      --title <TITLE>                      [default: "Agent session"]
+      --purpose <PURPOSE>                  [default: "Agent session"]
+      --goal <GOAL>                        [default: "Complete the assigned work"]
+      --expected-output <EXPECTED_OUTPUT>  [default: "A verified result"]
+      --success <SUCCESS_CRITERIA>
+      --completion <COMPLETION>            [default: orchestrator]
+      --review-by <REVIEW_BY>
+      --id <ID>
+      --native-id <NATIVE_ID>
+      --parent <PARENT_ID>
+      --run <RUN_ID>
+      --node <NODE_ID>
+      --provider-ref <PROVIDER_REF>
+      --source <SOURCE>                    [default: connected]
+      --hook-input
+      --quiet
+  -h, --help                               Print help
+```
 
 ### `orc session`
 
 Manage sessions
 
 ```text
-orc session register|current|list|update
+Manage sessions
+
+Usage: session <COMMAND>
+
+Commands:
+  register
+  adopt
+  archive
+  current
+  list
+  update
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
 ```
 
+### `orc session register`
+
+```text
+Usage: register [OPTIONS]
+
+Options:
+      --scope <SCOPE>                      [env: ORC_SCOPE=] [default: .]
+      --harness <HARNESS>                  [default: unknown]
+      --model <MODEL>
+      --role <ROLE>                        [default: worker]
+      --title <TITLE>                      [default: "Agent session"]
+      --purpose <PURPOSE>                  [default: "Agent session"]
+      --goal <GOAL>                        [default: "Complete the assigned work"]
+      --expected-output <EXPECTED_OUTPUT>  [default: "A verified result"]
+      --success <SUCCESS_CRITERIA>
+      --completion <COMPLETION>            [default: orchestrator]
+      --review-by <REVIEW_BY>
+      --id <ID>
+      --native-id <NATIVE_ID>
+      --parent <PARENT_ID>
+      --run <RUN_ID>
+      --node <NODE_ID>
+      --provider-ref <PROVIDER_REF>
+      --source <SOURCE>                    [default: connected]
+      --hook-input
+      --quiet
+  -h, --help                               Print help
+```
+
+### `orc session adopt`
+
+```text
+Usage: adopt [OPTIONS]
+
+Options:
+      --scope <SCOPE>                      [env: ORC_SCOPE=] [default: .]
+      --harness <HARNESS>                  [default: unknown]
+      --model <MODEL>
+      --role <ROLE>                        [default: worker]
+      --title <TITLE>                      [default: "Agent session"]
+      --purpose <PURPOSE>                  [default: "Agent session"]
+      --goal <GOAL>                        [default: "Complete the assigned work"]
+      --expected-output <EXPECTED_OUTPUT>  [default: "A verified result"]
+      --success <SUCCESS_CRITERIA>
+      --completion <COMPLETION>            [default: orchestrator]
+      --review-by <REVIEW_BY>
+      --native-id <NATIVE_ID>
+  -h, --help                               Print help
+```
+
+### `orc session archive`
+
+```text
+Usage: archive [OPTIONS] [ID]
+
+Arguments:
+  [ID]
+
+Options:
+      --scope <SCOPE>          [env: ORC_SCOPE=] [default: .]
+      --native-id <NATIVE_ID>
+      --hook-input
+      --quiet
+  -h, --help                   Print help
+```
+
+### `orc session current`
+
+```text
+Usage: current [OPTIONS]
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --json
+  -h, --help           Print help
+```
+
+### `orc session list`
+
+```text
+Usage: list [OPTIONS]
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --json
+  -h, --help           Print help
+```
+
+### `orc session update`
+
+```text
+Usage: update [OPTIONS] --status <STATUS> <ID>
+
+Arguments:
+  <ID>
+
+Options:
+      --scope <SCOPE>    [env: ORC_SCOPE=] [default: .]
+      --status <STATUS>
+  -h, --help             Print help
+```
 
 ### `orc run`
 
 Manage workflow runs
 
 ```text
-orc run create|agent|list|show|update
+Manage workflow runs
+
+Usage: run <COMMAND>
+
+Commands:
+  create
+  agent
+  list
+  show
+  update
+  resume
+  approve
+  cancel
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
 ```
 
+### `orc run create`
+
+```text
+Usage: create [OPTIONS] --name <NAME> --goal <GOAL> --expected-output <EXPECTED_OUTPUT>
+
+Options:
+      --scope <SCOPE>                      [env: ORC_SCOPE=] [default: .]
+      --name <NAME>
+      --goal <GOAL>
+      --expected-output <EXPECTED_OUTPUT>
+      --orchestrator <ORCHESTRATOR_ID>
+      --harness <HARNESS>
+      --model <MODEL>
+      --json
+  -h, --help                               Print help
+```
+
+### `orc run agent`
+
+```text
+Usage: agent [OPTIONS] --role <ROLE> --harness <HARNESS> <ID>
+
+Arguments:
+  <ID>
+
+Options:
+      --scope <SCOPE>      [env: ORC_SCOPE=] [default: .]
+      --role <ROLE>
+      --harness <HARNESS>
+      --model <MODEL>
+  -h, --help               Print help
+```
+
+### `orc run list`
+
+```text
+Usage: list [OPTIONS]
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --json
+  -h, --help           Print help
+```
+
+### `orc run show`
+
+```text
+Usage: show [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --json
+  -h, --help           Print help
+```
+
+### `orc run update`
+
+```text
+Usage: update [OPTIONS] --status <STATUS> <ID>
+
+Arguments:
+  <ID>
+
+Options:
+      --scope <SCOPE>    [env: ORC_SCOPE=] [default: .]
+      --status <STATUS>
+  -h, --help             Print help
+```
+
+### `orc run resume`
+
+```text
+Usage: resume [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+  -h, --help           Print help
+```
+
+### `orc run approve`
+
+```text
+Usage: approve [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --gate <GATE>
+      --no-resume
+  -h, --help           Print help
+```
+
+### `orc run cancel`
+
+```text
+Usage: cancel [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+  -h, --help           Print help
+```
 
 ### `orc node`
 
 Manage workflow nodes
 
 ```text
-orc node upsert|update
+Manage workflow nodes
+
+Usage: node <COMMAND>
+
+Commands:
+  upsert
+  update
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
 ```
 
+### `orc node upsert`
+
+```text
+Usage: upsert [OPTIONS] --run <RUN_ID> <ID>
+
+Arguments:
+  <ID>
+
+Options:
+      --scope <SCOPE>                      [env: ORC_SCOPE=] [default: .]
+      --run <RUN_ID>
+      --harness <HARNESS>                  [default: unknown]
+      --model <MODEL>
+      --role <ROLE>                        [default: worker]
+      --title <TITLE>                      [default: "Agent session"]
+      --purpose <PURPOSE>                  [default: "Agent session"]
+      --goal <GOAL>                        [default: "Complete the assigned work"]
+      --expected-output <EXPECTED_OUTPUT>  [default: "A verified result"]
+      --success <SUCCESS_CRITERIA>
+      --completion <COMPLETION>            [default: orchestrator]
+      --review-by <REVIEW_BY>
+      --session <SESSION_ID>
+      --status <STATUS>                    [default: queued]
+      --attempt <ATTEMPT>                  [default: 0]
+      --depends-on <DEPENDS_ON>
+  -h, --help                               Print help
+```
+
+### `orc node update`
+
+```text
+Usage: update [OPTIONS] --run <RUN_ID> --status <STATUS> <ID>
+
+Arguments:
+  <ID>
+
+Options:
+      --scope <SCOPE>    [env: ORC_SCOPE=] [default: .]
+      --run <RUN_ID>
+      --status <STATUS>
+  -h, --help             Print help
+```
+
+### `orc provider`
+
+Manage provider manifests
+
+```text
+Manage provider manifests
+
+Usage: provider <COMMAND>
+
+Commands:
+  list
+  validate
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+### `orc provider list`
+
+```text
+Usage: list [OPTIONS]
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --json
+  -h, --help           Print help
+```
+
+### `orc provider validate`
+
+```text
+Usage: validate [OPTIONS] [NAME]
+
+Arguments:
+  [NAME]
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --json
+  -h, --help           Print help
+```
+
+### `orc workflow`
+
+Manage versioned workflow definitions
+
+```text
+Manage versioned workflow definitions
+
+Usage: workflow <COMMAND>
+
+Commands:
+  init
+  import
+  list
+  show
+  edit
+  validate
+  plan
+  start
+  history
+  search
+  path
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+### `orc workflow init`
+
+```text
+Usage: init [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+  -h, --help           Print help
+```
+
+### `orc workflow import`
+
+```text
+Usage: import [OPTIONS] <PATH>
+
+Arguments:
+  <PATH>
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+  -h, --help           Print help
+```
+
+### `orc workflow list`
+
+```text
+Usage: list [OPTIONS]
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+  -h, --help           Print help
+```
+
+### `orc workflow show`
+
+```text
+Usage: show [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+  -h, --help           Print help
+```
+
+### `orc workflow edit`
+
+```text
+Usage: edit [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+  -h, --help           Print help
+```
+
+### `orc workflow validate`
+
+```text
+Usage: validate <WORKFLOW>
+
+Arguments:
+  <WORKFLOW>
+
+Options:
+  -h, --help  Print help
+```
+
+### `orc workflow plan`
+
+```text
+Usage: plan [OPTIONS] <WORKFLOW>
+
+Arguments:
+  <WORKFLOW>
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --json
+  -h, --help           Print help
+```
+
+### `orc workflow start`
+
+```text
+Usage: start [OPTIONS] <WORKFLOW>
+
+Arguments:
+  <WORKFLOW>
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --background
+      --json
+  -h, --help           Print help
+```
+
+### `orc workflow history`
+
+```text
+Usage: history [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+  -h, --help           Print help
+```
+
+### `orc workflow search`
+
+```text
+Usage: search <QUERY>
+
+Arguments:
+  <QUERY>
+
+Options:
+  -h, --help  Print help
+```
+
+### `orc workflow path`
+
+```text
+Usage: path [OPTIONS] <NAME>
+
+Arguments:
+  <NAME>
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+  -h, --help           Print help
+```
 
 ### `orc launch`
 
 Launch a managed harness
 
 ```text
-orc launch <harness> [-- args]
-```
+Launch a managed harness
+
+Usage: launch [OPTIONS] <HARNESS> [-- <ARGS>...]
+
+Arguments:
+  <HARNESS>
+  [ARGS]...
 
 Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--managed <value>`: Set the managed session id
-- `--model <value>`: Select a harness model
+      --scope <SCOPE>      [env: ORC_SCOPE=] [default: .]
+      --model <MODEL>
+      --managed <MANAGED>
+  -h, --help               Print help
+```
 
 ### `orc attach`
 
-Attach through a session provider
+Attach through a provider chain
 
 ```text
-orc attach <session-id>
-```
+Attach through a provider chain
+
+Usage: attach [OPTIONS] <ID>
+
+Arguments:
+  <ID>
 
 Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--direction <right|left|top|bottom>`: Select the split direction
+      --scope <SCOPE>          [env: ORC_SCOPE=] [default: .]
+      --direction <DIRECTION>  [default: right] [possible values: right, left, top, bottom]
+  -h, --help                   Print help
+```
 
 ### `orc inspect`
 
-Inspect through a session provider
+Inspect through a provider chain
 
 ```text
-orc inspect <session-id>
-```
+Inspect through a provider chain
+
+Usage: inspect [OPTIONS] <ID>
+
+Arguments:
+  <ID>
 
 Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--direction <right|left|top|bottom>`: Select the split direction
+      --scope <SCOPE>          [env: ORC_SCOPE=] [default: .]
+      --direction <DIRECTION>  [default: right] [possible values: right, left, top, bottom]
+  -h, --help                   Print help
+```
 
 ### `orc disconnect`
 
 Disconnect a registered session
 
 ```text
-orc disconnect [session-id]
-```
+Disconnect a registered session
+
+Usage: disconnect [OPTIONS] [ID]
+
+Arguments:
+  [ID]
 
 Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+  -h, --help           Print help
+```
 
-- `--scope <value>`: Select a workspace scope
+### `orc guide`
+
+Send mid-run guidance
+
+```text
+Send mid-run guidance
+
+Usage: guide [OPTIONS] --text <TEXT> <ID>
+
+Arguments:
+  <ID>
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --text <TEXT>
+  -h, --help           Print help
+```
 
 ### `orc mcp`
 
 Run the MCP server
 
 ```text
-orc mcp
-```
+Run the MCP server
 
+Usage: mcp
+
+Options:
+  -h, --help  Print help
+```
 
 ### `orc prompt`
 
 Print the prompt session marker
 
 ```text
-orc prompt
-```
+Print the prompt session marker
+
+Usage: prompt [OPTIONS]
 
 Options:
-
-- `--scope <value>`: Select a workspace scope
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+  -h, --help           Print help
+```
 
 ### `orc completion`
 
 Generate shell completions
 
 ```text
-orc completion bash|zsh|fish|nu
-```
+Generate shell completions
 
+Usage: completion <SHELL>
 
-### `orc help`
-
-Show command help
-
-```text
-orc help
-```
-
-
-### `orc version`
-
-Show the Orc version
-
-```text
-orc version
-```
-
-
-### `orc completion bash`
-
-Generate Bash completions
-
-```text
-orc completion bash
-```
-
-
-### `orc completion fish`
-
-Generate Fish completions
-
-```text
-orc completion fish
-```
-
-
-### `orc completion nu`
-
-Generate Nushell completions
-
-```text
-orc completion nu
-```
-
-
-### `orc completion zsh`
-
-Generate Zsh completions
-
-```text
-orc completion zsh
-```
-
-
-### `orc node upsert`
-
-Create or replace a workflow node
-
-```text
-orc node upsert
-```
+Arguments:
+  <SHELL>  [possible values: bash, zsh, fish, nu]
 
 Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--run <value>`: Select the workflow run
-- `--session <value>`: Set the linked session
-- `--status <queued|working|waiting|blocked|failed|done|cancelled|disconnected|archived>`: Set lifecycle status
-- `--attempt <value>`: Set the attempt number
-- `--depends-on <value>`: Add a dependency node
-- `--harness <value>`: Select an agent harness
-- `--model <value>`: Select a harness model
-- `--role <orchestrator|planner|researcher|implementer|critic|judge|verifier|operator|generalist|worker>`: Set the agent role
-- `--title <value>`: Set the display title
-- `--purpose <value>`: Explain why the agent exists
-- `--goal <value>`: Set the agent goal
-- `--expected-output <value>`: Describe the expected output
-- `--success <value>`: Add one success criterion
-- `--completion <orchestrator|judge>`: Select the completion target
-- `--review-by <value>`: Set the review node
-
-### `orc node update`
-
-Update a workflow node status
-
-```text
-orc node update
+  -h, --help  Print help
 ```
 
-Options:
+### `orc schema`
 
-- `--scope <value>`: Select a workspace scope
-- `--run <value>`: Select the workflow run
-- `--status <queued|working|waiting|blocked|failed|done|cancelled|disconnected|archived>`: Set lifecycle status
-
-### `orc provider list`
-
-List provider manifests
+Print generated JSON schemas
 
 ```text
-orc provider list
-```
+Print generated JSON schemas
+
+Usage: schema <SCHEMA>
+
+Arguments:
+  <SCHEMA>  [possible values: config, provider, workflow, state]
 
 Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--json`: Print JSON
-
-### `orc provider validate`
-
-Validate provider dependencies and protocol behavior
-
-```text
-orc provider validate [name]
+  -h, --help  Print help
 ```
 
-Options:
 
-- `--scope <value>`: Select a workspace scope
-- `--json`: Print JSON
-
-### `orc run create`
-
-Create a workflow run
-
-```text
-orc run create
-```
-
-Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--name <value>`: Set the run name
-- `--goal <value>`: Set the run goal
-- `--expected-output <value>`: Describe the expected output
-- `--orchestrator <value>`: Select the orchestrator session
-- `--harness <value>`: Select the default harness
-- `--model <value>`: Select the default model
-- `--json`: Print JSON
-
-### `orc run agent`
-
-Set a run role harness
-
-```text
-orc run agent
-```
-
-Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--harness <value>`: Select an agent harness
-- `--model <value>`: Select a harness model
-- `--role <orchestrator|planner|researcher|implementer|critic|judge|verifier|operator|generalist|worker>`: Set the agent role
-
-### `orc run list`
-
-List workflow runs
-
-```text
-orc run list
-```
-
-Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--json`: Print JSON
-
-### `orc run show`
-
-Show one workflow run
-
-```text
-orc run show
-```
-
-Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--json`: Print JSON
-
-### `orc run update`
-
-Update a workflow run status
-
-```text
-orc run update
-```
-
-Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--status <queued|working|waiting|blocked|failed|done|cancelled|disconnected|archived>`: Set lifecycle status
-
-### `orc session adopt`
-
-Adopt the current harness as a new orchestrator
-
-```text
-orc session adopt
-```
-
-Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--harness <value>`: Select an agent harness
-- `--model <value>`: Select a harness model
-- `--role <orchestrator|planner|researcher|implementer|critic|judge|verifier|operator|generalist|worker>`: Set the agent role
-- `--title <value>`: Set the display title
-- `--purpose <value>`: Explain why the agent exists
-- `--goal <value>`: Set the agent goal
-- `--expected-output <value>`: Describe the expected output
-- `--success <value>`: Add one success criterion
-- `--completion <orchestrator|judge>`: Select the completion target
-- `--review-by <value>`: Set the review node
-- `--native-id <value>`: Set the harness session id
-
-### `orc session archive`
-
-Archive a session incarnation
-
-```text
-orc session archive [session-id]
-```
-
-Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--native-id <value>`: Match the harness session id
-- `--hook-input`: Read session data from standard input
-- `--quiet`: Suppress the session id
-
-### `orc session register`
-
-Register a session
-
-```text
-orc session register
-```
-
-Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--harness <value>`: Select an agent harness
-- `--model <value>`: Select a harness model
-- `--role <orchestrator|planner|researcher|implementer|critic|judge|verifier|operator|generalist|worker>`: Set the agent role
-- `--title <value>`: Set the display title
-- `--purpose <value>`: Explain why the agent exists
-- `--goal <value>`: Set the agent goal
-- `--expected-output <value>`: Describe the expected output
-- `--success <value>`: Add one success criterion
-- `--completion <orchestrator|judge>`: Select the completion target
-- `--review-by <value>`: Set the review node
-- `--id <value>`: Set the Orc session id
-- `--native-id <value>`: Set the harness session id
-- `--parent <value>`: Set the parent session
-- `--run <value>`: Link a workflow run
-- `--node <value>`: Link a workflow node
-- `--source <connected|hook|managed>`: Set the registration source
-- `--provider-ref <value>`: Set the provider session reference
-- `--hook-input`: Read session data from standard input
-- `--quiet`: Suppress the session id
-
-### `orc session current`
-
-Show the current session
-
-```text
-orc session current
-```
-
-Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--json`: Print JSON
-
-### `orc session list`
-
-List sessions
-
-```text
-orc session list
-```
-
-Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--json`: Print JSON
-
-### `orc session update`
-
-Update a session status
-
-```text
-orc session update
-```
-
-Options:
-
-- `--scope <value>`: Select a workspace scope
-- `--status <queued|working|waiting|blocked|failed|done|cancelled|disconnected|archived>`: Set lifecycle status
 <!-- END GENERATED:commands -->
 
 ## Develop Orc

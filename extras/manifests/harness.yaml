@@ -7,4 +7,5 @@ command: orc-provider-harness
 actions:
   session.bind: Detect whether the harness session is active
   session.attach: Build the native harness resume command
+  session.launch: Build the native harness launch command
 priority: 100

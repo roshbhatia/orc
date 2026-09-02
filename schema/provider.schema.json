@@ -1,102 +1,119 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "additionalProperties": false,
-  "anyOf": [
-    {
-      "required": ["actions"]
-    },
-    {
-      "required": ["capabilities"]
-    }
-  ],
-  "description": "A language-neutral Orc provider manifest. The command reads Orc provider requests from stdin and writes responses to stdout.",
-  "properties": {
-    "actions": {
-      "additionalProperties": false,
-      "minProperties": 1,
-      "properties": {
-        "changes.inspect": {
-          "minLength": 1,
-          "type": "string"
-        },
-        "session.attach": {
-          "minLength": 1,
-          "type": "string"
-        },
-        "session.bind": {
-          "minLength": 1,
-          "type": "string"
-        },
-        "session.describe": {
-          "minLength": 1,
-          "type": "string"
-        },
-        "session.inspect": {
-          "minLength": 1,
-          "type": "string"
-        },
-        "session.launch": {
-          "minLength": 1,
-          "type": "string"
-        },
-        "session.persist": {
-          "minLength": 1,
-          "type": "string"
-        },
-        "terminal.open": {
-          "minLength": 1,
-          "type": "string"
-        }
-      },
-      "type": "object"
-    },
-    "capabilities": {
-      "items": {
-        "enum": [
-          "changes.inspect",
-          "session.attach",
-          "session.bind",
-          "session.describe",
-          "session.inspect",
-          "session.launch",
-          "session.persist",
-          "terminal.open"
-        ]
-      },
-      "minItems": 1,
-      "type": "array",
-      "uniqueItems": true
-    },
-    "command": {
-      "minLength": 1,
+  "$defs": {
+    "Capability": {
+      "enum": [
+        "changes.inspect",
+        "session.attach",
+        "session.bind",
+        "session.describe",
+        "session.inspect",
+        "session.launch",
+        "session.persist",
+        "terminal.open",
+        "execution.run",
+        "execution.cancel",
+        "execution.status",
+        "execution.logs",
+        "session.guide"
+      ],
       "type": "string"
     },
-    "description": {
-      "minLength": 1,
-      "type": "string"
-    },
-    "kind": {
+    "ProviderKind": {
       "enum": [
         "persistence",
         "display",
         "activity",
         "changes",
         "harness",
+        "execution",
         "integration"
-      ]
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "actions": {
+      "additionalProperties": false,
+      "default": {},
+      "properties": {
+        "changes.inspect": {
+          "type": "string"
+        },
+        "execution.cancel": {
+          "type": "string"
+        },
+        "execution.logs": {
+          "type": "string"
+        },
+        "execution.run": {
+          "type": "string"
+        },
+        "execution.status": {
+          "type": "string"
+        },
+        "session.attach": {
+          "type": "string"
+        },
+        "session.bind": {
+          "type": "string"
+        },
+        "session.describe": {
+          "type": "string"
+        },
+        "session.guide": {
+          "type": "string"
+        },
+        "session.inspect": {
+          "type": "string"
+        },
+        "session.launch": {
+          "type": "string"
+        },
+        "session.persist": {
+          "type": "string"
+        },
+        "terminal.open": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "capabilities": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Capability"
+      },
+      "type": "array"
+    },
+    "command": {
+      "type": "string"
+    },
+    "description": {
+      "default": "Orc provider",
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/$defs/ProviderKind",
+      "default": "integration"
     },
     "name": {
-      "pattern": "^[a-z0-9][a-z0-9._-]*$",
       "type": "string"
     },
     "priority": {
+      "default": 0,
+      "format": "int64",
       "type": "integer"
     },
     "version": {
-      "const": "orc.provider/v1"
+      "type": "string"
     }
   },
-  "required": ["version", "name", "kind", "command"],
-  "title": "Orc provider manifest",
+  "required": [
+    "version",
+    "name",
+    "command"
+  ],
+  "title": "Manifest",
   "type": "object"
 }

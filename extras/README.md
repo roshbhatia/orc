@@ -4,7 +4,8 @@ Orc core knows only provider capabilities and the JSON protocol. This directory
 contains optional adapters for common local tools.
 
 - `orc-provider-harness` reads an external harness registry and creates resume
-  command plans.
+  and launch command plans.
+- `orc-provider-local` executes command plans on the current machine.
 - `orc-provider-zmx` adds persistence.
 - `orc-provider-wezterm` adds display panes and keeps failed commands visible.
 - `orc-provider-traces` adds session descriptions and activity.

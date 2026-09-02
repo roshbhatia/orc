@@ -1,0 +1,609 @@
+{
+  "$defs": {
+    "ActivityEvent": {
+      "properties": {
+        "at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "at",
+        "kind",
+        "message"
+      ],
+      "type": "object"
+    },
+    "AgentConfig": {
+      "properties": {
+        "harness": {
+          "type": "string"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "$ref": "#/$defs/SessionRole"
+        }
+      },
+      "required": [
+        "role",
+        "harness"
+      ],
+      "type": "object"
+    },
+    "BindingStatus": {
+      "enum": [
+        "active",
+        "available",
+        "unavailable"
+      ],
+      "type": "string"
+    },
+    "CompletionTarget": {
+      "enum": [
+        "orchestrator",
+        "judge"
+      ],
+      "type": "string"
+    },
+    "LifecycleStatus": {
+      "enum": [
+        "queued",
+        "working",
+        "waiting",
+        "blocked",
+        "failed",
+        "done",
+        "cancelled",
+        "disconnected",
+        "archived"
+      ],
+      "type": "string"
+    },
+    "PendingGate": {
+      "properties": {
+        "before": {
+          "type": "string"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "recommendation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "before",
+        "reason",
+        "createdAt"
+      ],
+      "type": "object"
+    },
+    "ProviderBinding": {
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/ProviderKind"
+        },
+        "label": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/BindingStatus"
+        }
+      },
+      "required": [
+        "provider",
+        "kind",
+        "status",
+        "label"
+      ],
+      "type": "object"
+    },
+    "ProviderKind": {
+      "enum": [
+        "persistence",
+        "display",
+        "activity",
+        "changes",
+        "harness",
+        "execution",
+        "integration"
+      ],
+      "type": "string"
+    },
+    "RegistrationSource": {
+      "enum": [
+        "connected",
+        "hook",
+        "managed"
+      ],
+      "type": "string"
+    },
+    "RunMode": {
+      "enum": [
+        "foreground",
+        "background"
+      ],
+      "type": "string"
+    },
+    "Session": {
+      "properties": {
+        "completion": {
+          "$ref": "#/$defs/CompletionTarget"
+        },
+        "connectedAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "directory": {
+          "type": "string"
+        },
+        "expectedOutput": {
+          "type": "string"
+        },
+        "goal": {
+          "type": "string"
+        },
+        "harness": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "nativeId": {
+          "type": "string"
+        },
+        "nodeId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parentId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "providerRef": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "providers": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ProviderBinding"
+          },
+          "type": "array"
+        },
+        "purpose": {
+          "type": "string"
+        },
+        "registration": {
+          "$ref": "#/$defs/RegistrationSource"
+        },
+        "reviewBy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "$ref": "#/$defs/SessionRole"
+        },
+        "runId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/LifecycleStatus"
+        },
+        "successCriteria": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "title": {
+          "type": "string"
+        },
+        "traceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updatedAt": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "nativeId",
+        "harness",
+        "role",
+        "title",
+        "purpose",
+        "goal",
+        "expectedOutput",
+        "completion",
+        "directory",
+        "registration",
+        "status",
+        "connectedAt",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "SessionRole": {
+      "enum": [
+        "orchestrator",
+        "planner",
+        "researcher",
+        "implementer",
+        "critic",
+        "judge",
+        "verifier",
+        "operator",
+        "generalist",
+        "worker"
+      ],
+      "type": "string"
+    },
+    "WorkflowEdge": {
+      "properties": {
+        "from": {
+          "type": "string"
+        },
+        "relationship": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "from",
+        "to",
+        "relationship"
+      ],
+      "type": "object"
+    },
+    "WorkflowNode": {
+      "properties": {
+        "activity": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ActivityEvent"
+          },
+          "type": "array"
+        },
+        "attempt": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "completion": {
+          "$ref": "#/$defs/CompletionTarget"
+        },
+        "costUsd": {
+          "default": 0.0,
+          "format": "double",
+          "type": "number"
+        },
+        "expectedOutput": {
+          "type": "string"
+        },
+        "goal": {
+          "type": "string"
+        },
+        "harness": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "input": {
+          "default": null
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "output": {
+          "default": null
+        },
+        "prompt": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "purpose": {
+          "type": "string"
+        },
+        "reviewBy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "$ref": "#/$defs/SessionRole"
+        },
+        "sessionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/LifecycleStatus"
+        },
+        "successCriteria": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "updatedAt": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "purpose",
+        "role",
+        "harness",
+        "goal",
+        "expectedOutput",
+        "completion",
+        "status",
+        "attempt",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "WorkflowRun": {
+      "properties": {
+        "agents": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/AgentConfig"
+          },
+          "type": "array"
+        },
+        "approvedGates": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "checkpoint": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "costUsd": {
+          "default": 0.0,
+          "format": "double",
+          "type": "number"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "currentNode": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "definition": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "edges": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/WorkflowEdge"
+          },
+          "type": "array"
+        },
+        "expectedOutput": {
+          "type": "string"
+        },
+        "goal": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "logPath": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "$ref": "#/$defs/RunMode",
+          "default": "foreground"
+        },
+        "name": {
+          "type": "string"
+        },
+        "nodes": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/WorkflowNode"
+          },
+          "type": "array"
+        },
+        "orchestratorId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pendingGates": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PendingGate"
+          },
+          "type": "array"
+        },
+        "processId": {
+          "default": null,
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "revision": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/LifecycleStatus"
+        },
+        "tokenBurn": {
+          "default": [],
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "tokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "updatedAt": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "goal",
+        "expectedOutput",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "active": {
+      "type": "boolean"
+    },
+    "runs": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/WorkflowRun"
+      },
+      "type": "array"
+    },
+    "schemaVersion": {
+      "type": "string"
+    },
+    "scope": {
+      "type": "string"
+    },
+    "sessions": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Session"
+      },
+      "type": "array"
+    },
+    "updatedAt": {
+      "format": "date-time",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "scope",
+    "active",
+    "updatedAt"
+  ],
+  "title": "WorkspaceState",
+  "type": "object"
+}

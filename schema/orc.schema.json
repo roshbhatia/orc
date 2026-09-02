@@ -1,32 +1,100 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "type": "object",
-  "properties": {
-    "cache": {
-      "type": "object",
+  "$defs": {
+    "CacheConfig": {
       "properties": {
         "providerTtlMs": {
+          "default": 1000,
+          "format": "uint64",
+          "minimum": 0,
           "type": "integer"
         }
       },
-      "required": ["providerTtlMs"],
-      "additionalProperties": false
+      "type": "object"
     },
-    "providers": {
-      "type": "object",
+    "ProviderConfig": {
       "properties": {
         "directory": {
+          "default": "/Users/roshan/.config/orc/providers",
           "type": "string"
         },
         "timeoutMs": {
+          "default": 5000,
+          "format": "uint64",
+          "minimum": 0,
           "type": "integer"
         }
       },
-      "required": ["directory", "timeoutMs"],
-      "additionalProperties": false
+      "type": "object"
+    },
+    "UiConfig": {
+      "properties": {
+        "inspectorPercent": {
+          "default": 38,
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "refreshMs": {
+          "default": 750,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "WorkflowConfig": {
+      "properties": {
+        "autoCommit": {
+          "default": true,
+          "type": "boolean"
+        },
+        "maxDepth": {
+          "default": 10,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "repository": {
+          "default": "/Users/roshan/.local/share/orc/workflows",
+          "type": "string"
+        }
+      },
+      "type": "object"
     }
   },
-  "required": ["cache", "providers"],
-  "additionalProperties": false,
-  "title": "Orc configuration"
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "cache": {
+      "$ref": "#/$defs/CacheConfig",
+      "default": {
+        "providerTtlMs": 1000
+      }
+    },
+    "providers": {
+      "$ref": "#/$defs/ProviderConfig",
+      "default": {
+        "directory": "/Users/roshan/.config/orc/providers",
+        "timeoutMs": 5000
+      }
+    },
+    "ui": {
+      "$ref": "#/$defs/UiConfig",
+      "default": {
+        "inspectorPercent": 38,
+        "refreshMs": 750
+      }
+    },
+    "workflows": {
+      "$ref": "#/$defs/WorkflowConfig",
+      "default": {
+        "autoCommit": true,
+        "maxDepth": 10,
+        "repository": "/Users/roshan/.local/share/orc/workflows"
+      }
+    }
+  },
+  "title": "Config",
+  "type": "object"
 }

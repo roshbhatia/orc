@@ -10,8 +10,8 @@ trap 'rm -rf "$fixture"' EXIT
 mkdir -p "$repo_dir/docs"
 mkdir -p "$fixture/config/providers" "$fixture/repo" "$fixture/state"
 
-package=$(nix build --accept-flake-config --no-link --print-out-paths)
-export ORC_PROVIDER_DIR="$fixture/config/providers"
+package=$(nix build --accept-flake-config --no-link --print-out-paths .#full)
+export ORC_PROVIDER_DIR="$package/share/orc/providers"
 export ORC_SCREENSHOT_BIN="$package/bin/orc"
 export ORC_SCREENSHOT_SCOPE="$fixture/repo"
 export XDG_STATE_HOME="$fixture/state"

@@ -1,0 +1,9 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/roshbhatia/orc/main/schema/provider.schema.json
+version: orc.provider/v1
+name: local
+description: Execute command plans on the current machine
+kind: execution
+command: orc-provider-local
+actions:
+  execution.run: Execute a command plan as a local process
+priority: 0

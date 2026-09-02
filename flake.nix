@@ -1,5 +1,5 @@
 {
-  description = "Effect-based control plane for agent harnesses";
+  description = "Local control plane for agent harnesses";
 
   nixConfig = {
     extra-substituters = [ "https://nix-community.cachix.org" ];
@@ -11,7 +11,6 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     systems.url = "github:nix-systems/default";
-    bun2nix.url = "github:nix-community/bun2nix/2.1.2";
   };
 
   outputs =
@@ -22,7 +21,6 @@
         system:
         import inputs.nixpkgs {
           inherit system;
-          overlays = [ inputs.bun2nix.overlays.default ];
         }
       );
     in
@@ -67,6 +65,7 @@
           };
           provider-changes = providers.changes;
           provider-harness = providers.harness;
+          provider-local = providers.local;
           provider-traces = providers.traces;
           provider-wezterm = providers.wezterm;
           provider-zmx = providers.zmx;
@@ -87,23 +86,20 @@
 
       devShells = eachSystem (system: {
         default = pkgsFor.${system}.mkShellNoCC {
-          packages =
-            with pkgsFor.${system};
-            [
-              biome
-              bun
-              ffmpeg
-              fish
-              jq
-              ripgrep
-              shellcheck
-              shfmt
-              vhs
-            ]
-            ++ [ inputs.bun2nix.packages.${system}.default ];
-          shellHook = ''
-            export BUN2NIX_NATIVE=${inputs.nixpkgs.lib.getExe inputs.bun2nix.packages.${system}.default}
-          '';
+          packages = with pkgsFor.${system}; [
+            cargo
+            clippy
+            ffmpeg
+            fish
+            git
+            jq
+            ripgrep
+            rustc
+            rustfmt
+            shellcheck
+            shfmt
+            vhs
+          ];
         };
       });
     };

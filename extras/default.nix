@@ -42,6 +42,7 @@ let
   providers = {
     changes = mkProvider "changes";
     harness = mkProvider "harness";
+    local = mkProvider "local";
     traces = mkProvider "traces";
     wezterm = mkProvider "wezterm";
     zmx = mkProvider "zmx";
