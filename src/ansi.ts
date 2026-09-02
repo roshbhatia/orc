@@ -11,6 +11,63 @@ interface AnsiState {
   foreground: RGBA | undefined;
 }
 
+const escapeSequenceEnd = (
+  input: string,
+  start: number,
+): number | undefined => {
+  const introducer = input[start + 1];
+  if (introducer === undefined) return undefined;
+  if (introducer === "[") {
+    for (let index = start + 2; index < input.length; index++) {
+      const code = input.charCodeAt(index);
+      if (code >= 0x40 && code <= 0x7e) return index + 1;
+    }
+    return undefined;
+  }
+  if (["]", "P", "X", "^", "_"].includes(introducer)) {
+    for (let index = start + 2; index < input.length; index++) {
+      if (introducer === "]" && input.charCodeAt(index) === 0x07)
+        return index + 1;
+      if (input[index] === "\u001b" && input[index + 1] === "\\")
+        return index + 2;
+    }
+    return undefined;
+  }
+  return start + 2;
+};
+
+export const sanitizeTerminalText = (input: string): string => {
+  let output = "";
+  for (let index = 0; index < input.length; ) {
+    const code = input.charCodeAt(index);
+    if (code === 0x1b) {
+      const end = escapeSequenceEnd(input, index);
+      if (end === undefined) break;
+      const sequence = input.slice(index, end);
+      const parameters = sequence.slice(2, -1);
+      if (
+        sequence.startsWith("\u001b[") &&
+        sequence.endsWith("m") &&
+        /^[0-9;:]*$/.test(parameters)
+      )
+        output += sequence;
+      index = end;
+      continue;
+    }
+    if (
+      (code < 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) ||
+      code === 0x7f ||
+      (code >= 0x80 && code <= 0x9f)
+    ) {
+      index += 1;
+      continue;
+    }
+    output += input[index];
+    index += 1;
+  }
+  return output;
+};
+
 const colorIndex = (code: number, background: boolean): number | undefined => {
   const base = background ? 40 : 30;
   const bright = background ? 100 : 90;
@@ -103,6 +160,7 @@ const applySgr = (state: AnsiState, values: ReadonlyArray<number>): void => {
 };
 
 export const ansiToStyledText = (input: string): StyledText => {
+  const sanitized = sanitizeTerminalText(input);
   const chunks: TextChunk[] = [];
   const state: AnsiState = {
     attributes: TextAttributes.NONE,
@@ -112,7 +170,7 @@ export const ansiToStyledText = (input: string): StyledText => {
   const escapeCharacter = String.fromCharCode(27);
   const expression = new RegExp(`${escapeCharacter}\\[([0-9;]*)m`, "g");
   let start = 0;
-  for (const match of input.matchAll(expression)) {
+  for (const match of sanitized.matchAll(expression)) {
     const index = match.index;
     if (index > start) {
       chunks.push({
@@ -120,7 +178,7 @@ export const ansiToStyledText = (input: string): StyledText => {
         attributes: state.attributes,
         ...(state.background ? { bg: state.background } : {}),
         ...(state.foreground ? { fg: state.foreground } : {}),
-        text: input.slice(start, index),
+        text: sanitized.slice(start, index),
       });
     }
     applySgr(
@@ -132,13 +190,13 @@ export const ansiToStyledText = (input: string): StyledText => {
     );
     start = index + match[0].length;
   }
-  if (start < input.length || chunks.length === 0) {
+  if (start < sanitized.length || chunks.length === 0) {
     chunks.push({
       __isChunk: true,
       attributes: state.attributes,
       ...(state.background ? { bg: state.background } : {}),
       ...(state.foreground ? { fg: state.foreground } : {}),
-      text: input.slice(start),
+      text: sanitized.slice(start),
     });
   }
   return new StyledText(chunks);

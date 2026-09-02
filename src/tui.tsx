@@ -29,6 +29,7 @@ import type {
 } from "./domain.ts";
 import { fullKeyHelp, keyHelp, tuiActionFor } from "./keymap.ts";
 import type { ProviderInfo } from "./provider.ts";
+import { queryFilteredStdout } from "./terminal-output.ts";
 import {
   type DetailTab,
   explorerRows,
@@ -511,12 +512,15 @@ export const openTui = async (
     autoFocus: false,
     backgroundColor: "transparent",
     exitOnCtrlC: true,
+    remote: false,
+    stdout: queryFilteredStdout(),
     targetFps: 30,
   });
-  const terminalColors = await renderer
-    .getPalette({ timeout: 100 })
-    .catch(() => undefined);
-  const palette = resolveTerminalPalette(terminalColors);
+  const resize = (): void =>
+    renderer.resize(process.stdout.columns, process.stdout.rows);
+  process.on("SIGWINCH", resize);
+  renderer.once("destroy", () => process.off("SIGWINCH", resize));
+  const palette = resolveTerminalPalette();
   const destroyed = new Promise<void>((resolve) =>
     renderer.once("destroy", resolve),
   );
