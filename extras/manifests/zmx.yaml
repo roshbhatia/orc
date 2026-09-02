@@ -6,5 +6,6 @@ kind: persistence
 command: orc-provider-zmx
 actions:
   session.bind: Detect the current persistent process
+  session.launch: Launch a managed harness in a persistent session
   session.persist: Wrap a harness command in a persistent session
 priority: 100
