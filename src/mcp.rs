@@ -24,6 +24,7 @@ fn tools() -> Value {
             "successCriteria": {"type":"array", "items":{"type":"string"}}, "parentId": {"type":"string"}, "runId": {"type":"string"}, "nodeId": {"type":"string"}
         }), &["harness", "role", "goal"]) },
         { "name": "orc_session_update", "description": "Update a session lifecycle status.", "inputSchema": schema(json!({"id":{"type":"string"},"status":{"type":"string"}}), &["id","status"]) },
+        { "name": "orc_session_prune", "description": "Stop an active agent through an advertised provider, then archive it.", "inputSchema": schema(json!({"id":{"type":"string"}}), &["id"]) },
         { "name": "orc_run_create", "description": "Create a workflow run owned by the orchestrator.", "inputSchema": schema(json!({"name":{"type":"string"},"goal":{"type":"string"},"expectedOutput":{"type":"string"},"harness":{"type":"string"},"model":{"type":"string"}}), &["name","goal","expectedOutput"]) },
         { "name": "orc_run_list", "description": "List workflow runs by recency.", "inputSchema": schema(json!({}), &[]) },
         { "name": "orc_run_get", "description": "Return one workflow run and graph.", "inputSchema": schema(json!({"id":{"type":"string"}}), &["id"]) },
@@ -122,6 +123,9 @@ fn call(name: &str, input: &Value, config: &Config) -> Result<Value> {
                 .parse::<LifecycleStatus>()
                 .map_err(anyhow::Error::msg)?,
         )?)?,
+        "orc_session_prune" => {
+            serde_json::to_value(control::prune(config, &scope, &string(input, "id"))?)?
+        }
         "orc_run_create" => serde_json::to_value(control::create_run(
             &scope,
             string(input, "name"),

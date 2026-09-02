@@ -7,4 +7,7 @@ command: orc-provider-zmx
 actions:
   session.bind: Detect the current persistent process
   session.persist: Wrap a harness command in a persistent session
+  session.stop: Stop a persistent agent process
+requires:
+  commands: [zmx]
 priority: 100

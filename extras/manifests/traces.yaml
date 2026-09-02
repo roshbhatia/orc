@@ -8,4 +8,6 @@ actions:
   session.bind: Link a session to its trace identity
   session.describe: Read the session title and goal
   session.inspect: Show session activity
+requires:
+  commands: [traces]
 priority: 100

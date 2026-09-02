@@ -62,6 +62,12 @@
               core
               providers.all
             ];
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            postBuild = ''
+              rm "$out/bin/orc"
+              makeWrapper "${core}/bin/orc" "$out/bin/orc" \
+                --prefix PATH : "${providers.all}/bin"
+            '';
           };
           provider-changes = providers.changes;
           provider-harness = providers.harness;

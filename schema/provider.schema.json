@@ -9,6 +9,7 @@
         "session.inspect",
         "session.launch",
         "session.persist",
+        "session.stop",
         "terminal.open",
         "execution.run",
         "execution.cancel",
@@ -29,6 +30,32 @@
         "integration"
       ],
       "type": "string"
+    },
+    "Requirements": {
+      "properties": {
+        "commands": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "environment": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "paths": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -73,6 +100,9 @@
         "session.persist": {
           "type": "string"
         },
+        "session.stop": {
+          "type": "string"
+        },
         "terminal.open": {
           "type": "string"
         }
@@ -104,6 +134,14 @@
       "default": 0,
       "format": "int64",
       "type": "integer"
+    },
+    "requires": {
+      "$ref": "#/$defs/Requirements",
+      "default": {
+        "commands": [],
+        "environment": [],
+        "paths": []
+      }
     },
     "version": {
       "type": "string"

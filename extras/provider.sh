@@ -13,11 +13,12 @@ if [[ $version != "orc.provider/v1" ]]; then
   exit 2
 fi
 
-emit_plan() {
-  local cwd environment command_json
-  cwd=$1
-  environment=$2
-  shift 2
+emit_plan_with_codes() {
+  local success_codes cwd environment command_json
+  success_codes=$1
+  cwd=$2
+  environment=$3
+  shift 3
   if (($# == 0)); then
     printf 'orc-provider-%s: command plan is empty\n' "$provider_kind" >&2
     exit 2
@@ -27,7 +28,18 @@ emit_plan() {
     --arg cwd "$cwd" \
     --argjson command "$command_json" \
     --argjson environment "$environment" \
-    '{version: "orc.provider/v1", command: $command, cwd: $cwd, environment: $environment}'
+    --argjson success_codes "$success_codes" \
+    '{
+      version: "orc.provider/v1",
+      command: $command,
+      cwd: $cwd,
+      environment: $environment,
+      successCodes: $success_codes
+    }'
+}
+
+emit_plan() {
+  emit_plan_with_codes '[0]' "$@"
 }
 
 emit_declined() {
@@ -249,8 +261,13 @@ case "$provider_kind:$capability" in
     }
     executable=$provider_command
     trace_id=$(jq -r '.session.traceId // .session.nativeId // empty' <<< "$request")
+    harness=$(jq -r '.session.harness // empty' <<< "$request")
+    traces_args=(--json --once --session "$trace_id")
+    if [[ -n $harness ]]; then
+      traces_args+=(--service "$harness")
+    fi
     prompt=$(
-      "$executable" --json -session "$trace_id" 2> /dev/null |
+      "$executable" "${traces_args[@]}" 2> /dev/null |
         jq -n -r 'first(inputs | select(((.attrs.prompt? // "") | type) == "string" and ((.attrs.prompt? // "") | length) > 0) | .attrs.prompt) // empty'
     ) || true
     if [[ -z $prompt ]]; then
@@ -267,7 +284,12 @@ case "$provider_kind:$capability" in
     }
     executable=$provider_command
     trace_id=$(jq -er '.session.traceId // .session.nativeId | select(type == "string" and length > 0)' <<< "$request")
-    emit_plan "$scope" '{}' "$executable" --once -color always -session "$trace_id"
+    harness=$(jq -r '.session.harness // empty' <<< "$request")
+    traces_args=(--once -color always -session "$trace_id")
+    if [[ -n $harness ]]; then
+      traces_args+=(-service "$harness")
+    fi
+    emit_plan_with_codes '[0, 2]' "$scope" '{}' "$executable" "${traces_args[@]}"
     ;;
   wezterm:session.bind)
     if current_session_matches && [[ -n ${WEZTERM_PANE:-} ]]; then
@@ -329,6 +351,25 @@ case "$provider_kind:$capability" in
       prior_environment=$(jq -ce '.plan.environment // {}' <<< "$request")
       emit_plan "$scope" "$prior_environment" "$executable" attach "$managed_id" "${command[@]}"
     fi
+    ;;
+  zmx:session.stop)
+    require_command zmx || {
+      emit_declined "zmx is unavailable"
+      exit 0
+    }
+    executable=$provider_command
+    provider_ref=$(jq -r '
+      first(
+        .session.providers[]?
+        | select(.provider == "zmx" and .kind == "persistence" and .ref != null)
+        | .ref
+      ) // .session.providerRef // empty
+    ' <<< "$request")
+    if [[ -z $provider_ref ]]; then
+      emit_declined "session has no persistent process reference"
+      exit 0
+    fi
+    emit_plan "$scope" '{}' "$executable" kill "$provider_ref"
     ;;
   *)
     printf 'orc-provider-%s: unsupported capability: %s\n' "$provider_kind" "$capability" >&2

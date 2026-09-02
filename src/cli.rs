@@ -196,6 +196,12 @@ enum SessionCommand {
         #[arg(long)]
         quiet: bool,
     },
+    #[command(about = "Stop an active agent through its provider, then archive it")]
+    Prune {
+        id: String,
+        #[command(flatten)]
+        scope: ScopeArgs,
+    },
     Current(OutputArgs),
     List(OutputArgs),
     Update {
@@ -590,6 +596,9 @@ pub fn run() -> Result<u8> {
                 } else {
                     println!("{}", session.id);
                 }
+            }
+            SessionCommand::Prune { id, scope } => {
+                println!("{}", control::prune(&config, &scope.scope, &id)?.id)
             }
             SessionCommand::List(args) => list_sessions(&args)?,
             SessionCommand::Update { id, scope, status } => {

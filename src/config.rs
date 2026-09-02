@@ -22,7 +22,7 @@ pub struct CacheConfig {
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
-            provider_ttl_ms: 1_000,
+            provider_ttl_ms: 30_000,
         }
     }
 }
@@ -38,7 +38,7 @@ impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
             directory: config_home().join("orc/providers"),
-            timeout_ms: 5_000,
+            timeout_ms: 15_000,
         }
     }
 }
@@ -65,13 +65,15 @@ impl Default for WorkflowConfig {
 #[serde(default, rename_all = "camelCase")]
 pub struct UiConfig {
     pub refresh_ms: u64,
+    pub activity_refresh_ms: u64,
     pub inspector_percent: u16,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            refresh_ms: 750,
+            refresh_ms: 5_000,
+            activity_refresh_ms: 10_000,
             inspector_percent: 38,
         }
     }
@@ -136,6 +138,9 @@ pub fn load() -> Result<Config> {
     if let Ok(value) = env::var("ORC_UI_REFRESH_MS") {
         config.ui.refresh_ms = value.parse().context("parse UI refresh interval")?;
     }
+    if let Ok(value) = env::var("ORC_UI_ACTIVITY_REFRESH_MS") {
+        config.ui.activity_refresh_ms = value.parse().context("parse activity refresh interval")?;
+    }
     if let Ok(value) = env::var("ORC_UI_INSPECTOR_PERCENT") {
         config.ui.inspector_percent = value.parse().context("parse UI inspector size")?;
     }
@@ -144,6 +149,9 @@ pub fn load() -> Result<Config> {
     }
     if config.ui.refresh_ms < 50 {
         bail!("ui.refreshMs must be at least 50");
+    }
+    if config.ui.activity_refresh_ms < 1_000 {
+        bail!("ui.activityRefreshMs must be at least 1000");
     }
     if !(20..=80).contains(&config.ui.inspector_percent) {
         bail!("ui.inspectorPercent must be between 20 and 80");

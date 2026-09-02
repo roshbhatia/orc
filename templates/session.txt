@@ -1,0 +1,19 @@
+{{ session.title }}
+
+role            {{ session.role }}
+harness         {{ session.harness }}
+model           {% if session.model %}{{ session.model }}{% else %}default{% endif %}
+status          {{ session.status }}
+purpose         {{ session.purpose }}
+goal            {{ session.goal }}
+expected output {{ session.expectedOutput }}
+success         {% if session.successCriteria %}{{ session.successCriteria | join("; ") }}{% else %}unspecified{% endif %}
+completion      {{ session.completion }}
+native session  {{ session.nativeId }}
+orc session     {{ session.id }}
+parent          {% if session.parentId %}{{ session.parentId }}{% else %}root{% endif %}
+
+providers
+{% for binding in session.providers %}  {{ binding.kind }}  {{ binding.provider }} · {{ binding.status }} · {{ binding.label }}
+{% else %}  none
+{% endfor %}

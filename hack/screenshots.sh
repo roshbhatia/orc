@@ -40,6 +40,42 @@ run=$(
 )
 export ORC_SCREENSHOT_RUN=$run
 
+implementer=$(
+  "$ORC_SCREENSHOT_BIN" connect \
+    --scope "$ORC_SCREENSHOT_SCOPE" \
+    --id demo-implementer \
+    --native-id demo-implementer-native \
+    --harness codex \
+    --role implementer \
+    --title "Build provider boundary" \
+    --purpose "Replace direct renderer dependencies" \
+    --goal "Migrate each renderer call without changing behavior" \
+    --expected-output "Typed provider adapters and passing tests" \
+    --success "No direct renderer imports remain" \
+    --parent "$orchestrator" \
+    --run "$run" \
+    --node implement \
+    --source managed
+)
+
+critic=$(
+  "$ORC_SCREENSHOT_BIN" connect \
+    --scope "$ORC_SCREENSHOT_SCOPE" \
+    --id demo-critic \
+    --native-id demo-critic-native \
+    --harness claude \
+    --role critic \
+    --title "Review provider migration" \
+    --purpose "Challenge the implementation contract" \
+    --goal "Find coupling, regressions, and missing evidence" \
+    --expected-output "Actionable findings or approval" \
+    --success "Every provider boundary has test evidence" \
+    --parent "$orchestrator" \
+    --run "$run" \
+    --node review \
+    --source managed
+)
+
 "$ORC_SCREENSHOT_BIN" node upsert research \
   --scope "$ORC_SCREENSHOT_SCOPE" \
   --run "$run" \
@@ -62,6 +98,7 @@ export ORC_SCREENSHOT_RUN=$run
   --goal "Migrate call sites without behavior changes" \
   --expected-output "Passing tests and typed providers" \
   --success "All direct imports are removed" \
+  --session "$implementer" \
   --depends-on research \
   --status working > /dev/null
 
@@ -75,6 +112,7 @@ export ORC_SCREENSHOT_RUN=$run
   --goal "Reject incomplete provider boundaries" \
   --expected-output "Findings or approval evidence" \
   --success "No renderer coupling remains" \
+  --session "$critic" \
   --depends-on implement \
   --status queued > /dev/null
 

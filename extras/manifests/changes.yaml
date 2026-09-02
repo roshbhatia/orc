@@ -6,4 +6,6 @@ kind: changes
 command: orc-provider-changes
 actions:
   changes.inspect: Show repository changes for the workspace
+requires:
+  commands: [changes]
 priority: 100

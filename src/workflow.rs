@@ -913,13 +913,13 @@ fn execute_step(
             control::update_session(
                 scope,
                 &session.id,
-                if result.code == 0 {
+                if plan.accepts(result.code) {
                     LifecycleStatus::Done
                 } else {
                     LifecycleStatus::Failed
                 },
             )?;
-            if result.code != 0 {
+            if !plan.accepts(result.code) {
                 bail!(
                     "agent exited with {}: {}",
                     result.code,
@@ -938,6 +938,7 @@ fn execute_step(
                 command: step.command.clone(),
                 cwd: Some(scope.display().to_string()),
                 environment: BTreeMap::new(),
+                success_codes: vec![0],
             };
             let request = json!({
                 "version": "orc.provider/v1",
@@ -953,7 +954,7 @@ fn execute_step(
                 Some(initial),
             )?;
             let result = provider::run_plan(&plan, scope)?;
-            if result.code != 0 {
+            if !plan.accepts(result.code) {
                 bail!(
                     "command exited with {}: {}",
                     result.code,

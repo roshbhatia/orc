@@ -1,9 +1,10 @@
 use std::{
     collections::BTreeMap,
-    fs,
+    fs::{self, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::Instant,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -36,6 +37,8 @@ pub enum Capability {
     SessionLaunch,
     #[serde(rename = "session.persist")]
     SessionPersist,
+    #[serde(rename = "session.stop")]
+    SessionStop,
     #[serde(rename = "terminal.open")]
     TerminalOpen,
     #[serde(rename = "execution.run")]
@@ -71,7 +74,17 @@ pub struct Manifest {
     #[serde(default)]
     pub capabilities: Vec<Capability>,
     #[serde(default)]
+    pub requires: Requirements,
+    #[serde(default)]
     pub priority: i64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Requirements {
+    pub commands: Vec<String>,
+    pub environment: Vec<String>,
+    pub paths: Vec<PathBuf>,
 }
 
 fn default_description() -> String {
@@ -104,6 +117,18 @@ pub struct CommandPlan {
     pub cwd: Option<String>,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    #[serde(default = "default_success_codes", rename = "successCodes")]
+    pub success_codes: Vec<i32>,
+}
+
+fn default_success_codes() -> Vec<i32> {
+    vec![0]
+}
+
+impl CommandPlan {
+    pub fn accepts(&self, code: i32) -> bool {
+        self.success_codes.contains(&code)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -136,6 +161,7 @@ pub enum Action {
     Inspect,
     Launch,
     Guide,
+    Stop,
 }
 
 impl Action {
@@ -159,6 +185,7 @@ impl Action {
                 (Capability::ExecutionRun, false),
             ],
             Self::Guide => &[(Capability::SessionGuide, false)],
+            Self::Stop => &[(Capability::SessionStop, false)],
         }
     }
 
@@ -171,6 +198,7 @@ impl Action {
             Self::Inspect => "inspect",
             Self::Launch => "launch",
             Self::Guide => "guide",
+            Self::Stop => "stop",
         }
     }
 }
@@ -244,13 +272,26 @@ fn candidates(providers: &[Manifest], capability: Capability) -> Vec<&Manifest> 
 }
 
 fn invoke_raw(provider: &Manifest, request: &Value, config: &Config) -> Result<Value> {
-    let mut child = Command::new(&provider.command)
+    let started = Instant::now();
+    let child = Command::new(&provider.command)
         .current_dir(request.get("scope").and_then(Value::as_str).unwrap_or("."))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("start provider {}", provider.name))?;
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            record_invocation(
+                provider,
+                request,
+                false,
+                started.elapsed().as_millis(),
+                &error.to_string(),
+            );
+            return Err(error).with_context(|| format!("start provider {}", provider.name));
+        }
+    };
     child
         .stdin
         .take()
@@ -261,6 +302,13 @@ fn invoke_raw(provider: &Manifest, request: &Value, config: &Config) -> Result<V
         None => {
             child.kill()?;
             let _ = child.wait();
+            record_invocation(
+                provider,
+                request,
+                false,
+                started.elapsed().as_millis(),
+                "provider timed out",
+            );
             bail!("{} timed out", provider.name);
         }
     };
@@ -276,6 +324,13 @@ fn invoke_raw(provider: &Manifest, request: &Value, config: &Config) -> Result<V
         .take()
         .context("provider stderr")?
         .read_to_string(&mut stderr)?;
+    record_invocation(
+        provider,
+        request,
+        status.success(),
+        started.elapsed().as_millis(),
+        &stderr,
+    );
     if !status.success() {
         bail!(
             "{}",
@@ -289,6 +344,82 @@ fn invoke_raw(provider: &Manifest, request: &Value, config: &Config) -> Result<V
         .with_context(|| format!("{} returned invalid JSON", provider.name))
 }
 
+fn record_invocation(
+    provider: &Manifest,
+    request: &Value,
+    success: bool,
+    duration_ms: u128,
+    stderr: &str,
+) {
+    let directory = crate::config::state_home().join("orc/providers");
+    if fs::create_dir_all(&directory).is_err() {
+        return;
+    }
+    let path = directory.join(format!("{}.jsonl", provider.name));
+    let record = json!({
+        "at": chrono::Utc::now(),
+        "provider": provider.name,
+        "action": request.get("action").and_then(Value::as_str),
+        "capability": request.get("capability").and_then(Value::as_str),
+        "status": if success { "ok" } else { "failed" },
+        "durationMs": duration_ms.min(u64::MAX as u128) as u64,
+        "message": stderr.lines().next().unwrap_or_default(),
+    });
+    let Ok(line) = serde_json::to_string(&record) else {
+        return;
+    };
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = writeln!(file, "{line}");
+}
+
+pub fn recent_activity(name: &str) -> String {
+    let path = crate::config::state_home()
+        .join("orc/providers")
+        .join(format!("{name}.jsonl"));
+    let Ok(source) = fs::read_to_string(path) else {
+        return "No provider calls yet.".into();
+    };
+    let lines: Vec<_> = source.lines().rev().take(100).collect();
+    let rendered = lines
+        .into_iter()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .map(|record| {
+            let at = record
+                .get("at")
+                .and_then(Value::as_str)
+                .and_then(|value| value.get(11..19))
+                .unwrap_or("--:--:--");
+            let status = record
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let capability = record
+                .get("capability")
+                .and_then(Value::as_str)
+                .unwrap_or("provider.call");
+            let duration = record
+                .get("durationMs")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let message = record
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|message| !message.is_empty())
+                .map_or_else(String::new, |message| format!(" · {message}"));
+            format!("{at}  {status:<6}  {capability:<20}  {duration:>5}ms{message}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if rendered.is_empty() {
+        "No provider calls yet.".into()
+    } else {
+        rendered
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 struct CachedValue {
     created_at_ms: i64,
@@ -297,6 +428,7 @@ struct CachedValue {
 
 fn cache_path(provider: &Manifest, request: &Value) -> Result<PathBuf> {
     let key = serde_json::to_vec(&json!({
+        "orcVersion": env!("CARGO_PKG_VERSION"),
         "provider": provider.name,
         "command": provider.command,
         "request": request,
@@ -341,6 +473,74 @@ impl EmptyFallback for String {
     }
 }
 
+fn command_check(name: String, command: &str) -> ValidationCheck {
+    match which::which(command) {
+        Ok(path) => ValidationCheck {
+            name,
+            status: CheckStatus::Ok,
+            message: path.display().to_string(),
+        },
+        Err(error) => ValidationCheck {
+            name,
+            status: CheckStatus::Failed,
+            message: error.to_string(),
+        },
+    }
+}
+
+fn requirements_checks(provider: &Manifest) -> Vec<ValidationCheck> {
+    let mut checks = vec![command_check("executable".into(), &provider.command)];
+    checks.extend(
+        provider
+            .requires
+            .commands
+            .iter()
+            .map(|command| command_check(format!("command:{command}"), command)),
+    );
+    checks.extend(provider.requires.environment.iter().map(|variable| {
+        let present = std::env::var_os(variable).is_some();
+        ValidationCheck {
+            name: format!("environment:{variable}"),
+            status: if present {
+                CheckStatus::Ok
+            } else {
+                CheckStatus::Failed
+            },
+            message: if present { "set" } else { "not set" }.into(),
+        }
+    }));
+    checks.extend(provider.requires.paths.iter().map(|path| {
+        let present = path.exists();
+        ValidationCheck {
+            name: format!("path:{}", path.display()),
+            status: if present {
+                CheckStatus::Ok
+            } else {
+                CheckStatus::Failed
+            },
+            message: if present { "exists" } else { "missing" }.into(),
+        }
+    }));
+    checks
+}
+
+fn provider_checks(result: Result<Value>) -> Vec<ValidationCheck> {
+    match result {
+        Ok(value) => value
+            .get("checks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| serde_json::from_value(item.clone()).ok())
+            .collect(),
+        Err(error) => vec![ValidationCheck {
+            name: "provider".into(),
+            status: CheckStatus::Failed,
+            message: format!("{error:#}"),
+        }],
+    }
+}
+
 pub fn validate_all(config: &Config, scope: &Path, name: Option<&str>) -> Result<Vec<Validation>> {
     let providers = discover(config)?;
     let selected: Vec<_> = providers
@@ -350,31 +550,39 @@ pub fn validate_all(config: &Config, scope: &Path, name: Option<&str>) -> Result
     if name.is_some() && selected.is_empty() {
         bail!("unknown provider: {}", name.unwrap_or_default());
     }
-    Ok(selected.into_iter().map(|provider| {
-        let request = json!({
-            "version": "orc.provider/v1",
-            "action": "validate",
-            "capability": "provider.validate",
-            "scope": scope,
-            "manifest": { "name": provider.name, "kind": provider.kind, "actions": provider.actions },
-        });
-        let result = invoke_raw(&provider, &request, config);
-        let mut checks = vec![ValidationCheck {
-            name: "manifest".into(), status: CheckStatus::Ok, message: "manifest and executable are valid".into()
-        }];
-        match result {
-            Ok(value) => {
-                if let Some(items) = value.get("checks").and_then(Value::as_array) {
-                    for item in items {
-                        if let Ok(check) = serde_json::from_value(item.clone()) { checks.push(check); }
-                    }
-                }
+    Ok(selected
+        .into_iter()
+        .map(|provider| {
+            let request = json!({
+                "version": "orc.provider/v1",
+                "action": "validate",
+                "capability": "provider.validate",
+                "scope": scope,
+                "manifest": {
+                    "name": provider.name,
+                    "kind": provider.kind,
+                    "actions": provider.actions,
+                },
+            });
+            let mut checks = vec![ValidationCheck {
+                name: "manifest".into(),
+                status: CheckStatus::Ok,
+                message: "manifest is valid".into(),
+            }];
+            checks.extend(requirements_checks(&provider));
+            checks.extend(provider_checks(invoke_raw(&provider, &request, config)));
+            let status = if checks.iter().all(|check| check.status == CheckStatus::Ok) {
+                CheckStatus::Ok
+            } else {
+                CheckStatus::Failed
+            };
+            Validation {
+                provider,
+                status,
+                checks,
             }
-            Err(error) => checks.push(ValidationCheck { name: "provider".into(), status: CheckStatus::Failed, message: format!("{error:#}") }),
-        }
-        let status = if checks.iter().all(|check| check.status == CheckStatus::Ok) { CheckStatus::Ok } else { CheckStatus::Failed };
-        Validation { provider, status, checks }
-    }).collect())
+        })
+        .collect())
 }
 
 fn parse_plan(provider: &Manifest, value: Value) -> Result<Option<CommandPlan>> {
@@ -386,6 +594,7 @@ fn parse_plan(provider: &Manifest, value: Value) -> Result<Option<CommandPlan>> 
     if plan.version != "orc.provider/v1"
         || plan.command.is_empty()
         || plan.command.iter().any(String::is_empty)
+        || plan.success_codes.is_empty()
     {
         bail!("{} returned an invalid command plan", provider.name);
     }
@@ -454,6 +663,38 @@ pub fn run_plan(plan: &CommandPlan, scope: &Path) -> Result<CommandResult> {
     })
 }
 
+pub fn run_plan_with_timeout(
+    plan: &CommandPlan,
+    scope: &Path,
+    timeout: std::time::Duration,
+) -> Result<CommandResult> {
+    let program = plan.command.first().context("command plan is empty")?;
+    let stdout = tempfile::NamedTempFile::new()?;
+    let stderr = tempfile::NamedTempFile::new()?;
+    let mut child = Command::new(program)
+        .args(&plan.command[1..])
+        .current_dir(plan.cwd.as_deref().map(Path::new).unwrap_or(scope))
+        .envs(&plan.environment)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout.reopen()?))
+        .stderr(Stdio::from(stderr.reopen()?))
+        .spawn()
+        .with_context(|| format!("start command plan {program}"))?;
+    let status = match child.wait_timeout(timeout)? {
+        Some(status) => status,
+        None => {
+            child.kill()?;
+            let _ = child.wait();
+            bail!("command plan timed out after {}ms", timeout.as_millis());
+        }
+    };
+    Ok(CommandResult {
+        code: status.code().unwrap_or(1),
+        stdout: String::from_utf8_lossy(&fs::read(stdout.path())?).into_owned(),
+        stderr: String::from_utf8_lossy(&fs::read(stderr.path())?).into_owned(),
+    })
+}
+
 pub fn execute_plan(plan: &CommandPlan, scope: &Path, inherit: bool) -> Result<i32> {
     let program = plan.command.first().context("command plan is empty")?;
     let mut command = Command::new(program);
@@ -474,10 +715,18 @@ pub fn execute_plan(plan: &CommandPlan, scope: &Path, inherit: bool) -> Result<i
     Ok(output.status.code().unwrap_or(1))
 }
 
-pub fn capture_plan(plan: &CommandPlan, scope: &Path) -> Result<String> {
-    let result = run_plan(plan, scope)?;
-    if result.code != 0 {
-        bail!("{}", result.stderr.trim());
+pub fn capture_plan(
+    plan: &CommandPlan,
+    scope: &Path,
+    timeout: std::time::Duration,
+) -> Result<String> {
+    let result = run_plan_with_timeout(plan, scope, timeout)?;
+    if !plan.accepts(result.code) {
+        let message = result.stderr.trim();
+        if message.is_empty() {
+            bail!("command plan exited with {}", result.code);
+        }
+        bail!("{message}");
     }
     Ok(result.stdout)
 }
@@ -508,7 +757,7 @@ pub fn discover_bindings(
             "version": "orc.provider/v1", "action": "bind", "capability": Capability::SessionBind,
             "scope": scope, "session": session, "plan": null,
         });
-        let value = invoke_cached(provider, &request, config).ok()?;
+        let value = invoke_raw(provider, &request, config).ok()?;
         if value.get("status").and_then(Value::as_str) == Some("declined") { return None; }
         let binding = value.get("binding")?;
         Some(ProviderBinding {
@@ -560,5 +809,48 @@ mod tests {
     fn attach_chain_composes_three_capabilities() {
         assert_eq!(Action::Attach.stages().len(), 3);
         assert!(Action::Attach.stages()[1].1);
+    }
+
+    #[test]
+    fn bounded_plan_execution_stops_hung_integrations() {
+        let plan = CommandPlan {
+            version: "orc.provider/v1".into(),
+            command: vec!["sleep".into(), "1".into()],
+            cwd: None,
+            environment: BTreeMap::new(),
+            success_codes: vec![0],
+        };
+        let error =
+            run_plan_with_timeout(&plan, Path::new("."), std::time::Duration::from_millis(10))
+                .expect_err("sleep must exceed the timeout");
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn command_plan_accepts_provider_declared_exit_codes() {
+        let provider = Manifest {
+            version: "orc.provider/v1".into(),
+            name: "activity".into(),
+            description: "Activity".into(),
+            kind: ProviderKind::Activity,
+            command: "activity-provider".into(),
+            actions: BTreeMap::new(),
+            capabilities: Vec::new(),
+            requires: Requirements::default(),
+            priority: 0,
+        };
+        let plan = parse_plan(
+            &provider,
+            serde_json::json!({
+                "version": "orc.provider/v1",
+                "command": ["activity"],
+                "successCodes": [0, 2],
+            }),
+        )
+        .expect("plan should parse")
+        .expect("provider should accept the request");
+
+        assert!(plan.accepts(2));
+        assert!(!plan.accepts(1));
     }
 }

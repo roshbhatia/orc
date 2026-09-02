@@ -2,6 +2,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
+    sync::{
+        OnceLock,
+        mpsc::{self, Receiver, Sender},
+    },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -10,11 +15,12 @@ use anyhow::Result;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEvent,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use minijinja::{Environment, context};
 use rataflow::{
     Direction, Edge, EdgeContent, EdgePathContext, EdgeRenderContext, EdgeStyle, Flow, Handle,
     HandlePosition, Node, NodeContent, NodeRenderContext, Path as EdgePath, Reconnectable,
@@ -26,7 +32,7 @@ use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{
         Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs,
         Widget, Wrap,
@@ -37,7 +43,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     config::Config,
     control,
-    domain::{LifecycleStatus, Session, SessionRole, WorkspaceState},
+    domain::{LifecycleStatus, Session, SessionRole, WorkflowNode, WorkflowRun, WorkspaceState},
     provider::{self, Action, Manifest},
     workflow,
 };
@@ -83,9 +89,10 @@ enum Dock {
 enum Confirmation {
     Approve { run_id: String, gate_id: String },
     Cancel { run_id: String },
+    Prune { session_id: String, title: String },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ItemRef {
     Session(String),
     Run(String),
@@ -188,6 +195,30 @@ impl EdgeContent for RelationEdge {
 type AgentFlow = Flow<AgentCard, RelationEdge>;
 type GraphEdge = (String, String, String, bool);
 
+#[derive(Clone, Copy, Debug, Default)]
+struct HitAreas {
+    tabs: Rect,
+    main: Rect,
+    graph: Rect,
+    detail: Rect,
+    output: Option<Rect>,
+}
+
+enum BackgroundResult {
+    Refresh(Result<(WorkspaceState, Vec<Manifest>), String>),
+    Activity {
+        session_id: String,
+        result: Result<String, String>,
+    },
+    ProviderActivity {
+        provider_name: String,
+        result: String,
+    },
+    Changes(Result<String, String>),
+    Validation(Result<String, String>),
+    Action(Result<String, String>),
+}
+
 struct App {
     scope: PathBuf,
     config: Config,
@@ -213,9 +244,19 @@ struct App {
     help: bool,
     confirmation: Option<Confirmation>,
     status: String,
-    activity: String,
+    activity: BTreeMap<String, String>,
+    activity_loaded_at: BTreeMap<String, Instant>,
+    activity_loading: BTreeSet<String>,
+    provider_activity: BTreeMap<String, String>,
+    provider_activity_loaded_at: BTreeMap<String, Instant>,
+    provider_activity_loading: BTreeSet<String>,
+    provider_report: String,
     changes: String,
     last_refresh: Instant,
+    refresh_inflight: bool,
+    refresh_requested: bool,
+    resize_at: Option<Instant>,
+    hit: HitAreas,
     graph_signature: String,
 }
 
@@ -232,6 +273,13 @@ impl App {
             .find(|run| run.status.active())
             .or_else(|| state.runs.first())
             .map(|run| run.id.clone());
+        let expanded = state
+            .sessions
+            .iter()
+            .filter(|session| session.status != LifecycleStatus::Archived)
+            .map(|session| format!("session:{}", session.id))
+            .chain(state.runs.iter().map(|run| format!("run:{}", run.id)))
+            .collect();
         let mut app = Self {
             scope,
             config,
@@ -244,7 +292,7 @@ impl App {
             fleet_at: 0,
             active_run,
             provider_at: 0,
-            expanded: BTreeSet::new(),
+            expanded,
             main_tab: MainTab::Explorer,
             explorer_view: ExplorerView::Graph,
             focus: Focus::Main,
@@ -257,9 +305,19 @@ impl App {
             help: false,
             confirmation: None,
             status: String::new(),
-            activity: String::new(),
+            activity: BTreeMap::new(),
+            activity_loaded_at: BTreeMap::new(),
+            activity_loading: BTreeSet::new(),
+            provider_activity: BTreeMap::new(),
+            provider_activity_loaded_at: BTreeMap::new(),
+            provider_activity_loading: BTreeSet::new(),
+            provider_report: String::new(),
             changes: String::new(),
             last_refresh: Instant::now(),
+            refresh_inflight: false,
+            refresh_requested: false,
+            resize_at: None,
+            hit: HitAreas::default(),
             graph_signature: String::new(),
         };
         app.rebuild(true);
@@ -289,16 +347,123 @@ impl App {
         }
     }
 
-    fn refresh(&mut self) {
-        match control::reconcile(&self.config, &self.scope) {
-            Ok(state) => {
-                self.state = state;
-                self.providers = provider::discover(&self.config).unwrap_or_default();
-                self.rebuild(false);
-                self.last_refresh = Instant::now();
-            }
-            Err(error) => self.status = format!("refresh failed: {error:#}"),
+    fn request_refresh(&mut self, tx: &Sender<BackgroundResult>) {
+        if self.refresh_inflight {
+            self.refresh_requested = true;
+            return;
         }
+        self.refresh_inflight = true;
+        self.refresh_requested = false;
+        let config = self.config.clone();
+        let scope = self.scope.clone();
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let result = control::reconcile(&config, &scope)
+                .and_then(|state| provider::discover(&config).map(|providers| (state, providers)))
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(BackgroundResult::Refresh(result));
+        });
+    }
+
+    fn apply_background(&mut self, result: BackgroundResult) {
+        match result {
+            BackgroundResult::Refresh(result) => {
+                self.refresh_inflight = false;
+                self.last_refresh = Instant::now();
+                match result {
+                    Ok((state, providers)) => {
+                        self.state = state;
+                        self.providers = providers;
+                        self.rebuild(false);
+                    }
+                    Err(error) => self.status = format!("refresh failed: {error}"),
+                }
+            }
+            BackgroundResult::Activity { session_id, result } => {
+                self.activity_loading.remove(&session_id);
+                self.activity_loaded_at
+                    .insert(session_id.clone(), Instant::now());
+                self.activity.insert(
+                    session_id,
+                    result.unwrap_or_else(|error| format!("Activity provider failed: {error}")),
+                );
+            }
+            BackgroundResult::ProviderActivity {
+                provider_name,
+                result,
+            } => {
+                self.provider_activity_loading.remove(&provider_name);
+                self.provider_activity_loaded_at
+                    .insert(provider_name.clone(), Instant::now());
+                self.provider_activity.insert(provider_name, result);
+            }
+            BackgroundResult::Changes(result) => {
+                self.changes =
+                    result.unwrap_or_else(|error| format!("Changes provider failed: {error}"));
+            }
+            BackgroundResult::Validation(result) => {
+                self.provider_report =
+                    result.unwrap_or_else(|error| format!("Provider validation failed: {error}"));
+            }
+            BackgroundResult::Action(result) => {
+                self.status = result.unwrap_or_else(|error| format!("Action failed: {error}"));
+                self.refresh_requested = true;
+            }
+        }
+    }
+
+    fn request_activity(&mut self, tx: &Sender<BackgroundResult>, force: bool) {
+        let Some(session) = self.selected_session().cloned() else {
+            return;
+        };
+        if self.activity_loading.contains(&session.id) {
+            return;
+        }
+        let fresh = self.activity_loaded_at.get(&session.id).is_some_and(|at| {
+            at.elapsed() < Duration::from_millis(self.config.ui.activity_refresh_ms)
+        });
+        if !force && fresh {
+            return;
+        }
+        self.activity_loading.insert(session.id.clone());
+        let session_id = session.id.clone();
+        let config = self.config.clone();
+        let providers = self.providers.clone();
+        let scope = self.scope.clone();
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let request =
+                provider::action_request(Action::Activity, &scope, Some(&session), "right");
+            let result = provider::resolve_plan(&config, &providers, Action::Activity, request)
+                .and_then(|plan| provider::capture_plan(&plan, &scope, config.provider_timeout()))
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(BackgroundResult::Activity { session_id, result });
+        });
+    }
+
+    fn request_provider_activity(&mut self, tx: &Sender<BackgroundResult>, force: bool) {
+        let Some(ItemRef::Provider(provider_name)) = self.selected() else {
+            return;
+        };
+        if self.provider_activity_loading.contains(&provider_name) {
+            return;
+        }
+        let fresh = self
+            .provider_activity_loaded_at
+            .get(&provider_name)
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(2));
+        if !force && fresh {
+            return;
+        }
+        self.provider_activity_loading.insert(provider_name.clone());
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let result = provider::recent_activity(&provider_name);
+            let _ = tx.send(BackgroundResult::ProviderActivity {
+                provider_name,
+                result,
+            });
+        });
     }
 
     fn selected(&self) -> Option<ItemRef> {
@@ -371,6 +536,13 @@ impl App {
     }
 
     fn request_cancel(&mut self) {
+        if let Some(session) = self.selected_session() {
+            self.confirmation = Some(Confirmation::Prune {
+                session_id: session.id.clone(),
+                title: session.title.clone(),
+            });
+            return;
+        }
         if let Some(run_id) = self.selected_run_id() {
             self.confirmation = Some(Confirmation::Cancel { run_id });
         } else {
@@ -378,24 +550,34 @@ impl App {
         }
     }
 
-    fn confirm(&mut self) {
+    fn confirm(&mut self, tx: &Sender<BackgroundResult>) {
         let Some(confirmation) = self.confirmation.take() else {
             return;
         };
-        let result = match confirmation {
-            Confirmation::Approve { run_id, gate_id } => {
-                workflow::approve(&self.config, &self.scope, &run_id, Some(&gate_id), false)
-                    .and_then(|_| workflow::spawn(&self.scope, &run_id))
-            }
-            Confirmation::Cancel { run_id } => workflow::cancel(&self.scope, &run_id),
-        };
-        match result {
-            Ok(run) => {
-                self.status = format!("{} is {}", run.name, run.status);
-                self.refresh();
-            }
-            Err(error) => self.status = format!("action failed: {error:#}"),
-        }
+        self.status = "applying action…".into();
+        let config = self.config.clone();
+        let scope = self.scope.clone();
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let result: Result<(String, LifecycleStatus)> = match confirmation {
+                Confirmation::Approve { run_id, gate_id } => {
+                    workflow::approve(&config, &scope, &run_id, Some(&gate_id), false)
+                        .and_then(|_| workflow::spawn(&scope, &run_id))
+                        .map(|run| (run.name, run.status))
+                }
+                Confirmation::Cancel { run_id } => {
+                    workflow::cancel(&scope, &run_id).map(|run| (run.name, run.status))
+                }
+                Confirmation::Prune { session_id, .. } => {
+                    control::prune(&config, &scope, &session_id)
+                        .map(|session| (session.title, session.status))
+                }
+            };
+            let result = result
+                .map(|(name, status)| format!("{name} is {status}"))
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(BackgroundResult::Action(result));
+        });
     }
 
     fn move_main(&mut self, direction: Direction) {
@@ -444,7 +626,7 @@ impl App {
         }
     }
 
-    fn open_selected(&mut self) {
+    fn open_selected(&mut self, tx: &Sender<BackgroundResult>) {
         if let Some(ItemRef::Run(run_id)) = self.selected() {
             self.active_run = Some(run_id);
             self.explorer_view = ExplorerView::Graph;
@@ -456,73 +638,88 @@ impl App {
         }
         if let Some(session) = self.selected_session().cloned() {
             self.status = "opening session through providers".into();
-            match control::attach(
-                &self.config,
-                &self.scope,
-                &session.id,
-                Action::Attach,
-                "right",
-            ) {
-                Ok(0) => self.status = format!("opened {}", session.title),
-                Ok(code) => self.status = format!("attach exited with {code}"),
-                Err(error) => self.status = format!("attach failed: {error:#}"),
-            }
+            let config = self.config.clone();
+            let scope = self.scope.clone();
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let result = control::attach(&config, &scope, &session.id, Action::Attach, "right")
+                    .and_then(|code| {
+                        if code == 0 {
+                            Ok(format!("opened {}", session.title))
+                        } else {
+                            anyhow::bail!("attach exited with {code}")
+                        }
+                    })
+                    .map_err(|error| format!("{error:#}"));
+                let _ = tx.send(BackgroundResult::Action(result));
+            });
         } else if self.main_tab == MainTab::Providers {
-            self.validate_provider();
+            self.validate_provider(tx);
         }
     }
 
-    fn load_output(&mut self, action: Action) {
-        let session = self.selected_session().cloned();
-        if session.is_none() && !matches!(action, Action::Changes) {
-            self.status = "select a session first".into();
-            return;
-        }
-        let request = provider::action_request(action, &self.scope, session.as_ref(), "right");
-        match provider::resolve_plan(&self.config, &self.providers, action, request)
-            .and_then(|plan| provider::capture_plan(&plan, &self.scope))
-        {
-            Ok(output) => match action {
-                Action::Activity => {
-                    self.activity = output;
-                    self.output_tab = OutputTab::Activity;
+    fn load_output(&mut self, action: Action, tx: &Sender<BackgroundResult>) {
+        match action {
+            Action::Activity => {
+                if self.selected_session().is_none() {
+                    self.status = "select an agent first".into();
+                    return;
                 }
-                Action::Changes => {
-                    self.changes = output;
-                    self.output_tab = OutputTab::Changes;
-                }
-                _ => {}
-            },
-            Err(error) => self.status = format!("provider failed: {error:#}"),
+                self.request_activity(tx, true);
+                self.output_tab = OutputTab::Activity;
+            }
+            Action::Changes => {
+                let config = self.config.clone();
+                let providers = self.providers.clone();
+                let scope = self.scope.clone();
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    let request = provider::action_request(Action::Changes, &scope, None, "right");
+                    let result =
+                        provider::resolve_plan(&config, &providers, Action::Changes, request)
+                            .and_then(|plan| {
+                                provider::capture_plan(&plan, &scope, config.provider_timeout())
+                            })
+                            .map_err(|error| format!("{error:#}"));
+                    let _ = tx.send(BackgroundResult::Changes(result));
+                });
+                self.output_tab = OutputTab::Changes;
+            }
+            _ => return,
         }
         self.focus = Focus::Output;
         self.output_scroll = 0;
     }
 
-    fn validate_provider(&mut self) {
+    fn validate_provider(&mut self, tx: &Sender<BackgroundResult>) {
         let name = match self.selected() {
             Some(ItemRef::Provider(name)) => name,
             _ => return,
         };
-        match provider::validate_all(&self.config, &self.scope, Some(&name)) {
-            Ok(results) => {
-                let lines = results
-                    .into_iter()
-                    .flat_map(|result| {
-                        result.checks.into_iter().map(|check| {
-                            format!("{:?}  {}  {}", check.status, check.name, check.message)
+        let config = self.config.clone();
+        let scope = self.scope.clone();
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let result = provider::validate_all(&config, &scope, Some(&name))
+                .map(|results| {
+                    results
+                        .into_iter()
+                        .flat_map(|result| {
+                            result.checks.into_iter().map(|check| {
+                                format!("{:?}  {}  {}", check.status, check.name, check.message)
+                            })
                         })
-                    })
-                    .collect::<Vec<_>>();
-                self.activity = lines.join("\n");
-                self.output_tab = OutputTab::Activity;
-                self.focus = Focus::Output;
-            }
-            Err(error) => self.status = format!("validation failed: {error:#}"),
-        }
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(BackgroundResult::Validation(result));
+        });
+        self.output_tab = OutputTab::Activity;
+        self.focus = Focus::Output;
     }
 
-    fn handle_key(&mut self, key: KeyEvent) -> bool {
+    fn handle_key(&mut self, key: KeyEvent, tx: &Sender<BackgroundResult>) -> bool {
         if key.kind == KeyEventKind::Release {
             return false;
         }
@@ -531,7 +728,7 @@ impl App {
         }
         if self.confirmation.is_some() {
             match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => self.confirm(),
+                KeyCode::Char('y') | KeyCode::Enter => self.confirm(tx),
                 KeyCode::Char('n') | KeyCode::Esc => self.confirmation = None,
                 _ => {}
             }
@@ -596,8 +793,11 @@ impl App {
             (KeyCode::Char('1'), _) => self.main_tab = MainTab::Explorer,
             (KeyCode::Char('2'), _) => self.main_tab = MainTab::Providers,
             (KeyCode::Char('g'), _) if self.focus == Focus::Main => {
+                self.explorer_view = ExplorerView::Graph;
+            }
+            (KeyCode::Char('G'), _) if self.focus == Focus::Main => {
                 if !self.request_gate() {
-                    self.explorer_view = ExplorerView::Graph;
+                    self.status = "the selected run has no pending gate".into();
                 }
             }
             (KeyCode::Char('t'), _) if self.focus == Focus::Main => {
@@ -606,7 +806,7 @@ impl App {
             (KeyCode::Char('f'), _) if self.focus == Focus::Main => {
                 self.explorer_view = ExplorerView::Fleet
             }
-            (KeyCode::Char('r'), _) => self.refresh(),
+            (KeyCode::Char('r'), _) => self.request_refresh(tx),
             (KeyCode::Char('R'), _) => {
                 self.rebuild(true);
                 self.flow.request_fit_view();
@@ -628,13 +828,13 @@ impl App {
                 self.config.ui.inspector_percent =
                     self.config.ui.inspector_percent.saturating_sub(5).max(20);
             }
-            (KeyCode::Char('i'), _) => self.load_output(Action::Activity),
-            (KeyCode::Char('c'), _) => self.load_output(Action::Changes),
+            (KeyCode::Char('i'), _) => self.load_output(Action::Activity, tx),
+            (KeyCode::Char('c'), _) => self.load_output(Action::Changes, tx),
             (KeyCode::Char('v'), _) if self.main_tab == MainTab::Providers => {
-                self.validate_provider()
+                self.validate_provider(tx)
             }
             (KeyCode::Char('x'), _) => self.request_cancel(),
-            (KeyCode::Enter, _) => self.open_selected(),
+            (KeyCode::Enter, _) => self.open_selected(tx),
             (KeyCode::Char('j'), _) | (KeyCode::Down, _) => self.motion(Direction::Down),
             (KeyCode::Char('k'), _) | (KeyCode::Up, _) => self.motion(Direction::Up),
             (KeyCode::Char('h'), _) | (KeyCode::Left, _) => self.motion(Direction::Left),
@@ -645,13 +845,150 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if self.main_tab == MainTab::Explorer
-            && self.explorer_view == ExplorerView::Graph
-            && self.focus == Focus::Main
+        let x = mouse.column;
+        let y = mouse.row;
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && contains(self.hit.tabs, x, y)
         {
-            let _ = self.flow.handle_mouse_event(mouse);
-            self.detail_scroll = 0;
-            self.output_scroll = 0;
+            self.main_tab = if x < self.hit.tabs.x.saturating_add(15) {
+                MainTab::Explorer
+            } else {
+                MainTab::Providers
+            };
+            self.focus = Focus::Main;
+            return;
+        }
+
+        if contains(self.hit.detail, x, y) {
+            self.focus = Focus::Detail;
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(3)
+                }
+                MouseEventKind::ScrollDown => {
+                    self.detail_scroll = self.detail_scroll.saturating_add(3)
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if let Some(output) = self.hit.output
+            && contains(output, x, y)
+        {
+            self.focus = Focus::Output;
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.output_scroll = self.output_scroll.saturating_sub(3)
+                }
+                MouseEventKind::ScrollDown => {
+                    self.output_scroll = self.output_scroll.saturating_add(3)
+                }
+                MouseEventKind::Down(MouseButton::Left) if y == output.y => {
+                    if let Some(tab) = output_tab_at(output, x) {
+                        self.output_tab = tab;
+                        self.output_scroll = 0;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if !contains(self.hit.main, x, y) {
+            return;
+        }
+        self.focus = Focus::Main;
+        if self.main_tab == MainTab::Explorer && self.explorer_view == ExplorerView::Graph {
+            if contains(self.hit.graph, x, y) {
+                if self.hit.graph.width < 70 {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => self.move_main(Direction::Up),
+                        MouseEventKind::ScrollDown => self.move_main(Direction::Down),
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            let rows = compact_graph_rows(self);
+                            if let Some(index) = visible_row_at(
+                                self.hit.graph,
+                                y,
+                                compact_graph_index(self, &rows),
+                                rows.len(),
+                                0,
+                            ) && let Some(id) = rows
+                                .get(index)
+                                .and_then(|row| graph_id_for_item(self, &row.item))
+                            {
+                                self.flow.select_node(&id);
+                            }
+                        }
+                        _ => {}
+                    }
+                } else {
+                    let _ = self.flow.handle_mouse_event(mouse);
+                }
+                self.detail_scroll = 0;
+                self.output_scroll = 0;
+            }
+            return;
+        }
+
+        let delta: Option<i32> = match mouse.kind {
+            MouseEventKind::ScrollUp => Some(-3),
+            MouseEventKind::ScrollDown => Some(3),
+            _ => None,
+        };
+        if let Some(delta) = delta {
+            for _ in 0..delta.unsigned_abs() {
+                self.move_main(if delta > 0 {
+                    Direction::Down
+                } else {
+                    Direction::Up
+                });
+            }
+            return;
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            let header_rows = usize::from(
+                self.main_tab == MainTab::Explorer && self.explorer_view == ExplorerView::Fleet,
+            );
+            let index = visible_row_at(
+                self.hit.main,
+                y,
+                self.selected_list_index(),
+                self.list_len(),
+                header_rows,
+            );
+            if let Some(index) = index {
+                match self.main_tab {
+                    MainTab::Providers => self.provider_at = index,
+                    MainTab::Explorer if self.explorer_view == ExplorerView::Tree => {
+                        self.tree_at = index
+                    }
+                    MainTab::Explorer if self.explorer_view == ExplorerView::Fleet => {
+                        self.fleet_at = index
+                    }
+                    MainTab::Explorer => {}
+                }
+                self.detail_scroll = 0;
+                self.output_scroll = 0;
+            }
+        }
+    }
+
+    fn selected_list_index(&self) -> usize {
+        match self.main_tab {
+            MainTab::Providers => self.provider_at,
+            MainTab::Explorer if self.explorer_view == ExplorerView::Tree => self.tree_at,
+            MainTab::Explorer if self.explorer_view == ExplorerView::Fleet => self.fleet_at,
+            MainTab::Explorer => 0,
+        }
+    }
+
+    fn list_len(&self) -> usize {
+        match self.main_tab {
+            MainTab::Providers => self.providers.len(),
+            MainTab::Explorer if self.explorer_view == ExplorerView::Tree => self.tree.len(),
+            MainTab::Explorer if self.explorer_view == ExplorerView::Fleet => self.state.runs.len(),
+            MainTab::Explorer => 0,
         }
     }
 
@@ -711,35 +1048,115 @@ fn new_flow() -> AgentFlow {
     let mut palette = Theme::Dark.palette();
     palette.canvas_bg = Color::Reset;
     palette.surface = Color::Reset;
-    palette.accent = Color::Indexed(109);
-    palette.text = Color::Indexed(252);
+    palette.accent = Color::Cyan;
+    palette.text = Color::Gray;
     Flow::new()
         .with_theme(Theme::Custom(palette))
+        .with_min_zoom(0.55)
         .with_deselect_on_pane_click(false)
         .with_selection_reveal(rataflow::SelectionReveal::EnsureVisible)
 }
 
 fn graph_signature(state: &WorkspaceState, active_run: Option<&str>) -> String {
-    let Some(run) = active_run.and_then(|id| state.runs.iter().find(|run| run.id == id)) else {
-        return state
-            .current_session()
-            .map_or_else(String::new, |session| format!("s:{}", session.id));
-    };
-    let mut value = format!(
-        "r:{}:{};",
-        run.id,
-        run.orchestrator_id.as_deref().unwrap_or("")
-    );
-    for node in &run.nodes {
-        value.push_str(&format!("n:{};", node.id));
-    }
-    for edge in &run.edges {
+    let mut value = String::new();
+    if let Some(run) = active_run.and_then(|id| state.runs.iter().find(|run| run.id == id)) {
         value.push_str(&format!(
-            "e:{}:{}:{};",
-            edge.from, edge.to, edge.relationship
+            "r:{}:{};",
+            run.id,
+            run.orchestrator_id.as_deref().unwrap_or("")
+        ));
+        for node in &run.nodes {
+            value.push_str(&format!(
+                "n:{}:{};",
+                node.id,
+                node.session_id.as_deref().unwrap_or("")
+            ));
+        }
+        for edge in &run.edges {
+            value.push_str(&format!(
+                "e:{}:{}:{};",
+                edge.from, edge.to, edge.relationship
+            ));
+        }
+    }
+    for session in state
+        .sessions
+        .iter()
+        .filter(|session| session.status != LifecycleStatus::Archived)
+    {
+        value.push_str(&format!(
+            "s:{}:{}:{}:{};",
+            session.id,
+            session.parent_id.as_deref().unwrap_or(""),
+            session.run_id.as_deref().unwrap_or(""),
+            session.node_id.as_deref().unwrap_or("")
         ));
     }
     value
+}
+
+fn session_kind(state: &WorkspaceState, session: &Session) -> String {
+    if session.role == SessionRole::Orchestrator && session.parent_id.is_none() {
+        return "orchestrator".into();
+    }
+    let origin = session
+        .parent_id
+        .as_deref()
+        .and_then(|id| state.sessions.iter().find(|candidate| candidate.id == id))
+        .map_or("agent", |parent| {
+            if parent.harness == session.harness {
+                "native"
+            } else {
+                "harness"
+            }
+        });
+    format!("{origin} · {}", session.role)
+}
+
+fn add_session_card(
+    flow: &mut AgentFlow,
+    items: &mut BTreeMap<String, ItemRef>,
+    known: &mut BTreeSet<String>,
+    state: &WorkspaceState,
+    session: &Session,
+) {
+    let id = format!("session:{}", session.id);
+    let card = AgentCard {
+        kind: session_kind(state, session),
+        title: session.title.clone(),
+        subtitle: format!("{} · {}", session.harness, session.status),
+        goal: session.goal.clone(),
+        status: session.status,
+    };
+    let node = Node::new(&id, (0.0, 0.0), (38.0, 5.0), card)
+        .with_deletable(false)
+        .with_connectable(false)
+        .with_draggable(false)
+        .with_handles(vec![
+            Handle::source(HandlePosition::Bottom).with_hidden(true),
+            Handle::target(HandlePosition::Top).with_hidden(true),
+        ]);
+    let _ = flow.add_node(node);
+    known.insert(id.clone());
+    items.insert(id, ItemRef::Session(session.id.clone()));
+}
+
+fn descends_from(state: &WorkspaceState, session: &Session, ancestor: &str) -> bool {
+    let mut parent = session.parent_id.as_deref();
+    for _ in 0..state.sessions.len() {
+        let Some(id) = parent else {
+            return false;
+        };
+        if id == ancestor {
+            return true;
+        }
+        parent = state
+            .sessions
+            .iter()
+            .find(|candidate| candidate.id == id)
+            .and_then(|candidate| candidate.parent_id.as_deref());
+    }
+    false
 }
 
 fn refresh_flow_content(flow: &mut AgentFlow, state: &WorkspaceState) {
@@ -782,27 +1199,18 @@ fn build_flow(
         .and_then(|id| state.sessions.iter().find(|session| session.id == id))
         .or_else(|| state.current_session());
     if let Some(session) = orchestrator {
-        let id = format!("session:{}", session.id);
-        let card = AgentCard {
-            kind: "orchestrator".into(),
-            title: session.title.clone(),
-            subtitle: format!("{} · {}", session.harness, session.status),
-            goal: session.goal.clone(),
-            status: session.status,
-        };
-        let node = Node::new(&id, (0.0, 0.0), (40.0, 5.0), card)
-            .with_deletable(false)
-            .with_connectable(false)
-            .with_draggable(false)
-            .with_handles(vec![
-                Handle::source(HandlePosition::Bottom).with_hidden(true),
-                Handle::target(HandlePosition::Top).with_hidden(true),
-            ]);
-        let _ = flow.add_node(node);
-        known.insert(id.clone());
-        items.insert(id, ItemRef::Session(session.id.clone()));
+        add_session_card(&mut flow, &mut items, &mut known, state, session);
     }
     if let Some(run) = run {
+        let represented_sessions: BTreeMap<_, _> = run
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                node.session_id
+                    .as_ref()
+                    .map(|session| (session.clone(), format!("node:{}:{}", run.id, node.id)))
+            })
+            .collect();
         for workflow_node in &run.nodes {
             let node_id = format!("node:{}:{}", run.id, workflow_node.id);
             let card = AgentCard {
@@ -812,7 +1220,7 @@ fn build_flow(
                 goal: workflow_node.goal.clone(),
                 status: workflow_node.status,
             };
-            let node = Node::new(&node_id, (0.0, 0.0), (40.0, 5.0), card)
+            let node = Node::new(&node_id, (0.0, 0.0), (38.0, 5.0), card)
                 .with_deletable(false)
                 .with_connectable(false)
                 .with_draggable(false)
@@ -829,6 +1237,34 @@ fn build_flow(
         }
         let mut topology_edges = Vec::new();
         let mut overlay_edges = Vec::new();
+        let orchestrator_id = orchestrator.map(|session| session.id.as_str());
+        for session in state.sessions.iter().filter(|session| {
+            session.status != LifecycleStatus::Archived
+                && Some(session.id.as_str()) != orchestrator_id
+                && !represented_sessions.contains_key(&session.id)
+                && (session.run_id.as_deref() == Some(&run.id)
+                    || orchestrator_id.is_some_and(|id| descends_from(state, session, id)))
+        }) {
+            add_session_card(&mut flow, &mut items, &mut known, state, session);
+        }
+        for session in state.sessions.iter().filter(|session| {
+            known.contains(&format!("session:{}", session.id))
+                && Some(session.id.as_str()) != orchestrator_id
+        }) {
+            let Some(parent) = session.parent_id.as_deref() else {
+                continue;
+            };
+            let from = represented_sessions
+                .get(parent)
+                .cloned()
+                .unwrap_or_else(|| format!("session:{parent}"));
+            topology_edges.push((
+                from,
+                format!("session:{}", session.id),
+                "spawned".into(),
+                session.status.active(),
+            ));
+        }
         let dependencies: BTreeSet<_> = run.edges.iter().map(|edge| edge.to.as_str()).collect();
         for node in &run.nodes {
             if !dependencies.contains(node.id.as_str())
@@ -881,6 +1317,30 @@ fn build_flow(
         flow.apply_layout(Sugiyama::vertical());
         add_graph_edges(&mut flow, &known, overlay_edges, "overlay");
     } else {
+        let sessions: Vec<_> = state
+            .sessions
+            .iter()
+            .filter(|session| session.status != LifecycleStatus::Archived)
+            .collect();
+        for session in &sessions {
+            if !known.contains(&format!("session:{}", session.id)) {
+                add_session_card(&mut flow, &mut items, &mut known, state, session);
+            }
+        }
+        let edges = sessions
+            .iter()
+            .filter_map(|session| {
+                session.parent_id.as_deref().map(|parent| {
+                    (
+                        format!("session:{parent}"),
+                        format!("session:{}", session.id),
+                        "spawned".into(),
+                        session.status.active(),
+                    )
+                })
+            })
+            .collect();
+        add_graph_edges(&mut flow, &known, edges, "lineage");
         flow.apply_layout(Sugiyama::vertical());
     }
     flow.request_fit_view();
@@ -912,96 +1372,161 @@ fn add_graph_edges(
 
 fn tree_rows(state: &WorkspaceState, expanded: &BTreeSet<String>) -> Vec<TreeRow> {
     let mut rows = Vec::new();
-    let orchestrators: Vec<_> = state
+    let mut visited = BTreeSet::new();
+    let roots: Vec<_> = state
         .sessions
         .iter()
         .filter(|session| {
-            session.role == SessionRole::Orchestrator && session.status != LifecycleStatus::Archived
+            session.status != LifecycleStatus::Archived
+                && (session.parent_id.is_none()
+                    || !state.sessions.iter().any(|candidate| {
+                        candidate.id == session.parent_id.as_deref().unwrap_or_default()
+                            && candidate.status != LifecycleStatus::Archived
+                    }))
         })
         .collect();
-    for session in orchestrators {
-        let id = format!("session:{}", session.id);
-        let runs: Vec<_> = state
-            .runs
-            .iter()
-            .filter(|run| run.orchestrator_id.as_deref() == Some(&session.id))
-            .collect();
-        rows.push(TreeRow {
-            id: id.clone(),
-            depth: 0,
-            title: session.title.clone(),
-            subtitle: format!("{} · {}", session.harness, session.status),
-            status: Some(session.status),
-            item: ItemRef::Session(session.id.clone()),
-            children: !runs.is_empty(),
-        });
-        if expanded.contains(&id) || expanded.is_empty() {
-            for run in runs {
-                let run_id = format!("run:{}", run.id);
-                rows.push(TreeRow {
-                    id: run_id.clone(),
-                    depth: 1,
-                    title: run.name.clone(),
-                    subtitle: format!("{} steps · {}", run.nodes.len(), run.status),
-                    status: Some(run.status),
-                    item: ItemRef::Run(run.id.clone()),
-                    children: !run.nodes.is_empty(),
-                });
-                if expanded.contains(&run_id) || expanded.is_empty() {
-                    for node in &run.nodes {
-                        rows.push(TreeRow {
-                            id: format!("node:{}:{}", run.id, node.id),
-                            depth: 2,
-                            title: node.name.clone(),
-                            subtitle: format!("{} · {} · {}", node.role, node.harness, node.status),
-                            status: Some(node.status),
-                            item: ItemRef::Node(run.id.clone(), node.id.clone()),
-                            children: false,
-                        });
-                    }
-                }
-            }
-        }
+    for session in roots {
+        push_session_rows(state, expanded, &mut rows, &mut visited, session, 0);
     }
-    let included: BTreeSet<_> = rows
+    let remaining: Vec<_> = state
+        .sessions
         .iter()
-        .filter_map(|row| match &row.item {
-            ItemRef::Session(id) => Some(id.clone()),
-            _ => None,
+        .filter(|session| {
+            session.status != LifecycleStatus::Archived && !visited.contains(&session.id)
         })
         .collect();
-    for session in state.sessions.iter().filter(|session| {
-        session.status != LifecycleStatus::Archived && !included.contains(&session.id)
-    }) {
-        rows.push(TreeRow {
-            id: format!("session:{}", session.id),
-            depth: session.parent_id.is_some() as usize,
-            title: session.title.clone(),
-            subtitle: format!(
-                "{} · {} · {}",
-                session.role, session.harness, session.status
-            ),
-            status: Some(session.status),
-            item: ItemRef::Session(session.id.clone()),
-            children: false,
-        });
+    for session in remaining {
+        push_session_rows(state, expanded, &mut rows, &mut visited, session, 0);
     }
     rows
 }
 
+fn push_session_rows(
+    state: &WorkspaceState,
+    expanded: &BTreeSet<String>,
+    rows: &mut Vec<TreeRow>,
+    visited: &mut BTreeSet<String>,
+    session: &Session,
+    depth: usize,
+) {
+    if !visited.insert(session.id.clone()) {
+        return;
+    }
+    let id = format!("session:{}", session.id);
+    let runs: Vec<_> = state
+        .runs
+        .iter()
+        .filter(|run| run.orchestrator_id.as_deref() == Some(&session.id))
+        .collect();
+    let represented: BTreeSet<_> = runs
+        .iter()
+        .flat_map(|run| run.nodes.iter().filter_map(|node| node.session_id.clone()))
+        .collect();
+    let children: Vec<_> = state
+        .sessions
+        .iter()
+        .filter(|child| {
+            child.status != LifecycleStatus::Archived
+                && child.parent_id.as_deref() == Some(&session.id)
+                && !represented.contains(&child.id)
+        })
+        .collect();
+    rows.push(TreeRow {
+        id: id.clone(),
+        depth,
+        title: session.title.clone(),
+        subtitle: format!(
+            "{} · {} · {}",
+            session_kind(state, session),
+            session.harness,
+            session.status
+        ),
+        status: Some(session.status),
+        item: ItemRef::Session(session.id.clone()),
+        children: !runs.is_empty() || !children.is_empty(),
+    });
+    if !expanded.contains(&id) {
+        return;
+    }
+    for run in runs {
+        let run_id = format!("run:{}", run.id);
+        rows.push(TreeRow {
+            id: run_id.clone(),
+            depth: depth + 1,
+            title: run.name.clone(),
+            subtitle: format!("workflow · {} stages · {}", run.nodes.len(), run.status),
+            status: Some(run.status),
+            item: ItemRef::Run(run.id.clone()),
+            children: !run.nodes.is_empty(),
+        });
+        if !expanded.contains(&run_id) {
+            continue;
+        }
+        for node in &run.nodes {
+            let assigned = node
+                .session_id
+                .as_deref()
+                .and_then(|id| state.sessions.iter().find(|candidate| candidate.id == id));
+            let agent_children: Vec<_> = assigned
+                .into_iter()
+                .flat_map(|assigned| {
+                    state.sessions.iter().filter(move |child| {
+                        child.status != LifecycleStatus::Archived
+                            && child.parent_id.as_deref() == Some(&assigned.id)
+                    })
+                })
+                .collect();
+            let node_id = format!("node:{}:{}", run.id, node.id);
+            rows.push(TreeRow {
+                id: node_id.clone(),
+                depth: depth + 2,
+                title: node.name.clone(),
+                subtitle: format!("stage · {} · {} · {}", node.role, node.harness, node.status),
+                status: Some(node.status),
+                item: ItemRef::Node(run.id.clone(), node.id.clone()),
+                children: !agent_children.is_empty(),
+            });
+            if expanded.contains(&node_id) {
+                for child in agent_children {
+                    push_session_rows(state, expanded, rows, visited, child, depth + 3);
+                }
+            }
+            if let Some(assigned) = assigned {
+                visited.insert(assigned.id.clone());
+            }
+        }
+    }
+    for child in children {
+        push_session_rows(state, expanded, rows, visited, child, depth + 1);
+    }
+}
+
 fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    app.hit = HitAreas::default();
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Fill(1),
         Constraint::Length(1),
     ])
     .areas(area);
+    app.hit.tabs = Rect::new(header.x, header.y.saturating_add(1), header.width, 1);
     render_header(frame, header, app);
     let (workspace, output) = split_body(body, app.dock, app.config.ui.inspector_percent);
-    let [main, detail] =
-        Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)])
-            .areas(workspace);
+    let (main, detail) = if workspace.width >= 100 {
+        let [main, detail] =
+            Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)])
+                .areas(workspace);
+        (main, detail)
+    } else {
+        let [main, detail] =
+            Layout::vertical([Constraint::Percentage(68), Constraint::Percentage(32)])
+                .areas(workspace);
+        (main, detail)
+    };
+    app.hit.main = main;
+    app.hit.detail = detail;
+    app.hit.output = output;
     render_main(frame, main, app);
     render_detail(frame, detail, app);
     if let Some(output) = output {
@@ -1044,7 +1569,48 @@ fn split_body(area: Rect, dock: Dock, percent: u16) -> (Rect, Option<Rect>) {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
-    let titles = ["1  explorer", "2  providers"]
+    let working = app.state.active_sessions().count();
+    let status = if app.refresh_inflight {
+        format!("{} syncing", status_glyph(LifecycleStatus::Working))
+    } else {
+        format!(
+            "{} agents · {} runs",
+            app.state.sessions.len(),
+            app.state.runs.len()
+        )
+    };
+    let status = if working > 0 {
+        format!("{working} active · {status}")
+    } else {
+        status
+    };
+    let status_width = status.width().min(area.width.saturating_sub(1) as usize) as u16;
+    let [title_area, status_area] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(status_width)])
+            .areas(Rect::new(area.x, area.y, area.width, 1));
+    let workspace = app
+        .scope
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("workspace");
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("⚔ orc", title()),
+            Span::styled(
+                format!("  {workspace}"),
+                plain().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  {}", app.scope.display()), dim()),
+        ])),
+        title_area,
+    );
+    frame.render_widget(
+        Paragraph::new(status)
+            .style(if working > 0 { live() } else { dim() })
+            .alignment(Alignment::Right),
+        status_area,
+    );
+    let titles = ["1 explorer", "2 providers"]
         .into_iter()
         .map(Line::from)
         .collect::<Vec<_>>();
@@ -1057,20 +1623,24 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
         .select(selected)
         .style(dim())
         .highlight_style(accent().add_modifier(Modifier::BOLD))
-        .divider("  ");
-    frame.render_widget(tabs, Rect::new(area.x, area.y, area.width, 1));
-    let title = format!(
-        "⚔ orc  {}  {}",
-        app.scope
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("workspace"),
-        app.scope.display()
-    );
-    frame.render_widget(
-        Paragraph::new(title).style(dim()),
-        Rect::new(area.x, area.y + 1, area.width, 1),
-    );
+        .divider("   ");
+    let [tabs_area, view_area] =
+        Layout::horizontal([Constraint::Length(30.min(area.width)), Constraint::Fill(1)])
+            .areas(Rect::new(area.x, area.y + 1, area.width, 1));
+    frame.render_widget(tabs, tabs_area);
+    if app.main_tab == MainTab::Explorer {
+        let view = match app.explorer_view {
+            ExplorerView::Graph => "graph",
+            ExplorerView::Tree => "tree",
+            ExplorerView::Fleet => "fleet",
+        };
+        frame.render_widget(
+            Paragraph::new(format!("view  {view}   g graph · t tree · f fleet"))
+                .style(dim())
+                .alignment(Alignment::Right),
+            view_area,
+        );
+    }
 }
 
 fn render_main(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -1097,12 +1667,86 @@ fn render_main(frame: &mut Frame, area: Rect, app: &mut App) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(border)
-                .title(format!(" {run_title}  graph g · tree t · fleet f "));
+                .title_style(title())
+                .title(format!(" {run_title} "));
             let inner = block.inner(area);
+            app.hit.graph = inner;
             frame.render_widget(block, area);
-            frame.render_widget(&mut app.flow, inner);
+            if inner.width < 70 {
+                render_compact_graph(frame, inner, app);
+            } else {
+                frame.render_widget(&mut app.flow, inner);
+            }
         }
     }
+}
+
+fn graph_id_for_item(app: &App, item: &ItemRef) -> Option<String> {
+    app.graph_items
+        .iter()
+        .find_map(|(id, candidate)| (candidate == item).then(|| id.clone()))
+}
+
+fn compact_graph_rows(app: &App) -> Vec<&TreeRow> {
+    app.tree
+        .iter()
+        .filter(|row| graph_id_for_item(app, &row.item).is_some())
+        .collect()
+}
+
+fn compact_graph_index(app: &App, rows: &[&TreeRow]) -> usize {
+    let selected = app.selected();
+    rows.iter()
+        .position(|row| selected.as_ref() == Some(&row.item))
+        .unwrap_or(0)
+}
+
+fn render_compact_graph(frame: &mut Frame, area: Rect, app: &App) {
+    let rows = compact_graph_rows(app);
+    let selected = compact_graph_index(app, &rows);
+    let items = rows
+        .iter()
+        .map(|row| {
+            let indent = "  ".repeat(row.depth);
+            let connector = if row.depth == 0 { "" } else { "└─" };
+            let status = row.status.unwrap_or(LifecycleStatus::Queued);
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::styled(connector, dim()),
+                    Span::styled(
+                        format!("{} ", status_glyph(status)),
+                        Style::default().fg(status_color(status)),
+                    ),
+                    Span::styled(
+                        truncate(
+                            &row.title,
+                            area.width.saturating_sub(row.depth as u16 * 2 + 4) as usize,
+                        ),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::raw(format!("{indent}  ")),
+                    Span::styled(
+                        truncate(
+                            &row.subtitle,
+                            area.width.saturating_sub(row.depth as u16 * 2 + 2) as usize,
+                        ),
+                        dim(),
+                    ),
+                ]),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_style(accent().add_modifier(Modifier::BOLD))
+            .highlight_symbol("▌ "),
+        area,
+        &mut state,
+    );
 }
 
 fn render_tree(frame: &mut Frame, area: Rect, app: &mut App, border: Style) {
@@ -1128,12 +1772,7 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &mut App, border: Style) {
                         .fg(status_color(row.status.unwrap_or(LifecycleStatus::Queued))),
                 ),
                 Span::raw(" "),
-                Span::styled(
-                    row.title.clone(),
-                    Style::default()
-                        .fg(Color::Indexed(252))
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(row.title.clone(), plain().add_modifier(Modifier::BOLD)),
                 Span::styled(format!("  {}", row.subtitle), dim()),
             ]))
         })
@@ -1145,14 +1784,11 @@ fn render_tree(frame: &mut Frame, area: Rect, app: &mut App, border: Style) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(border)
+                .title_style(title())
                 .title(" tree  graph  g · fleet  f "),
         )
-        .highlight_style(
-            Style::default()
-                .bg(Color::Indexed(237))
-                .fg(Color::Indexed(255)),
-        )
-        .highlight_symbol("  ");
+        .highlight_style(accent().add_modifier(Modifier::BOLD))
+        .highlight_symbol("▌ ");
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -1162,12 +1798,7 @@ fn render_providers(frame: &mut Frame, area: Rect, app: &mut App, border: Style)
         .iter()
         .map(|provider| {
             ListItem::new(Line::from(vec![
-                Span::styled(
-                    provider.name.clone(),
-                    Style::default()
-                        .fg(Color::Indexed(252))
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(provider.name.clone(), plain().add_modifier(Modifier::BOLD)),
                 Span::styled(
                     format!(
                         "  {} · {} actions  ",
@@ -1187,14 +1818,11 @@ fn render_providers(frame: &mut Frame, area: Rect, app: &mut App, border: Style)
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(border)
+                .title_style(title())
                 .title(" providers "),
         )
-        .highlight_style(
-            Style::default()
-                .bg(Color::Indexed(237))
-                .fg(Color::Indexed(255)),
-        )
-        .highlight_symbol("  ");
+        .highlight_style(accent().add_modifier(Modifier::BOLD))
+        .highlight_symbol("▌ ");
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -1228,16 +1856,13 @@ fn render_fleet(frame: &mut Frame, area: Rect, app: &mut App, border: Style) {
         ],
     )
     .header(header)
-    .row_highlight_style(
-        Style::default()
-            .bg(Color::Indexed(237))
-            .fg(Color::Indexed(255)),
-    )
+    .row_highlight_style(accent().add_modifier(Modifier::BOLD))
     .block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(border)
+            .title_style(title())
             .title(" fleet  graph  g · tree  t "),
     );
     let mut state = ratatui::widgets::TableState::default().with_selected(Some(app.fleet_at));
@@ -1285,15 +1910,48 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border)
+        .title_style(title())
         .title(" detail ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(
-        Paragraph::new(details(app))
+        Paragraph::new(styled_details(&details(app)))
             .scroll((app.detail_scroll, 0))
             .wrap(Wrap { trim: false }),
         inner,
     );
+}
+
+fn styled_details(body: &str) -> Text<'static> {
+    Text::from(
+        body.lines()
+            .enumerate()
+            .map(|(index, line)| {
+                if index == 0 || matches!(line, "providers" | "requires" | "actions") {
+                    return Line::from(Span::styled(
+                        line.to_owned(),
+                        accent().add_modifier(Modifier::BOLD),
+                    ));
+                }
+                if line.len() >= 16 && !line.starts_with(' ') {
+                    let (label, value) = line.split_at(16);
+                    let value_style = if label.trim() == "status" {
+                        value.trim().parse::<LifecycleStatus>().map_or_else(
+                            |_| Style::default(),
+                            |status| Style::default().fg(status_color(status)),
+                        )
+                    } else {
+                        plain()
+                    };
+                    return Line::from(vec![
+                        Span::styled(label.to_owned(), dim()),
+                        Span::styled(value.to_owned(), value_style),
+                    ]);
+                }
+                Line::from(Span::raw(line.to_owned()))
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn render_output(frame: &mut Frame, area: Rect, app: &App) {
@@ -1332,13 +1990,7 @@ fn render_output(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
     let body = match app.output_tab {
         OutputTab::Log => selected_log(app),
-        OutputTab::Activity => {
-            if app.activity.is_empty() {
-                "No activity loaded. Press i on a session.".into()
-            } else {
-                app.activity.clone()
-            }
-        }
+        OutputTab::Activity => selected_activity(app),
         OutputTab::Output => selected_output(app),
         OutputTab::Changes => {
             if app.changes.is_empty() {
@@ -1359,28 +2011,42 @@ fn render_output(frame: &mut Frame, area: Rect, app: &App) {
 
 fn selected_log(app: &App) -> String {
     match app.selected() {
-        Some(ItemRef::Node(run_id, node_id)) => app
-            .state
-            .runs
-            .iter()
-            .find(|run| run.id == run_id)
-            .and_then(|run| run.nodes.iter().find(|node| node.id == node_id))
-            .map(|node| {
-                node.activity
-                    .iter()
-                    .map(|event| {
-                        format!(
-                            "{}  {:<10} {}",
-                            event.at.format("%H:%M:%S"),
-                            event.kind,
-                            event.message
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "No events for this step.".into()),
+        Some(ItemRef::Session(id)) => session_activity(app, &id),
+        Some(ItemRef::Node(run_id, node_id)) => {
+            let Some(node) = app
+                .state
+                .runs
+                .iter()
+                .find(|run| run.id == run_id)
+                .and_then(|run| run.nodes.iter().find(|node| node.id == node_id))
+            else {
+                return String::new();
+            };
+            let local = node
+                .activity
+                .iter()
+                .map(|event| {
+                    format!(
+                        "{}  {:<10} {}",
+                        event.at.format("%H:%M:%S"),
+                        event.kind,
+                        event.message
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let provider = node
+                .session_id
+                .as_deref()
+                .map(|id| session_activity(app, id))
+                .unwrap_or_default();
+            match (local.is_empty(), provider.is_empty()) {
+                (false, false) => format!("{local}\n\n{provider}"),
+                (false, true) => local,
+                (true, false) => provider,
+                (true, true) => "Waiting for this agent to report activity.".into(),
+            }
+        }
         Some(ItemRef::Run(id)) => app
             .state
             .runs
@@ -1410,8 +2076,44 @@ fn selected_log(app: &App) -> String {
                 lines.join("\n")
             })
             .unwrap_or_default(),
-        _ => "Select a run or step.".into(),
+        Some(ItemRef::Provider(name)) => {
+            if app.provider_activity_loading.contains(&name)
+                && !app.provider_activity.contains_key(&name)
+            {
+                "Loading provider activity…".into()
+            } else {
+                app.provider_activity
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_else(|| "Waiting for provider activity…".into())
+            }
+        }
+        _ => "Select an agent, run, or step.".into(),
     }
+}
+
+fn session_activity(app: &App, id: &str) -> String {
+    if app.activity_loading.contains(id) && !app.activity.contains_key(id) {
+        return "Loading live agent activity…".into();
+    }
+    app.activity
+        .get(id)
+        .cloned()
+        .unwrap_or_else(|| "Waiting for the activity provider…".into())
+}
+
+fn selected_activity(app: &App) -> String {
+    if let Some(session) = app.selected_session() {
+        return session_activity(app, &session.id);
+    }
+    if matches!(app.selected(), Some(ItemRef::Provider(_))) {
+        return if app.provider_report.is_empty() {
+            "Press Enter or v to validate this provider.".into()
+        } else {
+            app.provider_report.clone()
+        };
+    }
+    "Select an agent to read its provider activity.".into()
 }
 
 fn selected_output(app: &App) -> String {
@@ -1431,15 +2133,85 @@ fn selected_output(app: &App) -> String {
 
 fn details(app: &App) -> String {
     match app.selected() {
-        Some(ItemRef::Session(id)) => app.state.sessions.iter().find(|session| session.id == id).map(|session| format!("{}\n\nrole             {}\nharness          {}\nmodel            {}\nstatus           {}\npurpose          {}\ngoal             {}\nexpected output  {}\nsuccess          {}\ncompletion       {}\nnative session   {}\norc session      {}\nparent           {}\n\nproviders\n{}",
-            session.title, session.role, session.harness, session.model.as_deref().unwrap_or("default"), session.status, session.purpose, session.goal, session.expected_output,
-            if session.success_criteria.is_empty() { "unspecified".into() } else { session.success_criteria.join("; ") }, session.completion, session.native_id, session.id,
-            session.parent_id.as_deref().unwrap_or("root"), if session.providers.is_empty() { "  none".into() } else { session.providers.iter().map(|binding| format!("  {:<14} {} · {:?} · {}", binding.kind, binding.provider, binding.status, binding.label)).collect::<Vec<_>>().join("\n") })).unwrap_or_default(),
-        Some(ItemRef::Run(id)) => app.state.runs.iter().find(|run| run.id == id).map(|run| format!("{}\n\nstatus           {}\ngoal             {}\nexpected output  {}\nsteps            {}\ndefinition       {}\nrevision         {}\nrun              {}", run.name, run.status, run.goal, run.expected_output, run.nodes.len(), run.definition.as_deref().unwrap_or("dynamic"), run.revision.as_deref().unwrap_or("uncommitted"), run.id)).unwrap_or_default(),
-        Some(ItemRef::Node(run_id, node_id)) => app.state.runs.iter().find(|run| run.id == run_id).and_then(|run| run.nodes.iter().find(|node| node.id == node_id)).map(|node| format!("{}\n\nrole             {}\nharness          {}\nmodel            {}\nstatus           {}\npurpose          {}\ngoal             {}\nexpected output  {}\nsuccess          {}\ncompletion       {}\nreview by        {}\nsession          {}", node.name, node.role, node.harness, node.model.as_deref().unwrap_or("default"), node.status, node.purpose, node.goal, node.expected_output, if node.success_criteria.is_empty() { "unspecified".into() } else { node.success_criteria.join("; ") }, node.completion, node.review_by.as_deref().unwrap_or("orchestrator"), node.session_id.as_deref().unwrap_or("unassigned"))).unwrap_or_default(),
-        Some(ItemRef::Provider(name)) => app.providers.iter().find(|provider| provider.name == name).map(|provider| format!("{}\n\n{}\n\nkind      {}\npriority  {}\ncommand   {}\n\nactions\n{}", provider.name, provider.description, provider.kind, provider.priority, provider.command, provider.actions.iter().map(|(capability, description)| format!("  {:<20} {description}", capability.to_string())).collect::<Vec<_>>().join("\n"))).unwrap_or_default(),
+        Some(ItemRef::Session(id)) => app
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+            .map_or_else(String::new, session_details),
+        Some(ItemRef::Run(id)) => app
+            .state
+            .runs
+            .iter()
+            .find(|run| run.id == id)
+            .map_or_else(String::new, run_details),
+        Some(ItemRef::Node(run_id, node_id)) => app
+            .state
+            .runs
+            .iter()
+            .find(|run| run.id == run_id)
+            .and_then(|run| run.nodes.iter().find(|node| node.id == node_id))
+            .map_or_else(String::new, node_details),
+        Some(ItemRef::Provider(name)) => app
+            .providers
+            .iter()
+            .find(|provider| provider.name == name)
+            .map_or_else(String::new, provider_details),
         None => "Select an item.".into(),
     }
+}
+
+fn detail_templates() -> &'static Environment<'static> {
+    static TEMPLATES: OnceLock<Environment<'static>> = OnceLock::new();
+    TEMPLATES.get_or_init(|| {
+        let mut environment = Environment::new();
+        for (name, source) in [
+            ("session", include_str!("../templates/session.txt")),
+            ("run", include_str!("../templates/run.txt")),
+            ("node", include_str!("../templates/node.txt")),
+            ("provider", include_str!("../templates/provider.txt")),
+        ] {
+            environment
+                .add_template(name, source)
+                .unwrap_or_else(|error| panic!("invalid {name} detail template: {error}"));
+        }
+        environment
+    })
+}
+
+fn render_detail_template(name: &str, context: minijinja::Value) -> String {
+    detail_templates()
+        .get_template(name)
+        .and_then(|template| template.render(context))
+        .unwrap_or_else(|error| format!("Could not render {name} details: {error}"))
+        .trim_end()
+        .into()
+}
+
+fn session_details(session: &Session) -> String {
+    render_detail_template("session", context! { session })
+}
+
+fn run_details(run: &WorkflowRun) -> String {
+    render_detail_template("run", context! { run })
+}
+
+fn node_details(node: &WorkflowNode) -> String {
+    render_detail_template("node", context! { node })
+}
+
+fn provider_details(provider: &Manifest) -> String {
+    let actions = provider
+        .actions
+        .iter()
+        .map(|(capability, description)| {
+            serde_json::json!({
+                "capability": capability.to_string(),
+                "description": description,
+            })
+        })
+        .collect::<Vec<_>>();
+    render_detail_template("provider", context! { provider, actions })
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
@@ -1536,9 +2308,9 @@ const BINDINGS: &[Binding] = &[
     },
     Binding {
         id: "gate",
-        keys: "g",
+        keys: "G",
         short: "gate",
-        description: "answer a selected pending gate or open graph view",
+        description: "answer a pending human gate for the selected run",
     },
     Binding {
         id: "cancel",
@@ -1587,6 +2359,12 @@ const BINDINGS: &[Binding] = &[
         keys: "space i h/j/k/l",
         short: "dock",
         description: "move or hide the inspector",
+    },
+    Binding {
+        id: "mouse",
+        keys: "click/wheel",
+        short: "select/scroll",
+        description: "select panes and rows, choose tabs, pan the graph, or scroll",
     },
     Binding {
         id: "help",
@@ -1643,6 +2421,9 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
             format!("Approve {gate_id} for {run_id} and resume?")
         }
         Confirmation::Cancel { run_id } => format!("Stop {run_id} and discard in-flight work?"),
+        Confirmation::Prune { title, .. } => {
+            format!("Stop and archive agent {title}? This ends its managed process.")
+        }
     };
     let width = area.width.min(72);
     let popup = Rect::new(
@@ -1669,6 +2450,52 @@ fn render_confirmation(frame: &mut Frame, area: Rect, confirmation: &Confirmatio
 
 fn terminal_reply(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char(']')) && key.modifiers.contains(KeyModifiers::ALT)
+}
+
+fn contains(area: Rect, x: u16, y: u16) -> bool {
+    x >= area.x
+        && x < area.x.saturating_add(area.width)
+        && y >= area.y
+        && y < area.y.saturating_add(area.height)
+}
+
+fn visible_row_at(
+    area: Rect,
+    y: u16,
+    selected: usize,
+    len: usize,
+    header_rows: usize,
+) -> Option<usize> {
+    let height = area
+        .height
+        .saturating_sub(2)
+        .saturating_sub(header_rows as u16) as usize;
+    if len == 0 || height == 0 {
+        return None;
+    }
+    let first = selected
+        .saturating_sub(height.saturating_sub(1))
+        .min(len.saturating_sub(height));
+    let top = area.y.saturating_add(1 + header_rows as u16);
+    let row = y.checked_sub(top)? as usize;
+    (row < height && first + row < len).then_some(first + row)
+}
+
+fn output_tab_at(area: Rect, x: u16) -> Option<OutputTab> {
+    let mut start = area.x.saturating_add(1);
+    for (tab, width) in [
+        (OutputTab::Log, 5),
+        (OutputTab::Activity, 10),
+        (OutputTab::Output, 8),
+        (OutputTab::Changes, 9),
+    ] {
+        let end = start.saturating_add(width);
+        if x >= start && x < end {
+            return Some(tab);
+        }
+        start = end;
+    }
+    None
 }
 
 fn truncate(value: &str, width: usize) -> String {
@@ -1706,18 +2533,28 @@ fn status_glyph(status: LifecycleStatus) -> char {
 }
 fn status_color(status: LifecycleStatus) -> Color {
     match status {
-        LifecycleStatus::Working => Color::Indexed(114),
-        LifecycleStatus::Done => Color::Indexed(108),
-        LifecycleStatus::Failed => Color::Indexed(167),
-        LifecycleStatus::Blocked => Color::Indexed(179),
-        _ => Color::Indexed(244),
+        LifecycleStatus::Working | LifecycleStatus::Done => Color::Green,
+        LifecycleStatus::Failed => Color::Red,
+        LifecycleStatus::Blocked => Color::Yellow,
+        _ => Color::DarkGray,
     }
 }
 fn accent() -> Style {
-    Style::default().fg(Color::Indexed(109))
+    Style::default().fg(Color::Cyan)
+}
+fn title() -> Style {
+    Style::default()
+        .fg(Color::Blue)
+        .add_modifier(Modifier::BOLD)
+}
+fn plain() -> Style {
+    Style::default().fg(Color::Gray)
+}
+fn live() -> Style {
+    Style::default().fg(Color::Green)
 }
 fn dim() -> Style {
-    Style::default().fg(Color::Indexed(244))
+    Style::default().fg(Color::DarkGray)
 }
 
 struct TerminalGuard;
@@ -1743,21 +2580,51 @@ pub fn run(config: Config, scope: &Path) -> Result<()> {
     let providers = provider::discover(&config)?;
     let mut app = App::new(config, scope, state, providers);
     let (_guard, mut terminal) = TerminalGuard::enter()?;
+    let (tx, rx): (Sender<BackgroundResult>, Receiver<BackgroundResult>) = mpsc::channel();
+    let mut last_tick = Instant::now();
     loop {
+        while let Ok(result) = rx.try_recv() {
+            app.apply_background(result);
+        }
+        if app.refresh_requested
+            || (!app.refresh_inflight
+                && app.last_refresh.elapsed() >= Duration::from_millis(app.config.ui.refresh_ms))
+        {
+            app.request_refresh(&tx);
+        }
+        app.request_activity(&tx, false);
+        app.request_provider_activity(&tx, false);
+        if app
+            .resize_at
+            .is_some_and(|at| at.elapsed() >= Duration::from_millis(120))
+        {
+            app.flow.request_fit_view();
+            app.resize_at = None;
+        }
         terminal.draw(|frame| render(frame, &mut app))?;
-        if event::poll(Duration::from_millis(50))? {
-            match event::read()? {
-                Event::Key(key) if app.handle_key(key) => break,
-                Event::Mouse(mouse) => app.handle_mouse(mouse),
-                Event::Resize(_, _) => app.flow.request_fit_view(),
-                _ => {}
+        let mut quit = false;
+        if event::poll(Duration::from_millis(16))? {
+            let mut processed = 0;
+            loop {
+                processed += 1;
+                match event::read()? {
+                    Event::Key(key) if app.handle_key(key, &tx) => quit = true,
+                    Event::Mouse(mouse) => app.handle_mouse(mouse),
+                    Event::Resize(_, _) => app.resize_at = Some(Instant::now()),
+                    _ => {}
+                }
+                if quit || processed >= 128 || !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
         }
-        if app.last_refresh.elapsed() >= Duration::from_millis(app.config.ui.refresh_ms) {
-            app.refresh();
+        if quit {
+            break;
         }
-        app.flow.tick_animation(Duration::from_millis(50));
-        let _ = app.flow.tick_auto_pan(Duration::from_millis(50));
+        let elapsed = last_tick.elapsed();
+        last_tick = Instant::now();
+        app.flow.tick_animation(elapsed);
+        let _ = app.flow.tick_auto_pan(elapsed);
     }
     Ok(())
 }
@@ -1765,6 +2632,65 @@ pub fn run(config: Config, scope: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use crossterm::event::KeyEventState;
+    use ratatui::backend::TestBackend;
+
+    fn session(id: &str, parent_id: Option<&str>, harness: &str) -> Session {
+        Session {
+            id: id.into(),
+            native_id: format!("native-{id}"),
+            trace_id: Some(format!("trace-{id}")),
+            harness: harness.into(),
+            model: None,
+            role: if parent_id.is_none() {
+                SessionRole::Orchestrator
+            } else {
+                SessionRole::Researcher
+            },
+            title: id.into(),
+            purpose: format!("Purpose for {id}"),
+            goal: format!("Goal for {id}"),
+            expected_output: "Verified result".into(),
+            success_criteria: vec!["It passes".into()],
+            completion: crate::domain::CompletionTarget::Orchestrator,
+            review_by: None,
+            parent_id: parent_id.map(str::to_owned),
+            run_id: None,
+            node_id: None,
+            provider_ref: None,
+            providers: Vec::new(),
+            directory: "/tmp/orc-test".into(),
+            registration: crate::domain::RegistrationSource::Managed,
+            status: LifecycleStatus::Working,
+            connected_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn app() -> App {
+        let mut state = WorkspaceState::empty("/tmp/orc-test".into());
+        state.sessions = vec![
+            session("root", None, "codex"),
+            session("native-child", Some("root"), "codex"),
+            session("harness-child", Some("root"), "claude"),
+        ];
+        App::new(
+            Config::default(),
+            PathBuf::from("/tmp/orc-test"),
+            state,
+            Vec::new(),
+        )
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
 
     #[test]
     fn help_is_generated_from_bindings() {
@@ -1774,5 +2700,93 @@ mod tests {
                 .iter()
                 .all(|binding| !binding.description.is_empty())
         );
+    }
+
+    #[test]
+    fn keyboard_navigation_is_not_gated_by_refresh() {
+        let mut app = app();
+        app.explorer_view = ExplorerView::Tree;
+        app.refresh_inflight = true;
+        let (tx, _rx) = mpsc::channel();
+        assert!(!app.handle_key(key(KeyCode::Char('j'), KeyModifiers::NONE), &tx));
+        assert_eq!(app.tree_at, 1);
+        assert_eq!(app.focus, Focus::Main);
+    }
+
+    #[test]
+    fn tree_distinguishes_native_and_harness_children() {
+        let app = app();
+        assert_eq!(app.tree.len(), 3);
+        assert_eq!(app.tree[1].depth, 1);
+        assert!(app.tree[1].subtitle.contains("native · researcher"));
+        assert!(app.tree[2].subtitle.contains("harness · researcher"));
+    }
+
+    #[test]
+    fn detail_templates_render_typed_domain_data() {
+        let app = app();
+        let rendered = session_details(&app.state.sessions[0]);
+        assert!(rendered.contains("role            orchestrator"));
+        assert!(rendered.contains("native session  native-root"));
+        assert!(rendered.contains("providers\n  none"));
+    }
+
+    #[test]
+    fn mouse_selects_rows_and_scrolls_each_pane() {
+        let mut app = app();
+        app.explorer_view = ExplorerView::Tree;
+        app.hit.main = Rect::new(0, 2, 80, 10);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 4,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.tree_at, 1);
+
+        app.hit.detail = Rect::new(80, 2, 40, 10);
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 90,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.focus, Focus::Detail);
+        assert_eq!(app.detail_scroll, 3);
+    }
+
+    #[test]
+    fn mouse_selects_output_tabs() {
+        let mut app = app();
+        app.hit.output = Some(Rect::new(0, 20, 120, 12));
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 8,
+            row: 20,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.output_tab, OutputTab::Activity);
+        assert_eq!(app.focus, Focus::Output);
+    }
+
+    #[test]
+    fn layout_survives_wide_and_narrow_resizes() {
+        for (width, height) in [(160, 50), (72, 24), (40, 14)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            let mut app = app();
+            terminal
+                .draw(|frame| render(frame, &mut app))
+                .expect("render after resize");
+            assert!(app.hit.main.width > 0);
+            assert!(app.hit.detail.height > 0);
+        }
+    }
+
+    #[test]
+    fn activity_loading_message_replaces_empty_event_noise() {
+        let mut app = app();
+        app.activity_loading.insert("root".into());
+        assert_eq!(selected_log(&app), "Loading live agent activity…");
     }
 }

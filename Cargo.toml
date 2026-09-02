@@ -1,6 +1,6 @@
 [package]
 name = "orc"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Local control plane for agent harnesses"
@@ -16,6 +16,7 @@ clap_complete = "4.5"
 clap_complete_nushell = "4.5"
 crossterm = "0.29"
 hex = "0.4"
+minijinja = "2.21"
 rataflow = { version = "0.1.0", default-features = false, features = ["crossterm", "sugiyama"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 schemars = { version = "1", features = ["chrono04"] }

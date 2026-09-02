@@ -7,4 +7,6 @@ command: orc-provider-wezterm
 actions:
   session.bind: Detect the current WezTerm pane
   terminal.open: Open a command in a split pane
+requires:
+  commands: [wezterm]
 priority: 100

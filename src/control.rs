@@ -268,6 +268,28 @@ pub fn archive(scope: &Path, id: Option<&str>, native_id: Option<&str>) -> Resul
     })
 }
 
+pub fn prune(config: &Config, scope: &Path, id: &str) -> Result<Session> {
+    let scope = state::resolve_scope(scope)?;
+    let workspace = state::read(&scope)?;
+    let session = selected_session(&workspace, id)?.clone();
+    if session.status.active() {
+        let providers = provider::discover(config)?;
+        let request =
+            provider::action_request(provider::Action::Stop, &scope, Some(&session), "right");
+        let plan = provider::resolve_plan(config, &providers, provider::Action::Stop, request)
+            .context("no provider can stop this active agent")?;
+        let result = provider::run_plan_with_timeout(&plan, &scope, config.provider_timeout())?;
+        if !plan.accepts(result.code) {
+            bail!(
+                "stop provider exited with {}: {}",
+                result.code,
+                result.stderr.trim()
+            );
+        }
+    }
+    archive(&scope, Some(id), None)
+}
+
 pub fn reconcile(config: &Config, scope: &Path) -> Result<WorkspaceState> {
     let scope = state::resolve_scope(scope)?;
     let providers = provider::discover(config)?;

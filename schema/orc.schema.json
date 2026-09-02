@@ -3,7 +3,7 @@
     "CacheConfig": {
       "properties": {
         "providerTtlMs": {
-          "default": 1000,
+          "default": 30000,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -18,7 +18,7 @@
           "type": "string"
         },
         "timeoutMs": {
-          "default": 5000,
+          "default": 15000,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -28,6 +28,12 @@
     },
     "UiConfig": {
       "properties": {
+        "activityRefreshMs": {
+          "default": 10000,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "inspectorPercent": {
           "default": 38,
           "format": "uint16",
@@ -36,7 +42,7 @@
           "type": "integer"
         },
         "refreshMs": {
-          "default": 750,
+          "default": 5000,
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -69,21 +75,22 @@
     "cache": {
       "$ref": "#/$defs/CacheConfig",
       "default": {
-        "providerTtlMs": 1000
+        "providerTtlMs": 30000
       }
     },
     "providers": {
       "$ref": "#/$defs/ProviderConfig",
       "default": {
         "directory": "/Users/roshan/.config/orc/providers",
-        "timeoutMs": 5000
+        "timeoutMs": 15000
       }
     },
     "ui": {
       "$ref": "#/$defs/UiConfig",
       "default": {
+        "activityRefreshMs": 10000,
         "inspectorPercent": 38,
-        "refreshMs": 750
+        "refreshMs": 5000
       }
     },
     "workflows": {

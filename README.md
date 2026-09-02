@@ -166,15 +166,19 @@ activity  session.inspect
 changes   changes.inspect
 launch    session.launch -> session.persist? -> execution.run
 execute   execution.run
+stop      session.stop
 ```
 
 Orc writes one `orc.provider/v1` request to each provider command. A provider
 can return a command plan, a session binding, a description, or an explicit
 decline. An explicit decline lets the next provider handle that capability.
+Command plans may declare `successCodes`; the default is `[0]`. This lets a
+provider preserve command-specific results such as Traces exit status 2.
 
 The final command plan inherits terminal state. Captured output preserves ANSI
-color in the TUI. Reconciliation caches content-addressed binding and
-description responses for the configured TTL. Orc itself does not import Zmx,
+color in the TUI. Reconciliation caches content-addressed description
+responses for the configured TTL. Dynamic bindings are always read again.
+Orc itself does not import Zmx,
 WezTerm, Traces, or Changes.
 
 The optional provider packages live in [`extras/`](extras/README.md). Install
@@ -198,16 +202,17 @@ the canonical workspace directory.
 ```yaml
 # yaml-language-server: $schema=https://raw.githubusercontent.com/roshbhatia/orc/main/schema/orc.schema.json
 cache:
-  providerTtlMs: 1000
+  providerTtlMs: 30000
 providers:
   directory: ~/.config/orc/providers
-  timeoutMs: 5000
+  timeoutMs: 15000
 workflows:
   repository: ~/.local/share/orc/workflows
   autoCommit: true
   maxDepth: 10
 ui:
-  refreshMs: 750
+  refreshMs: 5000
+  activityRefreshMs: 10000
   inspectorPercent: 38
 ```
 
@@ -315,6 +320,7 @@ Commands:
   register
   adopt
   archive
+  prune     Stop an active agent through its provider, then archive it
   current
   list
   update
@@ -388,6 +394,23 @@ Options:
       --hook-input
       --quiet
   -h, --help                   Print help
+```
+
+### `orc session prune`
+
+Stop an active agent through its provider, then archive it
+
+```text
+Stop an active agent through its provider, then archive it
+
+Usage: prune [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+  -h, --help           Print help
 ```
 
 ### `orc session current`

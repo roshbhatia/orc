@@ -1,0 +1,16 @@
+{{ provider.name }}
+{{ provider.description }}
+
+kind            {{ provider.kind }}
+priority        {{ provider.priority }}
+command         {{ provider.command }}
+
+requires
+{% for command in provider.requires.commands %}  command       {{ command }}
+{% endfor %}{% for variable in provider.requires.environment %}  env           {{ variable }}
+{% endfor %}{% for path in provider.requires.paths %}  path          {{ path }}
+{% endfor %}{% if not provider.requires.commands and not provider.requires.environment and not provider.requires.paths %}  none
+{% endif %}
+actions
+{% for action in actions %}  {{ action.capability }}  {{ action.description }}
+{% endfor %}

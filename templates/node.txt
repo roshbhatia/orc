@@ -1,0 +1,13 @@
+{{ node.name }}
+
+role            {{ node.role }}
+harness         {{ node.harness }}
+model           {% if node.model %}{{ node.model }}{% else %}default{% endif %}
+status          {{ node.status }}
+purpose         {{ node.purpose }}
+goal            {{ node.goal }}
+expected output {{ node.expectedOutput }}
+success         {% if node.successCriteria %}{{ node.successCriteria | join("; ") }}{% else %}unspecified{% endif %}
+completion      {{ node.completion }}
+review by       {% if node.reviewBy %}{{ node.reviewBy }}{% else %}orchestrator{% endif %}
+session         {% if node.sessionId %}{{ node.sessionId }}{% else %}unassigned{% endif %}
