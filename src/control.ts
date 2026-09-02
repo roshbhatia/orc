@@ -5,6 +5,7 @@ import {
   agentRoles,
   inferredSessionId,
   type Session,
+  sessionsByRecency,
   type WorkflowNode,
   type WorkflowRun,
   type WorkspaceState,
@@ -71,14 +72,21 @@ const upsertSession = (
       command.id ??
       process.env.ORC_SESSION_ID ??
       inferredSessionId(command.harness, nativeId);
+    const incarnationId = `${id}-${crypto.randomUUID().slice(0, 6)}`;
     let result: Session | undefined;
     yield* resolved.store.update(resolved.scope, (state) => {
       const current = state.sessions.find(
         (session) =>
-          session.id === id ||
-          (session.harness === command.harness &&
-            session.nativeId === nativeId),
+          session.status !== "archived" &&
+          (session.id === id ||
+            (session.harness === command.harness &&
+              session.nativeId === nativeId)),
       );
+      const selectedId =
+        current?.id ??
+        (state.sessions.some((session) => session.id === id)
+          ? incarnationId
+          : id);
       const registration =
         command.tag === "session-register" ? command.source : "connected";
       const session: Session = {
@@ -89,7 +97,7 @@ const upsertSession = (
         goal: command.goal,
         harness: command.harness,
         model: command.model ?? current?.model ?? null,
-        id: current?.id || id,
+        id: selectedId,
         nativeId,
         nodeId:
           command.tag === "session-register" ? (command.nodeId ?? null) : null,
@@ -114,14 +122,7 @@ const upsertSession = (
         active: true,
         sessions: [
           session,
-          ...state.sessions.filter(
-            (candidate) =>
-              candidate.id !== session.id &&
-              !(
-                candidate.harness === session.harness &&
-                candidate.nativeId === nativeId
-              ),
-          ),
+          ...state.sessions.filter((candidate) => candidate.id !== session.id),
         ],
         updatedAt: now,
       };
@@ -147,6 +148,99 @@ export const registerSession = (
   },
 ): Effect.Effect<Session, StateError, StateStoreService> =>
   upsertSession(command, overrides);
+
+export const adoptSession = (
+  command: Extract<Command, { readonly tag: "session-adopt" }>,
+): Effect.Effect<Session, StateError, StateStoreService> =>
+  Effect.gen(function* () {
+    const resolved = yield* resolveScope(command.scope);
+    const now = new Date().toISOString();
+    const nativeId = command.nativeId ?? inferredNativeId();
+    const id = `${inferredSessionId(command.harness, nativeId)}-${crypto
+      .randomUUID()
+      .slice(0, 6)}`;
+    const session: Session = {
+      completion: command.completion,
+      connectedAt: now,
+      directory: resolved.scope,
+      expectedOutput: command.expectedOutput,
+      goal: command.goal,
+      harness: command.harness,
+      id,
+      model: command.model ?? null,
+      nativeId,
+      nodeId: null,
+      parentId: null,
+      providerRef: null,
+      providers: [],
+      purpose: command.purpose,
+      registration: "connected",
+      reviewBy: command.reviewBy ?? null,
+      role: "orchestrator",
+      runId: null,
+      status: "working",
+      successCriteria: command.successCriteria,
+      title: command.title,
+      traceId: nativeId,
+      updatedAt: now,
+    };
+    yield* resolved.store.update(resolved.scope, (state) => ({
+      ...state,
+      active: true,
+      sessions: [
+        session,
+        ...state.sessions.map((candidate) =>
+          candidate.role === "orchestrator" &&
+          candidate.status !== "archived" &&
+          candidate.status !== "done"
+            ? { ...candidate, status: "archived" as const, updatedAt: now }
+            : candidate,
+        ),
+      ],
+      updatedAt: now,
+    }));
+    return yield* reconcileSession(resolved.scope, session.id).pipe(
+      Effect.catch(() => Effect.succeed(session)),
+    );
+  });
+
+export const archiveSession = (
+  scope: string,
+  selector: { readonly id?: string; readonly nativeId?: string },
+): Effect.Effect<Session, StateError, StateStoreService> =>
+  Effect.gen(function* () {
+    const resolved = yield* resolveScope(scope);
+    let result: Session | undefined;
+    yield* resolved.store.update(resolved.scope, (state) => {
+      const selected = sessionsByRecency(state.sessions).find((session) =>
+        selector.id
+          ? session.id === selector.id
+          : selector.nativeId
+            ? session.nativeId === selector.nativeId &&
+              session.status !== "archived"
+            : false,
+      );
+      if (!selected) return state;
+      const now = new Date().toISOString();
+      result = { ...selected, status: "archived", updatedAt: now };
+      const sessions = state.sessions.map((session) =>
+        session.id === selected.id ? (result as Session) : session,
+      );
+      return {
+        ...state,
+        active: activeSessions({ ...state, sessions }).length > 0,
+        sessions,
+        updatedAt: now,
+      };
+    });
+    if (!result)
+      return yield* new StateError({
+        message: selector.id
+          ? `unknown session: ${selector.id}`
+          : `no active session has native id ${selector.nativeId ?? ""}`,
+      });
+    return result;
+  });
 
 export const disconnect = (
   command: Extract<Command, { readonly tag: "disconnect" }>,
@@ -211,6 +305,11 @@ const genericGoal = (session: Session): boolean =>
   session.goal === "Complete the assigned work" ||
   session.goal === `Run ${session.harness}`;
 
+const sameBindings = (
+  left: Session["providers"],
+  right: Session["providers"],
+): boolean => JSON.stringify(left) === JSON.stringify(right);
+
 export const reconcileSession = (
   scope: string,
   id: string,
@@ -226,9 +325,10 @@ export const reconcileSession = (
     let result = session;
     yield* resolved.store.update(resolved.scope, (current) => {
       const now = new Date().toISOString();
+      let changed = false;
       const sessions = current.sessions.map((candidate) => {
         if (candidate.id !== id) return candidate;
-        result = {
+        const next = {
           ...candidate,
           goal:
             genericGoal(candidate) && description.goal
@@ -239,10 +339,20 @@ export const reconcileSession = (
             genericTitle(candidate) && description.title
               ? description.title
               : candidate.title,
-          updatedAt: now,
         };
+        if (
+          next.goal === candidate.goal &&
+          next.title === candidate.title &&
+          sameBindings(next.providers, candidate.providers)
+        ) {
+          result = candidate;
+          return candidate;
+        }
+        changed = true;
+        result = { ...next, updatedAt: now };
         return result;
       });
+      if (!changed) return current;
       return { ...current, sessions, updatedAt: now };
     });
     return result;
@@ -253,8 +363,11 @@ export const reconcileWorkspace = (
 ): Effect.Effect<WorkspaceState, StateError, StateStoreService> =>
   Effect.gen(function* () {
     const state = yield* readWorkspace(scope);
-    yield* Effect.forEach(state.sessions, (session) =>
-      reconcileSession(state.scope, session.id).pipe(Effect.ignore),
+    yield* Effect.forEach(
+      activeSessions(state),
+      (session) =>
+        reconcileSession(state.scope, session.id).pipe(Effect.ignore),
+      { concurrency: 4 },
     );
     return yield* readWorkspace(state.scope);
   });
@@ -476,6 +589,19 @@ export const attach = (
   Effect.gen(function* () {
     const state = yield* readWorkspace(command.scope);
     const session = yield* selectedSession(state, command.id);
+    const persisted = session.providers.some(
+      (provider) =>
+        provider.kind === "persistence" && provider.status === "active",
+    );
+    if (
+      session.registration === "hook" &&
+      session.status === "working" &&
+      !persisted
+    )
+      return yield* new StateError({
+        message:
+          "session is active outside a persistence provider; open Activity, or archive it after the harness exits before resuming",
+      });
     yield* providerOutput({
       action: "attach",
       direction: command.direction,

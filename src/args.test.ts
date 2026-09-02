@@ -81,4 +81,65 @@ describe("parseArgs", () => {
       tag: "inspect",
     });
   });
+
+  test("parses directory-scoped session lifecycle commands", () => {
+    expect(
+      Effect.runSync(
+        parseArgs([
+          "session",
+          "adopt",
+          "--scope",
+          "/workspace",
+          "--harness",
+          "codex",
+          "--title",
+          "Current task",
+        ]),
+      ),
+    ).toMatchObject({
+      harness: "codex",
+      role: "orchestrator",
+      scope: "/workspace",
+      tag: "session-adopt",
+      title: "Current task",
+    });
+    expect(
+      Effect.runSync(
+        parseArgs([
+          "session",
+          "archive",
+          "--scope",
+          "/workspace",
+          "--native-id",
+          "native-session",
+          "--quiet",
+        ]),
+      ),
+    ).toMatchObject({
+      nativeId: "native-session",
+      quiet: true,
+      scope: "/workspace",
+      tag: "session-archive",
+    });
+  });
+
+  test("parses provider validation", () => {
+    expect(
+      Effect.runSync(
+        parseArgs([
+          "provider",
+          "validate",
+          "wezterm",
+          "--scope",
+          "/workspace",
+          "--json",
+        ]),
+      ),
+    ).toEqual({
+      json: true,
+      name: "wezterm",
+      scope: "/workspace",
+      tag: "provider-validate",
+    });
+  });
 });

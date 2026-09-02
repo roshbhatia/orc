@@ -105,6 +105,18 @@ describe("TUI model", () => {
       ["node:plan"],
       ["node:build"],
     ]);
-    expect(moveGraphSelection(levels, "node:plan", "right")).toBe("node:build");
+    expect(moveGraphSelection(levels, "node:plan", "down")).toBe("node:build");
+  });
+
+  test("hides archived sessions until requested", () => {
+    const archived = {
+      ...session("old", "orchestrator"),
+      status: "archived" as const,
+    };
+    const withArchive = { ...state, sessions: [archived, ...state.sessions] };
+    expect(explorerRows(withArchive).map((row) => row.id)).not.toContain("old");
+    expect(explorerRows(withArchive, true).map((row) => row.id)).toContain(
+      "old",
+    );
   });
 });

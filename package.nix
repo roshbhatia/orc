@@ -7,7 +7,7 @@
 }:
 stdenv.mkDerivation {
   pname = "orc";
-  version = "0.5.3";
+  version = "0.6.0";
   src = ./.;
 
   nativeBuildInputs = [
@@ -47,6 +47,9 @@ stdenv.mkDerivation {
       "$out/share/nushell/vendor/autoload" \
       "$out/share/zsh/site-functions"
     cp -R src node_modules package.json tsconfig.json "$out/lib/orc/"
+    mkdir -p "$out/share/orc"
+    cp schema/orc.schema.json "$out/share/orc/config.schema.json"
+    cp schema/provider.schema.json "$out/share/orc/provider.schema.json"
     makeWrapper ${bun}/bin/bun "$out/bin/orc" \
       --add-flags "--preload $out/lib/orc/node_modules/@opentui/solid/scripts/preload.js" \
       --add-flags "$out/lib/orc/src/main.ts"

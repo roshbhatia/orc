@@ -5,7 +5,10 @@ import type {
   WorkflowRun,
   WorkspaceState,
 } from "./domain.ts";
-import type { ProviderInfo } from "./provider.ts";
+import {
+  type ProviderInfo,
+  providerCapabilityDescription,
+} from "./provider.ts";
 
 export type MainTab = "explorer" | "workflow" | "providers";
 export type DetailTab = "details" | "activity" | "changes";
@@ -88,10 +91,16 @@ const nodeRow = (
   };
 };
 
-export const explorerRows = (state: WorkspaceState): ReadonlyArray<ViewRow> => {
+export const explorerRows = (
+  state: WorkspaceState,
+  includeArchived = false,
+): ReadonlyArray<ViewRow> => {
   const rows: ViewRow[] = [];
   const included = new Set<string>();
-  const orchestrators = byRecency(state.sessions).filter(
+  const visibleSessions = byRecency(state.sessions).filter(
+    (session) => includeArchived || session.status !== "archived",
+  );
+  const orchestrators = visibleSessions.filter(
     (session) => session.role === "orchestrator",
   );
   for (const orchestrator of orchestrators) {
@@ -106,7 +115,7 @@ export const explorerRows = (state: WorkspaceState): ReadonlyArray<ViewRow> => {
         if (node.sessionId) included.add(node.sessionId);
       }
     }
-    for (const child of byRecency(state.sessions).filter(
+    for (const child of visibleSessions.filter(
       (session) =>
         session.parentId === orchestrator.id &&
         !session.runId &&
@@ -116,7 +125,7 @@ export const explorerRows = (state: WorkspaceState): ReadonlyArray<ViewRow> => {
       included.add(child.id);
     }
   }
-  for (const session of byRecency(state.sessions)) {
+  for (const session of visibleSessions) {
     if (!included.has(session.id)) rows.push(sessionRow(session));
   }
   for (const run of byRecency(state.runs)) {
@@ -141,11 +150,11 @@ export const providerRows = (
 ): ReadonlyArray<ViewRow> =>
   providers.map((provider) => ({
     depth: 0,
-    goal: provider.capabilities.join(", "),
+    goal: provider.description,
     id: provider.name,
     kind: "provider",
     provider,
-    subtitle: `${provider.kind} · priority ${provider.priority}`,
+    subtitle: `${provider.kind} · ${provider.actions.length} ${provider.actions.length === 1 ? "action" : "actions"} · priority ${provider.priority}`,
     title: provider.name,
   }));
 
@@ -230,11 +239,11 @@ export const moveGraphSelection = (
     0,
     level.findIndex((node) => node.id === current.id),
   );
-  if (direction === "up" || direction === "down") {
-    const delta = direction === "down" ? 1 : -1;
+  if (direction === "left" || direction === "right") {
+    const delta = direction === "right" ? 1 : -1;
     return level[(row + delta + level.length) % level.length]?.id ?? current.id;
   }
-  const delta = direction === "right" ? 1 : -1;
+  const delta = direction === "down" ? 1 : -1;
   const target = levels[current.level + delta];
   return target?.[Math.min(row, target.length - 1)]?.id ?? current.id;
 };
@@ -243,12 +252,19 @@ export const rowDetails = (row: ViewRow | undefined): string => {
   if (!row) return "Select an item.";
   if (row.provider)
     return [
-      row.provider.name,
+      `${row.provider.name} · ${row.provider.kind} provider`,
+      row.provider.description,
       "",
-      `kind          ${row.provider.kind}`,
-      `priority      ${row.provider.priority}`,
-      `capabilities  ${row.provider.capabilities.join(", ")}`,
-      `command       ${row.provider.command}`,
+      "actions",
+      ...row.provider.actions.map(
+        (action) =>
+          `  ${action.capability.padEnd(18)} ${action.description || providerCapabilityDescription(action.capability)}`,
+      ),
+      "",
+      `priority  ${row.provider.priority}`,
+      `command   ${row.provider.command}`,
+      "",
+      `validate  orc provider validate ${row.provider.name}`,
     ].join("\n");
   if (row.node)
     return [

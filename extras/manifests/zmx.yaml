@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/roshbhatia/orc/main/schema/provider.schema.json
+version: orc.provider/v1
+name: zmx
+description: Keep harness processes available when displays close
+kind: persistence
+command: orc-provider-zmx
+actions:
+  session.bind: Detect the current persistent process
+  session.persist: Wrap a harness command in a persistent session
+priority: 100

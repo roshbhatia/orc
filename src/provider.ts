@@ -1,10 +1,12 @@
 import type { Dirent } from "node:fs";
 import { readdir } from "node:fs/promises";
-import { homedir } from "node:os";
 import { extname, isAbsolute, join, sep } from "node:path";
+import { YAML } from "bun";
 import { Effect } from "effect";
 import type { Direction } from "./args.ts";
+import { loadOrcConfig } from "./config.ts";
 import type { ProviderBinding, ProviderKind, Session } from "./domain.ts";
+import { readProviderCache, writeProviderCache } from "./provider-cache.ts";
 import { StateError } from "./state.ts";
 
 export type ProviderAction =
@@ -68,11 +70,30 @@ export interface ProviderResponse {
 }
 
 export interface ProviderInfo {
+  readonly actions: ReadonlyArray<ProviderActionInfo>;
   readonly capabilities: ReadonlyArray<ProviderCapability>;
   readonly command: string;
+  readonly description: string;
   readonly kind: ProviderKind;
   readonly name: string;
   readonly priority: number;
+}
+
+export interface ProviderActionInfo {
+  readonly capability: ProviderCapability;
+  readonly description: string;
+}
+
+export interface ProviderValidationCheck {
+  readonly message: string;
+  readonly name: string;
+  readonly status: "failed" | "ok";
+}
+
+export interface ProviderValidation {
+  readonly checks: ReadonlyArray<ProviderValidationCheck>;
+  readonly provider: ProviderInfo;
+  readonly status: "failed" | "ok";
 }
 
 export interface ResolvedProvider extends ProviderInfo {
@@ -103,6 +124,63 @@ const capabilities = [
   "session.persist",
   "terminal.open",
 ] as const;
+
+export const providerCapabilityDescription = (
+  capability: ProviderCapability,
+): string => {
+  const descriptions: Readonly<Record<ProviderCapability, string>> = {
+    "changes.inspect": "Show workspace changes",
+    "session.attach": "Resume a harness session",
+    "session.bind": "Discover session bindings",
+    "session.describe": "Describe a session",
+    "session.inspect": "Show session activity",
+    "session.launch": "Launch a harness session",
+    "session.persist": "Keep a session process available",
+    "terminal.open": "Open a command for display",
+  };
+  return descriptions[capability];
+};
+
+export const providerManifestSchema = (): Readonly<
+  Record<string, unknown>
+> => ({
+  $schema: "https://json-schema.org/draft/2020-12/schema",
+  additionalProperties: false,
+  anyOf: [{ required: ["actions"] }, { required: ["capabilities"] }],
+  description:
+    "A language-neutral Orc provider manifest. The command reads Orc provider requests from stdin and writes responses to stdout.",
+  properties: {
+    actions: {
+      additionalProperties: false,
+      minProperties: 1,
+      properties: Object.fromEntries(
+        capabilities.map((capability) => [
+          capability,
+          { minLength: 1, type: "string" },
+        ]),
+      ),
+      type: "object",
+    },
+    capabilities: {
+      items: { enum: [...capabilities] },
+      minItems: 1,
+      type: "array",
+      uniqueItems: true,
+    },
+    command: { minLength: 1, type: "string" },
+    description: { minLength: 1, type: "string" },
+    kind: { enum: [...providerKinds] },
+    name: {
+      pattern: "^[a-z0-9][a-z0-9._-]*$",
+      type: "string",
+    },
+    priority: { type: "integer" },
+    version: { const: "orc.provider/v1" },
+  },
+  required: ["version", "name", "kind", "command"],
+  title: "Orc provider manifest",
+  type: "object",
+});
 
 const providerKinds: ReadonlyArray<ProviderKind> = [
   "persistence",
@@ -145,14 +223,7 @@ const isProviderKind = (value: string): value is ProviderKind =>
 
 const providerDirectory = (
   environment: Readonly<Record<string, string | undefined>>,
-): string =>
-  environment.ORC_PROVIDER_DIR ??
-  join(
-    environment.XDG_CONFIG_HOME ??
-      join(environment.HOME ?? homedir(), ".config"),
-    "orc",
-    "providers",
-  );
+): string => loadOrcConfig(environment).providers.directory;
 
 const resolveCommand = (
   command: string,
@@ -186,14 +257,33 @@ const parseManifest = (
   const command = resolveCommand(parsed.command.trim(), environment);
   if (!command)
     throw new Error(`${path}: command ${parsed.command} was not found on PATH`);
-  if (!Array.isArray(parsed.capabilities) || parsed.capabilities.length === 0)
-    throw new Error(`${path}: capabilities must be a non-empty array`);
-  const selected: ProviderCapability[] = [];
-  for (const value of parsed.capabilities) {
+  const declaredActions = record(parsed.actions);
+  const legacyCapabilities = Array.isArray(parsed.capabilities)
+    ? parsed.capabilities
+    : [];
+  if (!declaredActions && legacyCapabilities.length === 0)
+    throw new Error(`${path}: actions must be a non-empty object`);
+  const actions: ProviderActionInfo[] = [];
+  if (declaredActions)
+    for (const [capability, description] of Object.entries(declaredActions)) {
+      if (!isCapability(capability))
+        throw new Error(`${path}: unsupported action ${capability}`);
+      if (typeof description !== "string" || description.trim().length === 0)
+        throw new Error(`${path}: action ${capability} needs a description`);
+      actions.push({ capability, description: description.trim() });
+    }
+  for (const value of legacyCapabilities) {
     if (typeof value !== "string" || !isCapability(value))
       throw new Error(`${path}: unsupported capability ${String(value)}`);
-    if (!selected.includes(value)) selected.push(value);
+    if (!actions.some((action) => action.capability === value))
+      actions.push({
+        capability: value,
+        description: providerCapabilityDescription(value),
+      });
   }
+  if (actions.length === 0)
+    throw new Error(`${path}: actions must be a non-empty object`);
+  const selected = actions.map((action) => action.capability);
   const priority = parsed.priority ?? 0;
   if (typeof priority !== "number" || !Number.isSafeInteger(priority))
     throw new Error(`${path}: priority must be an integer`);
@@ -201,8 +291,14 @@ const parseManifest = (
   if (typeof kind !== "string" || !isProviderKind(kind))
     throw new Error(`${path}: unsupported provider kind ${String(kind)}`);
   return {
+    actions,
     capabilities: selected,
     command,
+    description:
+      typeof parsed.description === "string" &&
+      parsed.description.trim().length > 0
+        ? parsed.description.trim()
+        : `${parsed.name} provider`,
     kind,
     name: parsed.name,
     priority,
@@ -227,14 +323,20 @@ const discoverProviders = (
       for (const entry of entries.sort((left, right) =>
         left.name.localeCompare(right.name),
       )) {
+        const extension = extname(entry.name);
         if (
           (!entry.isFile() && !entry.isSymbolicLink()) ||
-          extname(entry.name) !== ".json"
+          ![".json", ".yaml", ".yml"].includes(extension)
         )
           continue;
         const path = join(directory, entry.name);
+        const source = await Bun.file(path).text();
         manifests.push(
-          parseManifest(await Bun.file(path).json(), path, environment),
+          parseManifest(
+            extension === ".json" ? JSON.parse(source) : YAML.parse(source),
+            path,
+            environment,
+          ),
         );
       }
       return manifests;
@@ -307,10 +409,135 @@ export const resolveProviderChain = (
 
 const timeoutOf = (
   environment: Readonly<Record<string, string | undefined>>,
-): number => {
-  const parsed = Number(environment.ORC_PROVIDER_TIMEOUT_MS ?? "5000");
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 5000;
+): number => loadOrcConfig(environment).providers.timeoutMs;
+
+const providerInfo = (provider: ProviderManifest): ProviderInfo => {
+  const { version: _version, ...info } = provider;
+  return info;
 };
+
+const validationResponse = (
+  provider: ProviderManifest,
+  value: unknown,
+): ProviderValidation => {
+  const parsed = record(value);
+  const rawChecks = Array.isArray(parsed?.checks) ? parsed.checks : [];
+  const checks: ProviderValidationCheck[] = [
+    {
+      message: "manifest and executable are valid",
+      name: "manifest",
+      status: "ok",
+    },
+  ];
+  for (const value of rawChecks) {
+    const check = record(value);
+    if (
+      typeof check?.name !== "string" ||
+      typeof check.message !== "string" ||
+      (check.status !== "ok" && check.status !== "failed")
+    )
+      throw new Error(`${provider.name}: validation check is invalid`);
+    checks.push({
+      message: check.message,
+      name: check.name,
+      status: check.status,
+    });
+  }
+  if (
+    parsed?.version !== "orc.provider/v1" ||
+    (parsed.status !== "ok" && parsed.status !== "failed")
+  )
+    throw new Error(`${provider.name}: validation response is invalid`);
+  return {
+    checks,
+    provider: providerInfo(provider),
+    status:
+      parsed.status === "ok" && checks.every((check) => check.status === "ok")
+        ? "ok"
+        : "failed",
+  };
+};
+
+const validateOne = (
+  provider: ProviderManifest,
+  scope: string,
+  environment: Readonly<Record<string, string | undefined>>,
+): Effect.Effect<ProviderValidation> =>
+  Effect.tryPromise({
+    try: async () => {
+      const child = Bun.spawn([provider.command], {
+        cwd: scope,
+        env: environment,
+        stderr: "pipe",
+        stdin: "pipe",
+        stdout: "pipe",
+      });
+      child.stdin.write(
+        JSON.stringify({
+          action: "validate",
+          capability: "provider.validate",
+          manifest: {
+            actions: provider.actions,
+            kind: provider.kind,
+            name: provider.name,
+          },
+          scope,
+          version: "orc.provider/v1",
+        }),
+      );
+      child.stdin.end();
+      const outcome = Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+        child.exited,
+      ]);
+      const [stdout, stderr, code] = await Promise.race([
+        outcome,
+        Bun.sleep(timeoutOf(environment)).then(() => {
+          child.kill();
+          throw new Error(`${provider.name} validation timed out`);
+        }),
+      ]);
+      if (code !== 0)
+        throw new Error(
+          stderr.trim() ||
+            `${provider.name} validation exited with code ${code}`,
+        );
+      return validationResponse(provider, JSON.parse(stdout) as unknown);
+    },
+    catch: (cause) => cause,
+  }).pipe(
+    Effect.catch((cause) =>
+      Effect.succeed({
+        checks: [
+          {
+            message: cause instanceof Error ? cause.message : String(cause),
+            name: "provider",
+            status: "failed" as const,
+          },
+        ],
+        provider: providerInfo(provider),
+        status: "failed" as const,
+      }),
+    ),
+  );
+
+export const validateProviders = (
+  scope: string,
+  name?: string,
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+): Effect.Effect<ReadonlyArray<ProviderValidation>, StateError> =>
+  Effect.gen(function* () {
+    const providers = yield* discoverProviders(environment);
+    const selected = name
+      ? providers.filter((provider) => provider.name === name)
+      : providers;
+    if (name && selected.length === 0)
+      return yield* new StateError({ message: `unknown provider: ${name}` });
+    return yield* Effect.forEach(selected, (provider) =>
+      validateOne(provider, scope, environment),
+    );
+  });
 
 const runProvider = (
   provider: ResolvedProvider,
@@ -605,16 +832,25 @@ export const providerOutput = (
   request: ProviderRequest,
   environment: Readonly<Record<string, string | undefined>> = process.env,
 ): Effect.Effect<string, StateError> =>
-  invokeProvider(request, environment).pipe(
-    Effect.flatMap((response) =>
-      response.code === 0
-        ? Effect.succeed(response.stdout.trimEnd())
-        : Effect.fail(
-            new StateError({
-              message:
-                response.stderr.trim() ||
-                `provider action ${request.action} exited with code ${response.code}`,
-            }),
-          ),
-    ),
-  );
+  Effect.gen(function* () {
+    const cached = yield* Effect.tryPromise({
+      try: () => readProviderCache(request, environment),
+      catch: (cause) =>
+        new StateError({ message: "read provider output cache", cause }),
+    });
+    if (cached !== null) return cached;
+    const response = yield* invokeProvider(request, environment);
+    if (response.code !== 0)
+      return yield* new StateError({
+        message:
+          response.stderr.trim() ||
+          `provider action ${request.action} exited with code ${response.code}`,
+      });
+    const output = response.stdout.trimEnd();
+    yield* Effect.tryPromise({
+      try: () => writeProviderCache(request, environment, output),
+      catch: (cause) =>
+        new StateError({ message: "write provider output cache", cause }),
+    });
+    return output;
+  });

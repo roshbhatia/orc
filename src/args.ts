@@ -35,6 +35,12 @@ export type Command =
       readonly scope: string;
       readonly json: boolean;
     }
+  | {
+      readonly tag: "provider-validate";
+      readonly scope: string;
+      readonly json: boolean;
+      readonly name: string | undefined;
+    }
   | ({
       readonly tag: "connect";
       readonly scope: string;
@@ -71,6 +77,19 @@ export type Command =
       readonly scope: string;
       readonly id: string;
       readonly status: LifecycleStatus;
+    }
+  | ({
+      readonly tag: "session-adopt";
+      readonly scope: string;
+      readonly nativeId: string | undefined;
+    } & ContractOptions)
+  | {
+      readonly tag: "session-archive";
+      readonly scope: string;
+      readonly id: string | undefined;
+      readonly nativeId: string | undefined;
+      readonly hookInput: boolean;
+      readonly quiet: boolean;
     }
   | {
       readonly tag: "run-create";
@@ -172,6 +191,7 @@ const statuses: ReadonlyArray<LifecycleStatus> = [
   "done",
   "cancelled",
   "disconnected",
+  "archived",
 ];
 
 const defaultScope = (): string => process.env.ORC_SCOPE ?? process.cwd();
@@ -351,6 +371,38 @@ const parseSession = (
         tag: "session-update",
       };
     }
+    if (subcommand === "adopt") {
+      const options = yield* parseOptions(
+        args,
+        new Set([...contractOptions, "--native-id"]),
+      );
+      return {
+        ...(yield* parseContract(options)),
+        nativeId: one(options, "--native-id"),
+        role: "orchestrator",
+        scope: options.scope,
+        tag: "session-adopt",
+      };
+    }
+    if (subcommand === "archive") {
+      const options = yield* parseOptions(
+        args,
+        new Set(["--native-id"]),
+        new Set(["--hook-input", "--quiet"]),
+      );
+      if (options.positionals.length > 1)
+        return yield* new ArgumentError({
+          message: "session archive accepts one session id",
+        });
+      return {
+        hookInput: options.flags.has("--hook-input"),
+        id: options.positionals[0],
+        nativeId: one(options, "--native-id"),
+        quiet: options.flags.has("--quiet"),
+        scope: options.scope,
+        tag: "session-archive",
+      };
+    }
     if (subcommand !== "register") {
       return yield* new ArgumentError({
         message: `unknown session command: ${subcommand ?? ""}`,
@@ -390,6 +442,37 @@ const parseSession = (
       tag: "session-register",
       providerRef: one(options, "--provider-ref"),
     };
+  });
+
+const parseProvider = (
+  rest: ReadonlyArray<string>,
+): Effect.Effect<Command, ArgumentError> =>
+  Effect.gen(function* () {
+    const [subcommand, ...args] = rest;
+    if (subcommand === "list") {
+      const options = yield* parseOptions(args, new Set());
+      return {
+        json: options.json,
+        scope: options.scope,
+        tag: "provider-list",
+      };
+    }
+    if (subcommand === "validate") {
+      const options = yield* parseOptions(args, new Set());
+      if (options.positionals.length > 1)
+        return yield* new ArgumentError({
+          message: "provider validate accepts one provider name",
+        });
+      return {
+        json: options.json,
+        name: options.positionals[0],
+        scope: options.scope,
+        tag: "provider-validate",
+      };
+    }
+    return yield* new ArgumentError({
+      message: `unknown provider command: ${subcommand ?? ""}`,
+    });
   });
 
 const parseRun = (
@@ -570,6 +653,7 @@ export const parseArgs = (
       return { shell, tag: "completion" };
     }
     if (name === "mcp") return { tag: "mcp" };
+    if (name === "provider") return yield* parseProvider(rest);
     if (name === "providers") {
       const options = yield* parseOptions(rest, new Set());
       return {

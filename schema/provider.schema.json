@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "anyOf": [
+    {
+      "required": ["actions"]
+    },
+    {
+      "required": ["capabilities"]
+    }
+  ],
+  "description": "A language-neutral Orc provider manifest. The command reads Orc provider requests from stdin and writes responses to stdout.",
+  "properties": {
+    "actions": {
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "changes.inspect": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "session.attach": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "session.bind": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "session.describe": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "session.inspect": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "session.launch": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "session.persist": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "terminal.open": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "capabilities": {
+      "items": {
+        "enum": [
+          "changes.inspect",
+          "session.attach",
+          "session.bind",
+          "session.describe",
+          "session.inspect",
+          "session.launch",
+          "session.persist",
+          "terminal.open"
+        ]
+      },
+      "minItems": 1,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "command": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "description": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "kind": {
+      "enum": [
+        "persistence",
+        "display",
+        "activity",
+        "changes",
+        "harness",
+        "integration"
+      ]
+    },
+    "name": {
+      "pattern": "^[a-z0-9][a-z0-9._-]*$",
+      "type": "string"
+    },
+    "priority": {
+      "type": "integer"
+    },
+    "version": {
+      "const": "orc.provider/v1"
+    }
+  },
+  "required": ["version", "name", "kind", "command"],
+  "title": "Orc provider manifest",
+  "type": "object"
+}

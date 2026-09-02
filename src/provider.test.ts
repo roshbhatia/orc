@@ -20,6 +20,7 @@ import {
   providerOutput,
   resolveCommandPlan,
   resolveProviderChain,
+  validateProviders,
 } from "./provider.ts";
 
 const changesRequest = (scope: string) => ({
@@ -62,6 +63,7 @@ const writeProvider = async (
   options: {
     readonly capabilities: ReadonlyArray<ProviderCapability>;
     readonly capture?: string;
+    readonly counter?: string;
     readonly name: string;
     readonly plan: CommandPlan;
     readonly priority?: number;
@@ -78,6 +80,7 @@ const writeProviderResponse = async (
   options: {
     readonly capabilities: ReadonlyArray<ProviderCapability>;
     readonly capture?: string;
+    readonly counter?: string;
     readonly kind?: string;
     readonly name: string;
     readonly priority?: number;
@@ -88,9 +91,12 @@ const writeProviderResponse = async (
   const capture = options.capture
     ? `request=$(cat)\nprintf %s "$request" > ${shellQuote(options.capture)}\n`
     : "cat >/dev/null\n";
+  const counter = options.counter
+    ? `count=0\nif [ -f ${shellQuote(options.counter)} ]; then count=$(cat ${shellQuote(options.counter)}); fi\ncount=$((count + 1))\nprintf %s "$count" > ${shellQuote(options.counter)}\n`
+    : "";
   await writeFile(
     executable,
-    `#!/bin/sh\nset -eu\n${capture}printf %s ${shellQuote(JSON.stringify(options.response))}\n`,
+    `#!/bin/sh\nset -eu\n${capture}${counter}printf %s ${shellQuote(JSON.stringify(options.response))}\n`,
     { mode: 0o700 },
   );
   await writeFile(
@@ -140,6 +146,53 @@ describe("provider", () => {
     }
   });
 
+  test("discovers readable actions from a YAML manifest", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "orc-provider-yaml-"));
+    const printf = Bun.which("printf");
+    if (!printf) throw new Error("test requires printf on PATH");
+    const executable = await writeProvider(directory, {
+      capabilities: ["changes.inspect"],
+      name: "readable",
+      plan: {
+        command: [printf, "provider output"],
+        version: "orc.provider/v1",
+      },
+    });
+    await rm(join(directory, "readable.json"));
+    await writeFile(
+      join(directory, "readable.yaml"),
+      [
+        "version: orc.provider/v1",
+        "name: readable",
+        "description: Show structured repository changes",
+        "kind: changes",
+        `command: ${JSON.stringify(executable)}`,
+        "actions:",
+        "  changes.inspect: Render one workspace diff",
+        "priority: 10",
+        "",
+      ].join("\n"),
+    );
+    try {
+      expect(
+        await Effect.runPromise(listProviders(testEnvironment(directory))),
+      ).toMatchObject([
+        {
+          actions: [
+            {
+              capability: "changes.inspect",
+              description: "Render one workspace diff",
+            },
+          ],
+          description: "Show structured repository changes",
+          name: "readable",
+        },
+      ]);
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
   test("discovers one capability provider and executes its command plan", async () => {
     const directory = await mkdtemp(join(tmpdir(), "orc-provider-test-"));
     const capture = join(directory, "request.json");
@@ -172,6 +225,79 @@ describe("provider", () => {
         plan: null,
         version: "orc.provider/v1",
       });
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  test("caches successful captured provider output", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "orc-provider-cache-"));
+    const counter = join(directory, "count");
+    const printf = Bun.which("printf");
+    if (!printf) throw new Error("test requires printf on PATH");
+    await writeProvider(directory, {
+      capabilities: ["changes.inspect"],
+      counter,
+      name: "cached",
+      plan: {
+        command: [printf, "cached output"],
+        version: "orc.provider/v1",
+      },
+    });
+    const environment = {
+      ...testEnvironment(directory),
+      ORC_CACHE_PROVIDER_TTL_MS: "60000",
+      XDG_CACHE_HOME: join(directory, "cache"),
+    };
+    try {
+      expect(
+        await Effect.runPromise(
+          providerOutput(changesRequest(directory), environment),
+        ),
+      ).toBe("cached output");
+      expect(
+        await Effect.runPromise(
+          providerOutput(changesRequest(directory), environment),
+        ),
+      ).toBe("cached output");
+      expect(await readFile(counter, "utf8")).toBe("1");
+    } finally {
+      await rm(directory, { force: true, recursive: true });
+    }
+  });
+
+  test("validates a provider in isolation", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "orc-provider-validate-"));
+    await writeProviderResponse(directory, {
+      capabilities: ["changes.inspect"],
+      name: "validated",
+      response: {
+        checks: [
+          {
+            message: "dependency is available",
+            name: "dependency",
+            status: "ok",
+          },
+        ],
+        status: "ok",
+        version: "orc.provider/v1",
+      },
+    });
+    try {
+      expect(
+        await Effect.runPromise(
+          validateProviders(directory, "validated", testEnvironment(directory)),
+        ),
+      ).toMatchObject([
+        {
+          checks: [
+            { name: "manifest", status: "ok" },
+            { name: "dependency", status: "ok" },
+          ],
+          provider: { name: "validated" },
+          status: "ok",
+        },
+      ]);
     } finally {
       await rm(directory, { force: true, recursive: true });
     }

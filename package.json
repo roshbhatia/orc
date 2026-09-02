@@ -1,6 +1,6 @@
 {
   "name": "@roshbhatia/orc",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "packageManager": "bun@1.3.14",
   "type": "module",
   "module": "src/main.ts",
@@ -9,16 +9,18 @@
   },
   "scripts": {
     "build": "bun build src/main.ts --outdir dist --target bun --format esm --packages external",
-    "check": "bun run format:check && bun run typecheck && bun test --path-ignore-patterns 'result/**'",
+    "check": "bun run format:check && bun run typecheck && bun test --path-ignore-patterns 'result/**' && bun run generate:check",
     "format": "biome check --write .",
     "format:check": "biome check .",
+    "generate": "bun --preload ./node_modules/@opentui/solid/scripts/preload.js hack/generate.ts",
+    "generate:check": "bun --preload ./node_modules/@opentui/solid/scripts/preload.js hack/generate.ts --check",
     "nix:lock": "$BUN2NIX_NATIVE -o bun.nix",
     "typecheck": "tsgo --noEmit"
   },
   "dependencies": {
     "@opentui/core": "0.5.9",
     "@opentui/solid": "0.5.9",
-    "@roshbhatia/ts-utils": "https://github.com/roshbhatia/ts-utils/archive/refs/tags/v0.4.0.tar.gz",
+    "@roshbhatia/ts-utils": "https://github.com/roshbhatia/ts-utils/archive/refs/tags/v0.5.0.tar.gz",
     "effect": "4.0.0-beta.83",
     "solid-js": "1.9.12"
   },

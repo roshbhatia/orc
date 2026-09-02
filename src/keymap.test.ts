@@ -4,6 +4,7 @@ import { fullKeyHelp, keyHelp, tuiActionFor } from "./keymap.ts";
 describe("keymap", () => {
   test("uses one binding source for input and help", () => {
     expect(tuiActionFor({ name: "j" })).toBe("next");
+    expect(tuiActionFor({ name: "v" })).toBe("validate-provider");
     expect(keyHelp(["next"])).toBe("j/down next");
     expect(fullKeyHelp()).toContain("j/down       next");
   });

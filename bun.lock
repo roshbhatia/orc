@@ -7,7 +7,7 @@
       "dependencies": {
         "@opentui/core": "0.5.9",
         "@opentui/solid": "0.5.9",
-        "@roshbhatia/ts-utils": "https://github.com/roshbhatia/ts-utils/archive/refs/tags/v0.4.0.tar.gz",
+        "@roshbhatia/ts-utils": "https://github.com/roshbhatia/ts-utils/archive/refs/tags/v0.5.0.tar.gz",
         "effect": "4.0.0-beta.83",
         "solid-js": "1.9.12",
       },
@@ -119,7 +119,7 @@
 
     "@opentui/solid": ["@opentui/solid@0.5.9", "", { "dependencies": { "@babel/core": "7.28.0", "@babel/preset-typescript": "7.27.1", "@opentui/core": "0.5.9", "babel-plugin-module-resolver": "5.0.2", "babel-preset-solid": "1.9.12", "entities": "7.0.1", "s-js": "^0.4.9" }, "peerDependencies": { "solid-js": "1.9.12" } }, "sha512-zGSP/ia9ww+TTMvQMZjJW2+h7fg9YkVRIM723EgvP+v7ZBZ/0vMzPNh7FJ0jET3ysw0h5hsbvcYISs4sUcf+UA=="],
 
-    "@roshbhatia/ts-utils": ["@roshbhatia/ts-utils@https://github.com/roshbhatia/ts-utils/archive/refs/tags/v0.4.0.tar.gz", { "dependencies": { "effect": "4.0.0-beta.83" } }, "sha512-nwEDTP876xXL1niJtmKga2W8mmm8fDW7kprmk7H7fROb1A4llq67rZFxhCrJ17Zq9R9+E8RFSZSHdSzicKUyWA=="],
+    "@roshbhatia/ts-utils": ["@roshbhatia/ts-utils@https://github.com/roshbhatia/ts-utils/archive/refs/tags/v0.5.0.tar.gz", { "dependencies": { "effect": "4.0.0-beta.83" } }, "sha512-kCBtdZnc/hMMS6OMF9+DPmW9HtL5qml/JrP1HLKHmT4iDPdn76we5tQcbGTNtnALX1VtCiGti2CQv5BCUxQvUg=="],
 
     "@standard-schema/spec": ["@standard-schema/spec@1.1.0", "", {}, "sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w=="],
 

@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/roshbhatia/orc/main/schema/provider.schema.json
+version: orc.provider/v1
+name: wezterm
+description: Open provider command plans in a WezTerm pane
+kind: display
+command: orc-provider-wezterm
+actions:
+  session.bind: Detect the current WezTerm pane
+  terminal.open: Open a command in a split pane
+priority: 100

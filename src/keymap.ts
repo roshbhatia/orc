@@ -24,6 +24,8 @@ export type TuiAction =
   | "page-up"
   | "page-down"
   | "refresh"
+  | "validate-provider"
+  | "toggle-archived"
   | "help"
   | "quit";
 
@@ -135,6 +137,18 @@ export const keyBindings: ReadonlyArray<KeyBinding<TuiAction>> = [
     description: "refresh",
     help: "r",
     keys: [{ name: "r" }],
+  },
+  {
+    action: "validate-provider",
+    description: "validate provider",
+    help: "v",
+    keys: [{ name: "v" }],
+  },
+  {
+    action: "toggle-archived",
+    description: "show archived sessions",
+    help: ".",
+    keys: [{ name: "." }],
   },
   { action: "help", description: "help", help: "?", keys: [{ name: "?" }] },
   {

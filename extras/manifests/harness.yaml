@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/roshbhatia/orc/main/schema/provider.schema.json
+version: orc.provider/v1
+name: harness
+description: Resume sessions through the registered agent harness
+kind: harness
+command: orc-provider-harness
+actions:
+  session.bind: Detect whether the harness session is active
+  session.attach: Build the native harness resume command
+priority: 100

@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/roshbhatia/orc/main/schema/provider.schema.json
+version: orc.provider/v1
+name: traces
+description: Read agent titles, goals, messages, and tool activity
+kind: activity
+command: orc-provider-traces
+actions:
+  session.bind: Link a session to its trace identity
+  session.describe: Read the session title and goal
+  session.inspect: Show session activity
+priority: 100

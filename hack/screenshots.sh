@@ -38,6 +38,7 @@ run=$(
     --orchestrator "$orchestrator" \
     --harness codex
 )
+export ORC_SCREENSHOT_RUN=$run
 
 "$ORC_SCREENSHOT_BIN" node upsert research \
   --scope "$ORC_SCREENSHOT_SCOPE" \
@@ -49,7 +50,7 @@ run=$(
   --goal "List every call site and its owner" \
   --expected-output "A verified dependency map" \
   --success "Every renderer import is classified" \
-  --status "done" >/dev/null
+  --status "done" > /dev/null
 
 "$ORC_SCREENSHOT_BIN" node upsert implement \
   --scope "$ORC_SCREENSHOT_SCOPE" \
@@ -62,7 +63,7 @@ run=$(
   --expected-output "Passing tests and typed providers" \
   --success "All direct imports are removed" \
   --depends-on research \
-  --status working >/dev/null
+  --status working > /dev/null
 
 "$ORC_SCREENSHOT_BIN" node upsert review \
   --scope "$ORC_SCREENSHOT_SCOPE" \
@@ -75,7 +76,8 @@ run=$(
   --expected-output "Findings or approval evidence" \
   --success "No renderer coupling remains" \
   --depends-on implement \
-  --status queued >/dev/null
+  --status queued > /dev/null
 
 vhs hack/orc.tape --output "$repo_dir/docs/orc.gif"
 ffmpeg -y -loglevel error -sseof -1 -i "$repo_dir/docs/orc.gif" -frames:v 1 -update 1 "$repo_dir/docs/orc.png"
+vhs hack/orc-noninteractive.tape --output "$repo_dir/docs/orc-noninteractive.gif"

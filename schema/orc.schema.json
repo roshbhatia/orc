@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "cache": {
+      "type": "object",
+      "properties": {
+        "providerTtlMs": {
+          "type": "integer"
+        }
+      },
+      "required": ["providerTtlMs"],
+      "additionalProperties": false
+    },
+    "providers": {
+      "type": "object",
+      "properties": {
+        "directory": {
+          "type": "string"
+        },
+        "timeoutMs": {
+          "type": "integer"
+        }
+      },
+      "required": ["directory", "timeoutMs"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["cache", "providers"],
+  "additionalProperties": false,
+  "title": "Orc configuration"
+}

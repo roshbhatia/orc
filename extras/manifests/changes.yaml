@@ -1,0 +1,9 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/roshbhatia/orc/main/schema/provider.schema.json
+version: orc.provider/v1
+name: changes
+description: Render structured workspace changes
+kind: changes
+command: orc-provider-changes
+actions:
+  changes.inspect: Show repository changes for the workspace
+priority: 100

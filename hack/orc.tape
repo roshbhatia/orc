@@ -15,5 +15,21 @@ Wait+Screen /Explorer/
 Sleep 1s
 Tab
 Wait+Screen /Workflow/
-Sleep 2s
+Sleep 500ms
+Type "j"
+Sleep 250ms
+Type "j"
+Sleep 250ms
+Type "k"
+Sleep 250ms
+Type "t"
+Sleep 500ms
+Type "g"
+Sleep 500ms
+Ctrl+L
+Sleep 250ms
+Type "j"
+Sleep 250ms
+Ctrl+H
+Sleep 1s
 Type "q"

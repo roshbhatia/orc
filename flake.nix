@@ -47,9 +47,31 @@
         }
       );
 
-      packages = eachSystem (system: {
-        default = pkgsFor.${system}.callPackage ./package.nix { };
-      });
+      packages = eachSystem (
+        system:
+        let
+          pkgs = pkgsFor.${system};
+          core = pkgs.callPackage ./package.nix { };
+          providers = pkgs.callPackage ./extras { };
+        in
+        {
+          default = core;
+          inherit core;
+          extras = providers.all;
+          full = pkgs.symlinkJoin {
+            name = "orc-full";
+            paths = [
+              core
+              providers.all
+            ];
+          };
+          provider-changes = providers.changes;
+          provider-harness = providers.harness;
+          provider-traces = providers.traces;
+          provider-wezterm = providers.wezterm;
+          provider-zmx = providers.zmx;
+        }
+      );
 
       apps = eachSystem (system: {
         default = {
@@ -59,7 +81,8 @@
       });
 
       checks = eachSystem (system: {
-        default = pkgsFor.${system}.callPackage ./package.nix { };
+        default = inputs.self.packages.${system}.default;
+        providers = inputs.self.packages.${system}.extras;
       });
 
       devShells = eachSystem (system: {

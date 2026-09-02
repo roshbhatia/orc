@@ -28,7 +28,7 @@ import type {
   WorkspaceState,
 } from "./domain.ts";
 import { fullKeyHelp, keyHelp, tuiActionFor } from "./keymap.ts";
-import type { ProviderInfo } from "./provider.ts";
+import type { ProviderInfo, ProviderValidation } from "./provider.ts";
 import { queryFilteredStdout } from "./terminal-output.ts";
 import {
   type DetailTab,
@@ -87,6 +87,7 @@ export interface TuiActions {
   readonly changes: () => Promise<string>;
   readonly providers: ReadonlyArray<ProviderInfo>;
   readonly read: () => Promise<WorkspaceState>;
+  readonly validateProvider: (name: string) => Promise<ProviderValidation>;
 }
 
 interface AppProps {
@@ -99,41 +100,97 @@ interface GraphProps {
   readonly frame: number;
   readonly levels: ReadonlyArray<ReadonlyArray<GraphNode>>;
   readonly palette: Palette;
+  readonly run: WorkflowRun | undefined;
   readonly selected: string | undefined;
   readonly setScroll: (value: ScrollBoxRenderable) => void;
 }
 
+const graphConnector = (
+  run: WorkflowRun | undefined,
+  level: ReadonlyArray<GraphNode>,
+): string => {
+  if (!run) return "";
+  const targetIds = new Set(
+    level.flatMap((node) => (node.node ? [node.node.id] : [])),
+  );
+  return run.edges
+    .filter((edge) => targetIds.has(edge.to))
+    .map((edge) => {
+      const target = run.nodes.find((node) => node.id === edge.to);
+      const feedback =
+        target?.role === "critic" ||
+        target?.role === "judge" ||
+        target?.role === "verifier";
+      return `${edge.from} ${feedback ? "↔" : "→"} ${edge.to}`;
+    })
+    .join("   ");
+};
+
+const graphReturnSummary = (run: WorkflowRun | undefined): string => {
+  if (!run) return "";
+  const implementers = run.nodes
+    .filter((node) => node.role === "implementer")
+    .map((node) => node.id);
+  const reviewers = run.nodes
+    .filter(
+      (node) =>
+        node.role === "critic" ||
+        node.role === "judge" ||
+        node.role === "verifier",
+    )
+    .map((node) => node.id);
+  if (implementers.length > 0 && reviewers.length > 0)
+    return `${reviewers.join(", ")} ↩ ${implementers.join(", ")}   ${implementers.join(", ")} ↑ orchestrator`;
+  const terminal = run.nodes.filter(
+    (node) => !run.edges.some((edge) => edge.from === node.id),
+  );
+  return `${terminal.map((node) => node.id).join(", ")} ↑ orchestrator`;
+};
+
 const Graph = (props: GraphProps) => (
   <scrollbox ref={props.setScroll} scrollX scrollY style={{ flexGrow: 1 }}>
-    <box flexDirection="row" gap={2} padding={1}>
+    <box flexDirection="column" gap={0} padding={1}>
       <For each={props.levels}>
         {(level, index) => (
-          <box flexDirection="column" gap={1} width={36}>
-            <text fg={props.palette.muted}>{`stage ${index()}`}</text>
-            <For each={level}>
-              {(node) => (
-                <box
-                  border
-                  borderColor={
-                    node.id === props.selected
-                      ? props.palette.accent
-                      : props.palette.border
-                  }
-                  height={6}
-                  id={node.id}
-                  paddingX={1}
-                  title={truncate(node.title, 28)}
-                >
-                  <text fg={statusColor(node.status, props.palette)}>
-                    {`${statusMark(node.status, props.frame)} ${truncate(node.subtitle, 30)}\n`}
-                    {truncate(node.goal, 62)}
-                  </text>
-                </box>
-              )}
-            </For>
+          <box flexDirection="column" flexShrink={0} gap={0} height={6}>
+            <text fg={props.palette.muted}>
+              {index() === 0
+                ? "orchestrator"
+                : `level ${index()}   ${
+                    index() === 1
+                      ? "↓ delegates   ↑ reports"
+                      : graphConnector(props.run, level) ||
+                        "↓ dependency flow   ↑ feedback"
+                  }`}
+            </text>
+            <box flexDirection="row" gap={2} justifyContent="center">
+              <For each={level}>
+                {(node) => (
+                  <box
+                    border
+                    borderColor={
+                      node.id === props.selected
+                        ? props.palette.accent
+                        : props.palette.border
+                    }
+                    height={5}
+                    id={node.id}
+                    paddingX={1}
+                    width={38}
+                  >
+                    <text fg={statusColor(node.status, props.palette)}>
+                      {`${statusMark(node.status, props.frame)} ${truncate(node.title, 30)}\n${truncate(node.subtitle, 32)}\n${truncate(node.goal, 68)}`}
+                    </text>
+                  </box>
+                )}
+              </For>
+            </box>
           </box>
         )}
       </For>
+      <box flexDirection="row" justifyContent="center">
+        <text fg={props.palette.muted}>{graphReturnSummary(props.run)}</text>
+      </box>
     </box>
   </scrollbox>
 );
@@ -158,11 +215,13 @@ const App = (props: AppProps) => {
     "Press c to load workspace changes.",
   );
   const [message, setMessage] = createSignal("");
+  const [showArchived, setShowArchived] = createSignal(false);
   const [showHelp, setShowHelp] = createSignal(false);
   let mainTabs: TabSelectRenderable | undefined;
   let detailsTabs: TabSelectRenderable | undefined;
   let detailsScroll: ScrollBoxRenderable | undefined;
   let graphScroll: ScrollBoxRenderable | undefined;
+  let refreshing = false;
 
   const run = createMemo<WorkflowRun | undefined>(() =>
     state().runs.find((candidate) => candidate.id === selectedRun()),
@@ -170,7 +229,7 @@ const App = (props: AppProps) => {
   const rows = createMemo<ReadonlyArray<ViewRow>>(() => {
     if (tab() === "providers") return providerRows(props.actions.providers);
     if (tab() === "workflow") return workflowRows(state(), run());
-    return explorerRows(state());
+    return explorerRows(state(), showArchived());
   });
   const levels = createMemo(() => graphLevels(state(), run()));
   const graphRow = createMemo<ViewRow | undefined>(() => {
@@ -182,7 +241,7 @@ const App = (props: AppProps) => {
       return workflowRows(state(), run()).find(
         (row) => row.node?.id === selectedNode.node?.id,
       );
-    return explorerRows(state()).find(
+    return explorerRows(state(), showArchived()).find(
       (row) => row.session?.id === selectedNode.session?.id,
     );
   });
@@ -216,15 +275,19 @@ const App = (props: AppProps) => {
   });
 
   const refresh = async (): Promise<void> => {
+    if (refreshing) return;
+    refreshing = true;
     try {
       setState(await props.actions.read());
     } catch (cause) {
       setMessage(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      refreshing = false;
     }
   };
 
   onMount(() => {
-    const refreshTimer = setInterval(() => void refresh(), 1500);
+    const refreshTimer = setInterval(() => void refresh(), 3000);
     const spinnerTimer = setInterval(() => setFrame((value) => value + 1), 120);
     onCleanup(() => {
       clearInterval(refreshTimer);
@@ -272,6 +335,28 @@ const App = (props: AppProps) => {
     }
   };
 
+  const validateProvider = async (): Promise<void> => {
+    const provider = current()?.provider;
+    if (!provider) {
+      setMessage("Select a provider from the Providers tab.");
+      return;
+    }
+    setMessage(`Validating ${provider.name}…`);
+    try {
+      const validation = await props.actions.validateProvider(provider.name);
+      const failed = validation.checks.filter(
+        (check) => check.status === "failed",
+      );
+      setMessage(
+        failed.length === 0
+          ? `${provider.name} passed ${validation.checks.length} checks.`
+          : `${provider.name} failed: ${failed.map((check) => check.message).join("; ")}`,
+      );
+    } catch (cause) {
+      setMessage(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
   const changeTab = (delta: number): void => {
     setTab(
       (value) =>
@@ -313,7 +398,11 @@ const App = (props: AppProps) => {
     else if (action === "page-up") detailsScroll?.scrollBy(-8, "step");
     else if (action === "page-down") detailsScroll?.scrollBy(8, "step");
     else if (action === "refresh") void refresh();
-    else if (action === "activity") void loadActivity();
+    else if (action === "validate-provider") void validateProvider();
+    else if (action === "toggle-archived") {
+      setShowArchived((value) => !value);
+      setSelected(0);
+    } else if (action === "activity") void loadActivity();
     else if (action === "changes") void loadChanges();
     else if (action === "open") {
       const row = current();
@@ -437,6 +526,7 @@ const App = (props: AppProps) => {
             frame={frame()}
             levels={levels()}
             palette={props.palette}
+            run={run()}
             selected={graphSelected()}
             setScroll={(value) => {
               graphScroll = value;
@@ -470,7 +560,7 @@ const App = (props: AppProps) => {
           focus() === "details" ? props.palette.accent : props.palette.border
         }
         focused={false}
-        height="34%"
+        height="22%"
         padding={1}
         ref={(value) => {
           detailsScroll = value;
@@ -489,10 +579,6 @@ const App = (props: AppProps) => {
               "left",
               "right",
               "open",
-              "activity",
-              "changes",
-              "tree",
-              "graph",
               "tab-next",
               "help",
               "quit",

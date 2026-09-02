@@ -1,0 +1,6 @@
+# yaml-language-server: $schema=../schema/orc.schema.json
+cache:
+  providerTtlMs: 1000
+providers:
+  directory: ~/.config/orc/providers
+  timeoutMs: 5000

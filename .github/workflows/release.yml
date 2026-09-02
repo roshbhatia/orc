@@ -16,10 +16,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: cachix/install-nix-action@v31
-      - run: nix build --accept-flake-config --print-build-logs
+      - run: |
+          nix build --accept-flake-config --print-build-logs .#core --out-link result-core
+          nix build --accept-flake-config --print-build-logs .#extras --out-link result-extras
       - run: |
           mkdir -p dist
-          tar -czf "dist/orc-${{ runner.os }}-${{ runner.arch }}.tar.gz" -C result .
+          tar -czf "dist/orc-${{ runner.os }}-${{ runner.arch }}.tar.gz" -C result-core .
+          tar -czf "dist/orc-providers-${{ runner.os }}-${{ runner.arch }}.tar.gz" -C result-extras .
       - uses: actions/upload-artifact@v7
         with:
           name: orc-${{ runner.os }}-${{ runner.arch }}

@@ -45,6 +45,7 @@ export const LifecycleStatusSchema = Schema.Literals([
   "done",
   "cancelled",
   "disconnected",
+  "archived",
 ] as const);
 
 export type LifecycleStatus = typeof LifecycleStatusSchema.Type;
@@ -183,7 +184,8 @@ export const activeSessions = (state: WorkspaceState): ReadonlyArray<Session> =>
       session.status !== "done" &&
       session.status !== "failed" &&
       session.status !== "cancelled" &&
-      session.status !== "disconnected",
+      session.status !== "disconnected" &&
+      session.status !== "archived",
   );
 
 export const sessionsByRecency = (

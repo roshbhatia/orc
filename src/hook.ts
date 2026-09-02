@@ -1,6 +1,11 @@
 import { Effect } from "effect";
 import type { Command } from "./args.ts";
-import { readWorkspace, reconcileSession, registerSession } from "./control.ts";
+import {
+  archiveSession,
+  readWorkspace,
+  reconcileSession,
+  registerSession,
+} from "./control.ts";
 import type { Session } from "./domain.ts";
 import { StateError, type StateStoreService } from "./state.ts";
 
@@ -93,4 +98,27 @@ export const registerFromHook = (
     return yield* reconcileSession(directory, session.id).pipe(
       Effect.catch(() => Effect.succeed(session)),
     );
+  });
+
+export const archiveFromHook = (
+  command: Extract<Command, { readonly tag: "session-archive" }>,
+): Effect.Effect<Session | null, StateError, StateStoreService> =>
+  Effect.gen(function* () {
+    const context = command.hookInput
+      ? parseHookContext(yield* readHookInput())
+      : undefined;
+    const nativeId =
+      command.nativeId ??
+      context?.nativeId ??
+      process.env.ORC_NATIVE_SESSION_ID ??
+      process.env.CODEX_THREAD_ID ??
+      process.env.CODEX_SESSION_ID ??
+      process.env.CLAUDE_CODE_SESSION_ID ??
+      process.env.CLAUDE_SESSION_ID ??
+      process.env.OPENCODE_SESSION_ID;
+    if (!command.id && !nativeId) return null;
+    return yield* archiveSession(context?.directory ?? command.scope, {
+      ...(command.id ? { id: command.id } : {}),
+      ...(nativeId ? { nativeId } : {}),
+    }).pipe(Effect.catch(() => Effect.succeed(null)));
   });

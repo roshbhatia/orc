@@ -1,6 +1,7 @@
 import { Effect } from "effect";
 import { type CompletionShell, parseArgs } from "./args.ts";
 import {
+  adoptSession,
   attach,
   connect,
   createRun,
@@ -22,9 +23,13 @@ import {
   sessionsByRecency,
   type WorkspaceState,
 } from "./domain.ts";
-import { registerFromHook } from "./hook.ts";
+import { archiveFromHook, registerFromHook } from "./hook.ts";
 import { runMcp } from "./mcp.ts";
-import { listProviders, providerOutput } from "./provider.ts";
+import {
+  listProviders,
+  providerOutput,
+  validateProviders,
+} from "./provider.ts";
 import { StateError, StateStoreLive } from "./state.ts";
 import { openTui } from "./tui.tsx";
 
@@ -99,6 +104,7 @@ const statusOption: CliOption = {
     "done",
     "cancelled",
     "disconnected",
+    "archived",
   ],
 };
 
@@ -122,6 +128,11 @@ const cliCommands: ReadonlyArray<CliCommand> = [
     description: "List provider manifests",
     name: "providers",
     options: [scopeOption, jsonOption],
+  },
+  {
+    description: "Inspect and validate providers",
+    name: "provider",
+    usage: "list|validate",
   },
   {
     description: "Register the current session",
@@ -253,6 +264,19 @@ const nestedCommands: Readonly<Record<string, ReadonlyArray<CliCommand>>> = {
       ],
     },
   ],
+  provider: [
+    {
+      description: "List provider manifests",
+      name: "list",
+      options: [scopeOption, jsonOption],
+    },
+    {
+      description: "Validate provider dependencies and protocol behavior",
+      name: "validate",
+      options: [scopeOption, jsonOption],
+      usage: "[name]",
+    },
+  ],
   run: [
     {
       description: "Create a workflow run",
@@ -296,6 +320,30 @@ const nestedCommands: Readonly<Record<string, ReadonlyArray<CliCommand>>> = {
     },
   ],
   session: [
+    {
+      description: "Adopt the current harness as a new orchestrator",
+      name: "adopt",
+      options: [
+        scopeOption,
+        ...contractOptions,
+        { description: "Set the harness session id", name: "--native-id" },
+      ],
+    },
+    {
+      description: "Archive a session incarnation",
+      name: "archive",
+      options: [
+        scopeOption,
+        { description: "Match the harness session id", name: "--native-id" },
+        {
+          description: "Read session data from standard input",
+          flag: true,
+          name: "--hook-input",
+        },
+        { description: "Suppress the session id", flag: true, name: "--quiet" },
+      ],
+      usage: "[session-id]",
+    },
     {
       description: "Register a session",
       name: "register",
@@ -486,6 +534,42 @@ const helpOptions = [
     options.findIndex((candidate) => candidate.name === option.name) === index,
 );
 
+const markdownOptions = (options: ReadonlyArray<CliOption>): string =>
+  options.length === 0
+    ? ""
+    : [
+        "Options:",
+        "",
+        ...options.map(
+          (option) =>
+            `- \`${option.name}${option.flag ? "" : option.values ? ` <${option.values.join("|")}>` : " <value>"}\`: ${option.description}`,
+        ),
+        "",
+      ].join("\n");
+
+const markdownCommand = (prefix: string, command: CliCommand): string =>
+  [
+    `### \`orc ${prefix}${command.name}\``,
+    "",
+    command.description,
+    "",
+    "```text",
+    `orc ${prefix}${command.name}${command.usage ? ` ${command.usage}` : ""}`,
+    "```",
+    "",
+    markdownOptions(command.options ?? []),
+  ].join("\n");
+
+export const commandReferenceMarkdown = (): string =>
+  [
+    "## Command reference",
+    "",
+    ...cliCommands.map((command) => markdownCommand("", command)),
+    ...Object.entries(nestedCommands).flatMap(([parent, commands]) =>
+      commands.map((command) => markdownCommand(`${parent} `, command)),
+    ),
+  ].join("\n");
+
 export const help = [
   "orc: local control plane for agent harnesses",
   "",
@@ -580,11 +664,38 @@ const program = (
             : providers
                 .map(
                   (provider) =>
-                    `${provider.name}\t${provider.kind}\t${provider.capabilities.join(",")}`,
+                    `${provider.name}\t${provider.kind}\t${provider.description}\n${provider.actions
+                      .map(
+                        (action) =>
+                          `  ${action.capability.padEnd(18)} ${action.description}`,
+                      )
+                      .join("\n")}`,
                 )
                 .join("\n"),
         );
         return 0;
+      }
+      case "provider-validate": {
+        const validations = yield* validateProviders(
+          command.scope,
+          command.name,
+        );
+        streams.stdout(
+          command.json
+            ? JSON.stringify(validations)
+            : validations
+                .flatMap((validation) => [
+                  `${validation.status === "ok" ? "+" : "x"} ${validation.provider.name} · ${validation.provider.kind}`,
+                  ...validation.checks.map(
+                    (check) =>
+                      `  ${check.status === "ok" ? "+" : "x"} ${check.name.padEnd(12)} ${check.message}`,
+                  ),
+                ])
+                .join("\n"),
+        );
+        return validations.every((validation) => validation.status === "ok")
+          ? 0
+          : 1;
       }
       case "session-current": {
         const session = currentSession(yield* readWorkspace(command.scope));
@@ -597,6 +708,14 @@ const program = (
         return 0;
       case "session-register": {
         const session = yield* registerFromHook(command);
+        if (session && !command.quiet) streams.stdout(session.id);
+        return 0;
+      }
+      case "session-adopt":
+        streams.stdout((yield* adoptSession(command)).id);
+        return 0;
+      case "session-archive": {
+        const session = yield* archiveFromHook(command);
         if (session && !command.quiet) streams.stdout(session.id);
         return 0;
       }
@@ -696,6 +815,15 @@ const program = (
                     Effect.provide(StateStoreLive),
                   ),
                 ),
+              validateProvider: async (name) => {
+                const results = await Effect.runPromise(
+                  validateProviders(state.scope, name),
+                );
+                const result = results[0];
+                if (!result)
+                  throw new Error(`Provider ${name} returned no validation.`);
+                return result;
+              },
             }),
           catch: (cause) =>
             new StateError({ message: "open terminal interface", cause }),
