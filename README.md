@@ -2,6 +2,8 @@
 
 ![Orc workflow graph](docs/orc.png)
 
+![Orc animated workflow graph](docs/orc.gif)
+
 Orc is a local control plane for agent harnesses. It records agent sessions and
 workflow graphs. External providers add host integrations.
 
