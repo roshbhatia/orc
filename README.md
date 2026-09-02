@@ -1,12 +1,12 @@
 # Orc
 
+![Orc workflow graph](docs/orc.png)
+
 Orc is a local control plane for agent harnesses. It records agent sessions and
 workflow graphs. External providers add host integrations.
 
 Orc uses the same TypeScript stack as OpenCode: Bun, Effect, Solid, and
 OpenTUI.
-
-![Orc workflow graph](docs/orc.png)
 
 ## Terms
 
