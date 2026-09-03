@@ -45,7 +45,7 @@ symlinkJoin {
   name = "orc-provider-${name}";
   paths = [ adapter ] ++ commandPackages;
   passthru = {
-    inherit commandPackages runtimeInputs;
+    inherit adapter commandPackages runtimeInputs;
     providerName = name;
   };
   meta.mainProgram = "orc-provider-${name}";

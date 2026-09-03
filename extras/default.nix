@@ -27,7 +27,7 @@ providers
 // {
   all = symlinkJoin {
     name = "orc-providers";
-    paths = lib.attrValues providers;
+    paths = map (provider: provider.adapter) (lib.attrValues providers);
     passthru.providers = providers;
   };
 }

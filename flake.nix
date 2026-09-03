@@ -235,6 +235,14 @@
                 ' providers.json > /dev/null
                 touch "$out"
               '';
+          providerAggregateBoundary = pkgs.runCommand "orc-provider-aggregate-boundary" { } ''
+            ${lib.concatMapStringsSep "\n" (name: ''
+              test -x ${packages.extras}/bin/orc-provider-${name}
+              test ! -e ${packages.extras}/bin/${name}
+              test -f ${packages.extras}/share/orc/providers/${name}/provider.yaml
+            '') providerNames}
+            touch "$out"
+          '';
           weztermEnvironment =
             let
               fakeWezterm = pkgs.writeShellScriptBin "wezterm" ''
@@ -291,6 +299,7 @@
           providers = packages.extras;
           provider-neutral-closure = providerNeutralClosure;
           provider-neutral-core = providerNeutralCore;
+          provider-aggregate-boundary = providerAggregateBoundary;
           installed-provider-discovery = installedProviderDiscovery;
           wezterm-composed-environment = weztermEnvironment;
         }
