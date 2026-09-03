@@ -39,25 +39,31 @@ fn normalize(mut value: Value) -> Result<Value> {
         bail!("state must be an object");
     };
     match object.get("schemaVersion").and_then(Value::as_str) {
-        Some("orc.state/v3") => {
+        Some("orc.state/v4") => {
             if let Some(sessions) = object.get_mut("sessions").and_then(Value::as_array_mut) {
                 for session in sessions {
                     if let Some(session) = session.as_object_mut() {
-                        session
-                            .entry("providers")
-                            .or_insert_with(|| Value::Array(Vec::new()));
+                        normalize_session(session);
+                    }
+                }
+            }
+        }
+        Some("orc.state/v3") => {
+            object.insert("schemaVersion".into(), Value::String("orc.state/v4".into()));
+            if let Some(sessions) = object.get_mut("sessions").and_then(Value::as_array_mut) {
+                for session in sessions {
+                    if let Some(session) = session.as_object_mut() {
+                        normalize_session(session);
                     }
                 }
             }
         }
         Some("orc.state/v2") => {
-            object.insert("schemaVersion".into(), Value::String("orc.state/v3".into()));
+            object.insert("schemaVersion".into(), Value::String("orc.state/v4".into()));
             if let Some(sessions) = object.get_mut("sessions").and_then(Value::as_array_mut) {
                 for session in sessions {
                     if let Some(session) = session.as_object_mut() {
-                        session
-                            .entry("providers")
-                            .or_insert_with(|| Value::Array(Vec::new()));
+                        normalize_session(session);
                         session.entry("model").or_insert(Value::Null);
                     }
                 }
@@ -66,7 +72,36 @@ fn normalize(mut value: Value) -> Result<Value> {
         Some(version) => bail!("unsupported state version: {version}"),
         None => bail!("state has no schemaVersion"),
     }
+    if let Some(runs) = object.get_mut("runs").and_then(Value::as_array_mut) {
+        for run in runs.iter_mut().filter_map(Value::as_object_mut) {
+            run.entry("executionNonce").or_insert(Value::Null);
+            run.entry("parentRunId").or_insert(Value::Null);
+        }
+    }
     Ok(value)
+}
+
+fn normalize_session(session: &mut serde_json::Map<String, Value>) {
+    session
+        .entry("providers")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    session
+        .entry("runtimeTimeoutSeconds")
+        .or_insert(Value::Null);
+    session.entry("idleTimeoutSeconds").or_insert(Value::Null);
+    session.entry("terminationReason").or_insert(Value::Null);
+    session.entry("terminationAttemptAt").or_insert(Value::Null);
+    session
+        .entry("terminationOperationId")
+        .or_insert(Value::Null);
+    if !session.contains_key("heartbeatAt") {
+        let heartbeat = session
+            .get("updatedAt")
+            .or_else(|| session.get("connectedAt"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        session.insert("heartbeatAt".into(), heartbeat);
+    }
 }
 
 pub fn read(scope: &Path) -> Result<WorkspaceState> {
@@ -74,7 +109,14 @@ pub fn read(scope: &Path) -> Result<WorkspaceState> {
     match fs::read_to_string(&target) {
         Ok(source) => {
             let value = normalize(serde_json::from_str(&source).context("parse workspace state")?)?;
-            serde_json::from_value(value).context("decode workspace state")
+            let mut workspace: WorkspaceState =
+                serde_json::from_value(value).context("decode workspace state")?;
+            for run in &mut workspace.runs {
+                for node in &mut run.nodes {
+                    node.compact_activity();
+                }
+            }
+            Ok(workspace)
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {
             Ok(WorkspaceState::empty(scope.display().to_string()))
@@ -105,11 +147,14 @@ struct LockOwner {
     pid: u32,
     token: String,
     acquired_at_unix_ms: u128,
+    #[serde(default)]
+    guarded: bool,
 }
 
 struct Lock {
     path: PathBuf,
     token: String,
+    _guard: ClaimGuard,
 }
 
 struct ClaimGuard {
@@ -185,14 +230,22 @@ impl Lock {
     ) -> Result<Self> {
         let started = Instant::now();
         loop {
-            if let Some(_guard) = ClaimGuard::try_acquire(&target)? {
-                if let Some(lock) = Self::claim(&target)? {
-                    return Ok(lock);
+            if let Some(guard) = ClaimGuard::try_acquire(&target)? {
+                if let Some(token) = Self::claim(&target)? {
+                    return Ok(Self {
+                        path: target,
+                        token,
+                        _guard: guard,
+                    });
                 }
                 if Self::reclaim_if_stale(&target, incomplete_grace)?
-                    && let Some(lock) = Self::claim(&target)?
+                    && let Some(token) = Self::claim(&target)?
                 {
-                    return Ok(lock);
+                    return Ok(Self {
+                        path: target,
+                        token,
+                        _guard: guard,
+                    });
                 }
             }
 
@@ -203,7 +256,7 @@ impl Lock {
         }
     }
 
-    fn claim(path: &Path) -> Result<Option<Self>> {
+    fn claim(path: &Path) -> Result<Option<String>> {
         let token = Uuid::new_v4().to_string();
         let owner = LockOwner {
             pid: std::process::id(),
@@ -212,6 +265,7 @@ impl Lock {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis(),
+            guarded: true,
         };
         let parent = path.parent().context("state lock has no parent")?;
         fs::create_dir_all(parent).context("create state lock directory")?;
@@ -225,10 +279,7 @@ impl Lock {
             serde_json::to_writer(&mut file, &owner).context("write state lock owner")?;
             file.sync_all().context("flush state lock owner")?;
             match fs::hard_link(&temporary, path) {
-                Ok(()) => Ok(Some(Self {
-                    path: path.to_owned(),
-                    token,
-                })),
+                Ok(()) => Ok(Some(token)),
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(None),
                 Err(error) => Err(error).context("claim state lock"),
             }
@@ -290,7 +341,7 @@ fn read_lock_owner(path: &Path) -> Result<LockOwner> {
 
 fn lock_is_stale(path: &Path, incomplete_grace: Duration) -> Result<bool> {
     match read_lock_owner(path) {
-        Ok(owner) => Ok(!pid_is_alive(owner.pid)),
+        Ok(owner) => Ok(owner.guarded || !pid_is_alive(owner.pid)),
         Err(_) => {
             let modified = fs::metadata(path)
                 .and_then(|metadata| metadata.modified())
@@ -365,6 +416,26 @@ mod tests {
     }
 
     #[test]
+    fn v3_sessions_gain_lease_fields() {
+        let value = serde_json::json!({
+            "schemaVersion": "orc.state/v3",
+            "sessions": [{
+                "connectedAt": "2026-09-03T12:00:00Z",
+                "updatedAt": "2026-09-03T12:01:00Z"
+            }]
+        });
+
+        let normalized = normalize(value).unwrap();
+        let session = &normalized["sessions"][0];
+        assert_eq!(normalized["schemaVersion"], "orc.state/v4");
+        assert_eq!(session["heartbeatAt"], "2026-09-03T12:01:00Z");
+        assert!(session["runtimeTimeoutSeconds"].is_null());
+        assert!(session["idleTimeoutSeconds"].is_null());
+        assert!(session["terminationReason"].is_null());
+        assert!(session["terminationAttemptAt"].is_null());
+    }
+
+    #[test]
     fn lock_writes_owner_metadata_and_releases_its_directory() {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("state.lock");
@@ -412,6 +483,30 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn released_guard_is_reclaimed_even_when_pid_is_reused() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("state.lock");
+        let owner = LockOwner {
+            pid: std::process::id(),
+            token: Uuid::new_v4().to_string(),
+            acquired_at_unix_ms: 0,
+            guarded: true,
+        };
+        fs::write(&path, serde_json::to_vec(&owner).unwrap()).unwrap();
+
+        let lock = Lock::acquire_with(
+            path.clone(),
+            Duration::from_millis(10),
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        assert_ne!(lock.token, owner.token);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn dead_owner_is_reclaimed() {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("state.lock");
@@ -420,6 +515,7 @@ mod tests {
             pid: u32::MAX,
             token: Uuid::new_v4().to_string(),
             acquired_at_unix_ms: 0,
+            guarded: false,
         };
         fs::write(
             path.join(LEGACY_LOCK_OWNER_FILE),
@@ -449,6 +545,7 @@ mod tests {
             pid: u32::MAX,
             token: Uuid::new_v4().to_string(),
             acquired_at_unix_ms: 0,
+            guarded: false,
         };
         fs::write(path.as_ref(), serde_json::to_vec(&owner).unwrap()).unwrap();
         let start = Arc::new(Barrier::new(8));
@@ -534,6 +631,7 @@ mod tests {
             pid: std::process::id(),
             token: Uuid::new_v4().to_string(),
             acquired_at_unix_ms: 0,
+            guarded: false,
         };
         fs::write(&path, serde_json::to_vec(&replacement).unwrap()).unwrap();
 

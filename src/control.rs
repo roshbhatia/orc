@@ -1,4 +1,11 @@
-use std::{env, path::Path};
+use std::{
+    env,
+    fs::{self, File, OpenOptions},
+    path::{Path, PathBuf},
+};
+
+#[cfg(unix)]
+use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -7,13 +14,16 @@ use uuid::Uuid;
 
 use crate::{
     config::Config,
+    daemon,
     domain::{
-        ActivityEvent, AgentConfig, CompletionTarget, JudgePolicy, LifecycleStatus,
+        AgentConfig, BindingStatus, CompletionTarget, JudgePolicy, LifecycleStatus, ProviderKind,
         RegistrationSource, Session, SessionRole, WorkflowEdge, WorkflowNode, WorkflowRun,
         WorkspaceState,
     },
     provider, state,
 };
+
+const MAX_NODE_OUTPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Contract {
@@ -54,7 +64,15 @@ pub struct SessionLink {
     pub run_id: Option<String>,
     pub node_id: Option<String>,
     pub provider_ref: Option<String>,
+    pub runtime_timeout_seconds: Option<u64>,
+    pub idle_timeout_seconds: Option<u64>,
     pub source: RegistrationSource,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SessionLease {
+    pub runtime_timeout_seconds: Option<u64>,
+    pub idle_timeout_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -79,17 +97,10 @@ pub struct NodeReport {
 }
 
 pub fn inferred_native_id() -> String {
-    [
-        "ORC_NATIVE_SESSION_ID",
-        "CODEX_THREAD_ID",
-        "CODEX_SESSION_ID",
-        "CLAUDE_CODE_SESSION_ID",
-        "CLAUDE_SESSION_ID",
-        "OPENCODE_SESSION_ID",
-    ]
-    .into_iter()
-    .find_map(|name| env::var(name).ok().filter(|value| !value.is_empty()))
-    .unwrap_or_else(|| format!("process-{}", std::process::id()))
+    env::var("ORC_NATIVE_SESSION_ID")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("process-{}", std::process::id()))
 }
 
 pub fn inferred_session_id(harness: &str, native_id: &str) -> String {
@@ -106,16 +117,43 @@ pub fn read_workspace(scope: &Path) -> Result<WorkspaceState> {
 }
 
 pub fn register(scope: &Path, mut contract: Contract, link: SessionLink) -> Result<Session> {
+    let environment_id = env::var("ORC_SESSION_ID").ok();
+    register_for_caller(scope, &mut contract, link, environment_id.as_deref())
+}
+
+fn register_for_caller(
+    scope: &Path,
+    contract: &mut Contract,
+    link: SessionLink,
+    environment_id: Option<&str>,
+) -> Result<Session> {
     let scope = state::resolve_scope(scope)?;
     let native_id = link.native_id.unwrap_or_else(inferred_native_id);
     let explicit_id = link.id;
-    let environment_id = env::var("ORC_SESSION_ID").ok();
     state::update(&scope, |workspace| {
         let inferred_id = inferred_session_id(&contract.harness, &native_id);
+        let caller = environment_id
+            .map(|caller_id| {
+                workspace
+                    .sessions
+                    .iter()
+                    .find(|session| {
+                        session.id == caller_id
+                            && session.status.active()
+                            && session.status != LifecycleStatus::Terminating
+                    })
+                    .cloned()
+                    .with_context(|| format!("inactive or unknown Orc session: {caller_id}"))
+            })
+            .transpose()?;
+        let refreshes_caller = caller.as_ref().is_some_and(|caller| {
+            explicit_id.as_deref() == Some(caller.id.as_str())
+                || (caller.harness == contract.harness && caller.native_id == native_id)
+        });
         let base_id = registration_base_id(
             workspace,
             explicit_id.as_deref(),
-            environment_id.as_deref(),
+            refreshes_caller.then_some(environment_id).flatten(),
             &inferred_id,
         );
         let current = workspace
@@ -127,6 +165,15 @@ pub fn register(scope: &Path, mut contract: Contract, link: SessionLink) -> Resu
                         || (session.harness == contract.harness && session.native_id == native_id))
             })
             .cloned();
+        if let Some(caller) = caller.as_ref()
+            && caller.role != SessionRole::Orchestrator
+            && !refreshes_caller
+        {
+            bail!("a managed child can only refresh its own Orc registration");
+        }
+        let governed = current.as_ref().filter(|session| {
+            session.registration == RegistrationSource::Managed || refreshes_caller
+        });
         let id = current
             .as_ref()
             .map(|session| session.id.clone())
@@ -149,6 +196,7 @@ pub fn register(scope: &Path, mut contract: Contract, link: SessionLink) -> Resu
             .active_sessions()
             .find(|session| {
                 session.role == SessionRole::Orchestrator
+                    && session.status != LifecycleStatus::Terminating
                     && current
                         .as_ref()
                         .is_none_or(|current| session.id != current.id)
@@ -162,42 +210,95 @@ pub fn register(scope: &Path, mut contract: Contract, link: SessionLink) -> Resu
         {
             contract.role = SessionRole::Orchestrator;
         }
-        let parent_id = explicit_parent.or_else(|| {
-            (contract.role != SessionRole::Orchestrator)
-                .then_some(active_orchestrator)
-                .flatten()
-        });
+        let role = governed.map_or(contract.role, |session| session.role);
+        let parent_id = governed
+            .and_then(|session| session.parent_id.clone())
+            .or_else(|| {
+                explicit_parent.or_else(|| {
+                    (role != SessionRole::Orchestrator)
+                        .then_some(active_orchestrator)
+                        .flatten()
+                })
+            });
         let now = Utc::now();
+        let session_native_id =
+            governed.map_or_else(|| native_id.clone(), |session| session.native_id.clone());
         let session = Session {
             id,
-            native_id: native_id.clone(),
-            trace_id: Some(native_id),
-            harness: contract.harness,
-            model: contract
-                .model
-                .or_else(|| current.as_ref().and_then(|session| session.model.clone())),
-            role: contract.role,
-            title: contract.title,
-            purpose: contract.purpose,
-            goal: contract.goal,
-            expected_output: contract.expected_output,
-            success_criteria: contract.success_criteria,
-            completion: contract.completion,
-            review_by: contract.review_by,
+            native_id: session_native_id.clone(),
+            trace_id: governed
+                .and_then(|session| session.trace_id.clone())
+                .or(Some(session_native_id)),
+            harness: governed.map_or_else(
+                || contract.harness.clone(),
+                |session| session.harness.clone(),
+            ),
+            model: governed.map_or_else(
+                || {
+                    contract
+                        .model
+                        .clone()
+                        .or_else(|| current.as_ref().and_then(|session| session.model.clone()))
+                },
+                |session| session.model.clone(),
+            ),
+            role,
+            title: governed.map_or_else(|| contract.title.clone(), |session| session.title.clone()),
+            purpose: governed.map_or_else(
+                || contract.purpose.clone(),
+                |session| session.purpose.clone(),
+            ),
+            goal: governed.map_or_else(|| contract.goal.clone(), |session| session.goal.clone()),
+            expected_output: governed.map_or_else(
+                || contract.expected_output.clone(),
+                |session| session.expected_output.clone(),
+            ),
+            success_criteria: governed.map_or_else(
+                || contract.success_criteria.clone(),
+                |session| session.success_criteria.clone(),
+            ),
+            completion: governed.map_or(contract.completion, |session| session.completion),
+            review_by: governed
+                .and_then(|session| session.review_by.clone())
+                .or(contract.review_by.clone()),
             parent_id,
-            run_id: link.run_id,
-            node_id: link.node_id,
-            provider_ref: link
-                .provider_ref
-                .or_else(|| env::var("ORC_PROVIDER_REF").ok()),
+            run_id: governed
+                .and_then(|session| session.run_id.clone())
+                .or(link.run_id),
+            node_id: governed
+                .and_then(|session| session.node_id.clone())
+                .or(link.node_id),
+            provider_ref: governed
+                .map(|session| session.provider_ref.clone())
+                .unwrap_or_else(|| {
+                    link.provider_ref
+                        .or_else(|| env::var("ORC_PROVIDER_REF").ok())
+                }),
             providers: current
                 .as_ref()
                 .map(|session| session.providers.clone())
                 .unwrap_or_default(),
             directory: scope.display().to_string(),
-            registration: link.source,
-            status: LifecycleStatus::Working,
-            connected_at: current.map(|session| session.connected_at).unwrap_or(now),
+            registration: governed.map_or(link.source, |session| session.registration),
+            status: governed.map_or(LifecycleStatus::Working, |session| session.status),
+            runtime_timeout_seconds: governed.map_or(link.runtime_timeout_seconds, |session| {
+                session.runtime_timeout_seconds
+            }),
+            idle_timeout_seconds: governed.map_or(link.idle_timeout_seconds, |session| {
+                session.idle_timeout_seconds
+            }),
+            heartbeat_at: governed
+                .and_then(|session| session.heartbeat_at)
+                .or(Some(now)),
+            termination_reason: governed.and_then(|session| session.termination_reason.clone()),
+            termination_cause: governed.and_then(|session| session.termination_cause.clone()),
+            termination_attempt_at: governed.and_then(|session| session.termination_attempt_at),
+            termination_operation_id: governed
+                .and_then(|session| session.termination_operation_id.clone()),
+            connected_at: current
+                .as_ref()
+                .map(|session| session.connected_at)
+                .unwrap_or(now),
             updated_at: now,
         };
         workspace
@@ -245,6 +346,7 @@ pub fn adopt(scope: &Path, mut contract: Contract, native_id: Option<String>) ->
             .collect::<Vec<_>>();
         for session in &mut workspace.sessions {
             if session.role == SessionRole::Orchestrator
+                && session.status != LifecycleStatus::Terminating
                 && session.status != LifecycleStatus::Archived
             {
                 session.status = LifecycleStatus::Archived;
@@ -278,6 +380,13 @@ pub fn adopt(scope: &Path, mut contract: Contract, native_id: Option<String>) ->
             directory: scope.display().to_string(),
             registration: RegistrationSource::Connected,
             status: LifecycleStatus::Working,
+            runtime_timeout_seconds: None,
+            idle_timeout_seconds: None,
+            heartbeat_at: Some(now),
+            termination_reason: None,
+            termination_cause: None,
+            termination_attempt_at: None,
+            termination_operation_id: None,
             connected_at: now,
             updated_at: now,
         };
@@ -305,6 +414,7 @@ fn reparent_active_descendants(
 ) {
     for session in &mut workspace.sessions {
         if session.status.active()
+            && session.status != LifecycleStatus::Terminating
             && session
                 .parent_id
                 .as_ref()
@@ -324,10 +434,447 @@ pub fn update_session(scope: &Path, id: &str, status: LifecycleStatus) -> Result
             .iter_mut()
             .find(|session| session.id == id)
             .with_context(|| format!("unknown session: {id}"))?;
+        if session
+            .termination_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("termination pending "))
+        {
+            bail!("session termination is in progress: {id}");
+        }
+        if session.status == LifecycleStatus::Cancelled && session.termination_reason.is_some() {
+            bail!("session was terminated and must be registered as a new session: {id}");
+        }
         session.status = status;
-        session.updated_at = Utc::now();
+        let now = Utc::now();
+        if status.active() {
+            session.termination_reason = None;
+            session.termination_cause = None;
+            session.termination_attempt_at = None;
+            session.termination_operation_id = None;
+        }
+        session.updated_at = now;
         Ok(session.clone())
     })
+}
+
+pub fn keepalive(scope: &Path, id: &str) -> Result<Session> {
+    let scope = state::resolve_scope(scope)?;
+    state::update(&scope, |workspace| {
+        let session = workspace
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == id)
+            .with_context(|| format!("unknown session: {id}"))?;
+        if !session.status.active() {
+            bail!("session is not active: {id}");
+        }
+        if session
+            .termination_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("termination pending "))
+        {
+            bail!("session termination is in progress: {id}");
+        }
+        if session.registration != RegistrationSource::Managed {
+            bail!("only managed sessions have renewable leases");
+        }
+        let now = Utc::now();
+        session.heartbeat_at = Some(now);
+        session.updated_at = now;
+        Ok(session.clone())
+    })
+}
+
+pub fn terminate(config: &Config, scope: &Path, id: &str, reason: &str) -> Result<Session> {
+    terminate_with_heartbeat(config, scope, id, reason, None, None)
+}
+
+pub fn terminate_expired(
+    config: &Config,
+    scope: &Path,
+    id: &str,
+    reason: &str,
+    observed_heartbeat: Option<Option<chrono::DateTime<Utc>>>,
+    observed_claim: Option<&str>,
+) -> Result<Session> {
+    terminate_with_heartbeat(
+        config,
+        scope,
+        id,
+        reason,
+        observed_heartbeat,
+        observed_claim,
+    )
+}
+
+fn terminate_with_heartbeat(
+    config: &Config,
+    scope: &Path,
+    id: &str,
+    reason: &str,
+    expected_heartbeat: Option<Option<chrono::DateTime<Utc>>>,
+    expected_claim: Option<&str>,
+) -> Result<Session> {
+    let scope = state::resolve_scope(scope)?;
+    let snapshot = state::read(&scope)?;
+    let session = selected_session(&snapshot, id)?.clone();
+    if !terminable(&session) {
+        return Ok(session);
+    }
+    let providers = provider::discover(config)?;
+    let bindings = provider::discover_bindings(config, &providers, &scope, &session, false);
+    if !bindings.is_empty() {
+        state::update(&scope, |workspace| {
+            let selected = workspace
+                .sessions
+                .iter_mut()
+                .find(|candidate| candidate.id == id)
+                .with_context(|| format!("unknown session: {id}"))?;
+            for binding in &bindings {
+                let existing = selected.providers.iter().position(|candidate| {
+                    candidate.provider == binding.provider && candidate.kind == binding.kind
+                });
+                if binding.status == crate::domain::BindingStatus::Active || existing.is_none() {
+                    if let Some(index) = existing {
+                        selected.providers[index] = binding.clone();
+                    } else {
+                        selected.providers.push(binding.clone());
+                    }
+                }
+            }
+            Ok(())
+        })?;
+    }
+    let session = selected_session(&state::read(&scope)?, id)?.clone();
+    let operation_id =
+        termination_operation_id(expected_claim, session.termination_operation_id.as_deref());
+    let termination_cause =
+        persisted_termination_cause(session.termination_cause.as_deref(), reason);
+    let claim = format!("termination pending {operation_id}");
+    let Some(_termination_guard) =
+        TerminationGuard::acquire(&scope, id, config.provider_timeout())?
+    else {
+        let message = "another managed-session termination owns this lock shard";
+        state::update(&scope, |workspace| {
+            let selected = workspace
+                .sessions
+                .iter_mut()
+                .find(|candidate| candidate.id == id)
+                .with_context(|| format!("unknown session: {id}"))?;
+            let pending = selected
+                .termination_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("termination pending "));
+            if terminable(selected) && !pending {
+                let now = Utc::now();
+                selected.termination_reason = Some(format!("termination failed: {message}"));
+                selected.termination_cause = Some(termination_cause.clone());
+                selected.termination_attempt_at = Some(now);
+                selected.updated_at = now;
+            }
+            Ok(())
+        })?;
+        bail!(message);
+    };
+    let claimed_status = state::update(&scope, |workspace| {
+        let selected = workspace
+            .sessions
+            .iter_mut()
+            .find(|candidate| candidate.id == id)
+            .with_context(|| format!("unknown session: {id}"))?;
+        if !terminable(selected) {
+            return Ok(None);
+        }
+        let pending_claim = selected
+            .termination_reason
+            .as_deref()
+            .filter(|reason| reason.starts_with("termination pending "));
+        if pending_claim.is_some() && pending_claim != expected_claim {
+            return Ok(None);
+        }
+        if let Some(expected) = expected_heartbeat
+            && selected.heartbeat_at != expected
+        {
+            return Ok(None);
+        }
+        let now = Utc::now();
+        let claimed_status = selected.status;
+        selected.status = LifecycleStatus::Terminating;
+        selected.termination_reason = Some(claim.clone());
+        selected.termination_cause = Some(termination_cause.clone());
+        selected.termination_attempt_at = Some(now);
+        selected.termination_operation_id = Some(operation_id.clone());
+        selected.updated_at = now;
+        Ok(Some(claimed_status))
+    })?;
+    let Some(claimed_status) = claimed_status else {
+        return selected_session(&state::read(&scope)?, id).cloned();
+    };
+    let result = (|| {
+        let mut request =
+            provider::action_request(provider::Action::Stop, &scope, Some(&session), "right");
+        request["operationId"] = serde_json::Value::String(operation_id.clone());
+        let plan = provider::resolve_plan(config, &providers, provider::Action::Stop, request)
+            .or_else(|stop_error| {
+                let mut request = provider::action_request(
+                    provider::Action::Cancel,
+                    &scope,
+                    Some(&session),
+                    "right",
+                );
+                request["operationId"] = serde_json::Value::String(operation_id.clone());
+                provider::resolve_plan(config, &providers, provider::Action::Cancel, request)
+                    .with_context(|| format!("session stop unavailable: {stop_error:#}"))
+            })
+            .context("no provider can stop or cancel this active agent")?;
+        let result = provider::run_plan_with_timeout(&plan, &scope, config.provider_timeout())?;
+        if !plan.accepts(result.code) {
+            bail!(
+                "stop provider exited with {}: {}",
+                result.code,
+                result.stderr.trim()
+            );
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        state::update(&scope, |workspace| {
+            let selected = workspace
+                .sessions
+                .iter_mut()
+                .find(|candidate| candidate.id == id)
+                .with_context(|| format!("unknown session: {id}"))?;
+            if selected.termination_reason.as_deref() == Some(claim.as_str()) {
+                selected.status = claimed_status;
+                selected.termination_reason = Some(format!("termination failed: {error:#}"));
+                selected.updated_at = Utc::now();
+            }
+            Ok(())
+        })?;
+        return Err(error);
+    }
+    state::update(&scope, |workspace| {
+        let session = workspace
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == id)
+            .with_context(|| format!("unknown session: {id}"))?;
+        if session.termination_reason.as_deref() == Some(claim.as_str()) {
+            session.status = LifecycleStatus::Cancelled;
+            session.termination_reason = Some(termination_cause.clone());
+            session.updated_at = Utc::now();
+        }
+        Ok(session.clone())
+    })
+}
+
+fn termination_operation_id(expected_claim: Option<&str>, persisted: Option<&str>) -> String {
+    expected_claim
+        .and_then(|claim| claim.strip_prefix("termination pending "))
+        .or(persisted)
+        .map(str::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string())
+}
+
+fn persisted_termination_cause(existing: Option<&str>, reason: &str) -> String {
+    match existing {
+        Some("idle timeout exceeded") if reason == "runtime timeout exceeded" => reason.to_owned(),
+        Some(existing) => existing.to_owned(),
+        None => reason.to_owned(),
+    }
+}
+
+struct TerminationGuard {
+    file: File,
+    path: PathBuf,
+}
+
+impl TerminationGuard {
+    fn acquire(
+        scope: &Path,
+        session_id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Option<Self>> {
+        let path = termination_lock_path(scope, session_id);
+        let directory = path.parent().context("termination lock has no directory")?;
+        fs::create_dir_all(directory).context("create termination lock directory")?;
+        #[cfg(unix)]
+        {
+            let deadline = std::time::Instant::now()
+                .checked_add(timeout)
+                .context("termination lock timeout exceeds the platform clock range")?;
+            loop {
+                if let Some(_gate) = TerminationGateGuard::try_acquire(&path)? {
+                    let file = open_termination_lock(&path)?;
+                    if try_lock(&file)? {
+                        return Ok(Some(Self { file, path }));
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        #[cfg(not(unix))]
+        Ok(Some(Self {
+            file: open_termination_lock(&path)?,
+            path,
+        }))
+    }
+}
+
+impl Drop for TerminationGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            if let Ok(_gate) = TerminationGateGuard::acquire(&self.path) {
+                let _ = fs::remove_file(&self.path);
+                unlock(&self.file);
+                return;
+            }
+            unlock(&self.file);
+        }
+        #[cfg(not(unix))]
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+pub fn termination_claim_active(scope: &Path, session_id: &str, claim: &str) -> Result<bool> {
+    if !claim.starts_with("termination pending ") {
+        return Ok(false);
+    }
+    let path = termination_lock_path(scope, session_id);
+    #[cfg(unix)]
+    {
+        let _gate = TerminationGateGuard::acquire(&path)?;
+        let file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).context("inspect termination lock"),
+        };
+        if !try_lock(&file)? {
+            return Ok(true);
+        }
+        fs::remove_file(&path).context("remove released termination lock")?;
+        unlock(&file);
+    }
+    #[cfg(not(unix))]
+    return Ok(path.exists());
+    #[cfg(unix)]
+    Ok(false)
+}
+
+fn termination_lock_path(scope: &Path, session_id: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    #[cfg(unix)]
+    hasher.update(scope.as_os_str().as_bytes());
+    #[cfg(not(unix))]
+    hasher.update(scope.as_os_str().to_string_lossy().as_bytes());
+    hasher.update([0]);
+    hasher.update(session_id.as_bytes());
+    let name = hex::encode(hasher.finalize());
+    crate::config::state_home()
+        .join("orc/terminations")
+        .join(format!("{name}.lock"))
+}
+
+fn open_termination_lock(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .context("open termination lock")
+}
+
+#[cfg(unix)]
+struct TerminationGateGuard {
+    file: File,
+}
+
+#[cfg(unix)]
+impl TerminationGateGuard {
+    fn acquire(path: &Path) -> Result<Self> {
+        let file = open_termination_gate_lock(path)?;
+        lock(&file)?;
+        Ok(Self { file })
+    }
+
+    fn try_acquire(path: &Path) -> Result<Option<Self>> {
+        let file = open_termination_gate_lock(path)?;
+        try_lock(&file).map(|locked| locked.then_some(Self { file }))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminationGateGuard {
+    fn drop(&mut self) {
+        unlock(&self.file);
+    }
+}
+
+#[cfg(unix)]
+fn open_termination_gate_lock(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path.with_extension("guard"))
+        .context("open termination lock cleanup guard")
+}
+
+#[cfg(unix)]
+fn lock(file: &File) -> Result<()> {
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    const LOCK_EX: i32 = 2;
+    if unsafe { flock(file.as_raw_fd(), LOCK_EX) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()).context("acquire termination lock cleanup guard")
+    }
+}
+
+#[cfg(unix)]
+fn try_lock(file: &File) -> Result<bool> {
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(error).context("acquire termination lock")
+    }
+}
+
+#[cfg(unix)]
+fn unlock(file: &File) {
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    const LOCK_UN: i32 = 8;
+    let _ = unsafe { flock(file.as_raw_fd(), LOCK_UN) };
+}
+
+pub(crate) fn terminable(session: &Session) -> bool {
+    session.status.active()
+        || (session.registration == RegistrationSource::Managed
+            && matches!(
+                session.status,
+                LifecycleStatus::Disconnected | LifecycleStatus::Failed
+            ))
 }
 
 pub fn archive(scope: &Path, id: Option<&str>, native_id: Option<&str>) -> Result<Session> {
@@ -343,6 +890,9 @@ pub fn archive(scope: &Path, id: Option<&str>, native_id: Option<&str>) -> Resul
             })
             .max_by_key(|session| session.updated_at)
             .context("no matching active session")?;
+        if session.status == LifecycleStatus::Terminating {
+            bail!("session termination is in progress: {}", session.id);
+        }
         session.status = LifecycleStatus::Archived;
         session.updated_at = Utc::now();
         Ok(session.clone())
@@ -351,22 +901,9 @@ pub fn archive(scope: &Path, id: Option<&str>, native_id: Option<&str>) -> Resul
 
 pub fn prune(config: &Config, scope: &Path, id: &str) -> Result<Session> {
     let scope = state::resolve_scope(scope)?;
-    let workspace = state::read(&scope)?;
-    let session = selected_session(&workspace, id)?.clone();
-    if session.status.active() {
-        let providers = provider::discover(config)?;
-        let request =
-            provider::action_request(provider::Action::Stop, &scope, Some(&session), "right");
-        let plan = provider::resolve_plan(config, &providers, provider::Action::Stop, request)
-            .context("no provider can stop this active agent")?;
-        let result = provider::run_plan_with_timeout(&plan, &scope, config.provider_timeout())?;
-        if !plan.accepts(result.code) {
-            bail!(
-                "stop provider exited with {}: {}",
-                result.code,
-                result.stderr.trim()
-            );
-        }
+    let terminated = terminate(config, &scope, id, "pruned by operator")?;
+    if terminable(&terminated) {
+        bail!("session is still active after its termination attempt: {id}");
     }
     archive(&scope, Some(id), None)
 }
@@ -431,7 +968,9 @@ fn apply_enrichment(
 ) {
     let liveness = reconciled_liveness(&session.providers, bindings);
     session.providers = bindings.to_vec();
-    if let Some(is_live) = liveness {
+    if let Some(is_live) = liveness
+        && session.status != LifecycleStatus::Terminating
+    {
         if is_live && session.status == LifecycleStatus::Disconnected {
             session.status = LifecycleStatus::Working;
         } else if !is_live && session.status.active() {
@@ -513,6 +1052,19 @@ pub fn create_run(
                 .current_session()
                 .map(|session| session.id.clone())
         });
+        if let Some(orchestrator_id) = orchestrator_id.as_deref() {
+            let orchestrator = workspace
+                .sessions
+                .iter()
+                .find(|session| session.id == orchestrator_id)
+                .with_context(|| format!("unknown orchestrator session: {orchestrator_id}"))?;
+            if orchestrator.role != SessionRole::Orchestrator
+                || !orchestrator.status.active()
+                || orchestrator.status == LifecycleStatus::Terminating
+            {
+                bail!("orchestrator is not accepting new work: {orchestrator_id}");
+            }
+        }
         let run = WorkflowRun {
             id: format!("run-{}", &Uuid::new_v4().to_string()[..12]),
             name: name.clone(),
@@ -520,11 +1072,14 @@ pub fn create_run(
             expected_output: expected_output.clone(),
             status: LifecycleStatus::Queued,
             orchestrator_id,
+            parent_run_id: None,
             definition: None,
             revision: None,
             checkpoint: None,
             mode: Default::default(),
             process_id: None,
+            execution_nonce: None,
+            resume_requested: false,
             log_path: None,
             current_node: None,
             tokens: 0,
@@ -566,6 +1121,9 @@ pub fn set_run_agent(
             .iter_mut()
             .find(|run| run.id == run_id)
             .with_context(|| format!("unknown run: {run_id}"))?;
+        if run.status == LifecycleStatus::Terminating {
+            return Ok(run.clone());
+        }
         run.agents.retain(|agent| agent.role != role);
         run.agents.push(AgentConfig {
             role,
@@ -585,6 +1143,9 @@ pub fn update_run(scope: &Path, run_id: &str, status: LifecycleStatus) -> Result
             .iter_mut()
             .find(|run| run.id == run_id)
             .with_context(|| format!("unknown run: {run_id}"))?;
+        if run.status == LifecycleStatus::Terminating && status != LifecycleStatus::Terminating {
+            return Ok(run.clone());
+        }
         run.status = status;
         run.updated_at = Utc::now();
         Ok(run.clone())
@@ -609,6 +1170,9 @@ pub fn upsert_node(scope: &Path, run_id: &str, spec: NodeSpec) -> Result<Workflo
             .iter_mut()
             .find(|run| run.id == run_id)
             .with_context(|| format!("unknown run: {run_id}"))?;
+        if run.status == LifecycleStatus::Terminating {
+            bail!("run is terminating");
+        }
         let node = WorkflowNode {
             id: id.clone(),
             name: contract.title.clone(),
@@ -624,8 +1188,10 @@ pub fn upsert_node(scope: &Path, run_id: &str, spec: NodeSpec) -> Result<Workflo
             completion: contract.completion,
             review_by: contract.review_by.clone(),
             session_id: session_id.clone(),
+            child_run_id: None,
             status,
             attempt,
+            retry_after: None,
             prompt: None,
             input: None,
             output: None,
@@ -674,6 +1240,10 @@ pub fn update_node(
             .iter_mut()
             .find(|node| node.id == node_id)
             .with_context(|| format!("unknown node: {node_id}"))?;
+        if run.status == LifecycleStatus::Terminating || node.status == LifecycleStatus::Terminating
+        {
+            return Ok(node.clone());
+        }
         node.status = status;
         node.updated_at = Utc::now();
         run.updated_at = Utc::now();
@@ -685,10 +1255,29 @@ pub fn report_node(
     scope: &Path,
     run_id: &str,
     node_id: &str,
+    reporting_session_id: Option<&str>,
     report: NodeReport,
 ) -> Result<WorkflowNode> {
     let scope = state::resolve_scope(scope)?;
+    if let Some(output) = report.output.as_ref()
+        && serde_json::to_vec(output)?.len() > MAX_NODE_OUTPUT_BYTES
+    {
+        bail!("workflow node output exceeds {MAX_NODE_OUTPUT_BYTES} bytes");
+    }
     state::update(&scope, |workspace| {
+        if let Some(session_id) = reporting_session_id {
+            let reporting = workspace
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .with_context(|| format!("unknown reporting session: {session_id}"))?;
+            if !reporting.status.active()
+                || reporting.status == LifecycleStatus::Terminating
+                || reporting.registration != RegistrationSource::Managed
+            {
+                bail!("reporting session is not authorized: {session_id}");
+            }
+        }
         let run = workspace
             .runs
             .iter_mut()
@@ -699,6 +1288,30 @@ pub fn report_node(
             .iter_mut()
             .find(|node| node.id == node_id)
             .with_context(|| format!("unknown node: {node_id}"))?;
+        if run.status == LifecycleStatus::Terminating || node.status == LifecycleStatus::Terminating
+        {
+            return Ok(node.clone());
+        }
+        if let Some(session_id) = reporting_session_id
+            && node.session_id.as_deref() != Some(session_id)
+        {
+            bail!("a worker can report only its assigned workflow node");
+        }
+        if reporting_session_id.is_some()
+            && !matches!(
+                report.status,
+                LifecycleStatus::Working
+                    | LifecycleStatus::Waiting
+                    | LifecycleStatus::Blocked
+                    | LifecycleStatus::Failed
+                    | LifecycleStatus::Done
+            )
+        {
+            bail!(
+                "a worker cannot report the {} lifecycle state",
+                report.status
+            );
+        }
         node.status = report.status;
         if report.output.is_some() {
             node.output.clone_from(&report.output);
@@ -714,14 +1327,13 @@ pub fn report_node(
             run.cost_usd = (run.cost_usd - node.cost_usd + cost_usd).max(0.0);
             node.cost_usd = cost_usd;
         }
-        node.activity.push(ActivityEvent {
-            at: Utc::now(),
-            kind: "reported".into(),
-            message: report
+        node.record_activity(
+            "reported",
+            report
                 .message
                 .clone()
                 .unwrap_or_else(|| report.status.to_string()),
-        });
+        );
         node.updated_at = Utc::now();
         run.updated_at = Utc::now();
         Ok(node.clone())
@@ -878,8 +1490,14 @@ pub fn launch(
     harness: String,
     model: Option<String>,
     managed: Option<String>,
+    lease: SessionLease,
     args: Vec<String>,
 ) -> Result<i32> {
+    if managed.is_none()
+        && (lease.runtime_timeout_seconds.is_some() || lease.idle_timeout_seconds.is_some())
+    {
+        bail!("session timeouts require --managed and a lifecycle provider");
+    }
     let scope = state::resolve_scope(scope)?;
     let parent = state::read(&scope)?
         .current_session()
@@ -907,43 +1525,172 @@ pub fn launch(
             native_id: Some(native_id.clone()),
             parent_id: parent,
             provider_ref: managed.clone(),
-            source: RegistrationSource::Managed,
+            runtime_timeout_seconds: lease.runtime_timeout_seconds,
+            idle_timeout_seconds: lease.idle_timeout_seconds,
+            source: if managed.is_some() {
+                RegistrationSource::Managed
+            } else {
+                RegistrationSource::Connected
+            },
             ..SessionLink::default()
         },
     )?;
+    let supervised = managed.is_some();
     let mut command = vec![harness];
     command.extend(args);
-    let code = if let Some(managed_id) = managed {
-        let providers = provider::discover(config)?;
-        let request = serde_json::json!({
-            "version": "orc.provider/v1", "action": "launch", "scope": scope, "session": session,
-            "command": command, "managedId": managed_id,
-        });
-        let plan = provider::resolve_plan(config, &providers, provider::Action::Launch, request)?;
-        provider::execute_plan(&plan, &scope, true)?
-    } else {
-        let mut child = std::process::Command::new(&command[0]);
-        child
-            .args(&command[1..])
-            .current_dir(&scope)
-            .env("ORC_SCOPE", &scope)
-            .env("ORC_SESSION_ID", &session.id)
-            .env("ORC_NATIVE_SESSION_ID", &native_id);
-        if let Some(model) = &model {
-            child.env("ORC_MODEL", model);
+    let result = (|| -> Result<i32> {
+        if supervised {
+            daemon::ensure_running(config)?;
         }
-        child.status()?.code().unwrap_or(1)
-    };
-    update_session(
-        &scope,
-        &session.id,
-        if code == 0 {
-            LifecycleStatus::Done
+        let code = if let Some(managed_id) = managed {
+            let providers = provider::discover(config)?;
+            let request = serde_json::json!({
+                "version": "orc.provider/v1", "action": "launch", "scope": scope, "session": session,
+                "command": command, "managedId": managed_id,
+            });
+            let plan =
+                provider::resolve_plan(config, &providers, provider::Action::Launch, request)?;
+            let launch_guard =
+                TerminationGuard::acquire(&scope, &session.id, config.provider_timeout())?
+                    .context("managed session launch is changing lifecycle ownership")?;
+            let current = selected_session(&state::read(&scope)?, &session.id)?.clone();
+            if !current.status.active() || current.status == LifecycleStatus::Terminating {
+                bail!(
+                    "managed session was cancelled before launch: {}",
+                    session.id
+                );
+            }
+            provider::execute_inherited_plan_after_spawn(&plan, &scope, launch_guard, |child| {
+                wait_for_managed_launch(config, &providers, &scope, &session.id, child)
+            })?
         } else {
-            LifecycleStatus::Failed
-        },
-    )?;
+            let mut child = std::process::Command::new(&command[0]);
+            child
+                .args(&command[1..])
+                .current_dir(&scope)
+                .env("ORC_SCOPE", &scope)
+                .env("ORC_SESSION_ID", &session.id)
+                .env("ORC_NATIVE_SESSION_ID", &native_id);
+            if let Some(model) = &model {
+                child.env("ORC_MODEL", model);
+            }
+            child.status()?.code().unwrap_or(1)
+        };
+        Ok(code)
+    })();
+    let code = match result {
+        Ok(code) => code,
+        Err(error) => {
+            if let Err(cleanup_error) =
+                terminate(config, &scope, &session.id, "managed launch failed")
+            {
+                update_session(&scope, &session.id, LifecycleStatus::Failed)?;
+                return Err(
+                    error.context(format!("managed session cleanup failed: {cleanup_error:#}"))
+                );
+            }
+            return Err(error);
+        }
+    };
+    if code != 0 && supervised {
+        if let Err(cleanup_error) = terminate(config, &scope, &session.id, "managed launch failed")
+        {
+            update_session(&scope, &session.id, LifecycleStatus::Failed)?;
+            bail!("managed session cleanup failed after exit {code}: {cleanup_error:#}");
+        }
+    } else if supervised {
+        finalize_managed_launch(config, &scope, &session.id)?;
+    } else {
+        update_session(
+            &scope,
+            &session.id,
+            if code == 0 {
+                LifecycleStatus::Done
+            } else {
+                LifecycleStatus::Failed
+            },
+        )?;
+    }
     Ok(code)
+}
+
+fn finalize_managed_launch(config: &Config, scope: &Path, session_id: &str) -> Result<()> {
+    let _guard = TerminationGuard::acquire(scope, session_id, config.provider_timeout())?
+        .context("managed session completion is changing lifecycle ownership")?;
+    let session = selected_session(&state::read(scope)?, session_id)?.clone();
+    if !session.status.active() || session.status == LifecycleStatus::Terminating {
+        return Ok(());
+    }
+    let providers = provider::discover(config)?;
+    let bindings = provider::discover_bindings(config, &providers, scope, &session, false);
+    let still_active = bindings.iter().any(|binding| {
+        binding.status == BindingStatus::Active
+            && matches!(
+                binding.kind,
+                ProviderKind::Persistence | ProviderKind::Execution
+            )
+    });
+    state::update(scope, |workspace| {
+        let selected = workspace
+            .sessions
+            .iter_mut()
+            .find(|candidate| candidate.id == session_id)
+            .with_context(|| format!("unknown session: {session_id}"))?;
+        if selected.status != LifecycleStatus::Terminating {
+            apply_enrichment(selected, &bindings, None, None);
+            if !still_active {
+                selected.status = LifecycleStatus::Done;
+                selected.updated_at = Utc::now();
+            }
+        }
+        Ok(())
+    })
+}
+
+fn wait_for_managed_launch(
+    config: &Config,
+    providers: &[provider::Manifest],
+    scope: &Path,
+    session_id: &str,
+    child: &mut std::process::Child,
+) -> Result<()> {
+    let deadline = std::time::Instant::now()
+        .checked_add(config.provider_timeout())
+        .context("provider timeout exceeds the platform clock range")?;
+    loop {
+        let session = selected_session(&state::read(scope)?, session_id)?.clone();
+        if !session.status.active() || session.status == LifecycleStatus::Terminating {
+            bail!("managed session was cancelled during launch: {session_id}");
+        }
+        let bindings = provider::discover_bindings(config, providers, scope, &session, false);
+        if bindings.iter().any(|binding| {
+            binding.status == BindingStatus::Active
+                && matches!(
+                    binding.kind,
+                    ProviderKind::Persistence | ProviderKind::Execution
+                )
+        }) {
+            state::update(scope, |workspace| {
+                let selected = workspace
+                    .sessions
+                    .iter_mut()
+                    .find(|candidate| candidate.id == session_id)
+                    .with_context(|| format!("unknown session: {session_id}"))?;
+                apply_enrichment(selected, &bindings, None, None);
+                Ok(())
+            })?;
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()?
+            && !status.success()
+        {
+            bail!("managed launch exited before becoming ready: {status}");
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("managed session did not become ready before the provider timeout");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
 
 pub fn require_id(id: Option<String>) -> Result<String> {
@@ -963,11 +1710,93 @@ pub fn ensure_active_context(scope: &Path) -> Result<(WorkspaceState, Session)> 
     Ok((state, session))
 }
 
+pub fn require_supervisor_control(scope: &Path) -> Result<()> {
+    if env::var_os("ORC_SESSION_ID").is_none() {
+        return Ok(());
+    }
+    let (_, current) = ensure_active_context(scope)?;
+    if current.role != SessionRole::Orchestrator {
+        bail!("only the orchestrator or an external operator can change managed lifecycle state");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::domain::{BindingStatus, ProviderBinding, ProviderKind};
+    use crate::{
+        domain::{BindingStatus, ProviderBinding, ProviderKind},
+        test_support::render_fixture,
+    };
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    const LAUNCH_RACE_PROVIDER: &str = r#"#!/bin/sh
+request=$(cat)
+case "$request" in
+  *session.launch*)
+    : > '{{ resolving }}'
+    while [ ! -e '{{ release }}' ]; do sleep 0.01; done
+    cat <<'JSON'
+{"version":"orc.provider/v1","command":["/usr/bin/touch","{{ launched }}"]}
+JSON
+    ;;
+  *session.stop*)
+    cat <<'JSON'
+{"version":"orc.provider/v1","command":["/usr/bin/true"]}
+JSON
+    ;;
+  *) printf '%s\n' 'null' ;;
+esac
+"#;
+
+    const READY_LAUNCHER: &str = r#"#!/bin/sh
+: > '{{ spawned }}'
+while [ ! -e '{{ release }}' ]; do sleep 0.01; done
+: > '{{ resource }}'
+"#;
+
+    const READY_PROVIDER: &str = r#"#!/bin/sh
+request=$(cat)
+case "$request" in
+  *session.launch*)
+    cat <<'JSON'
+{"version":"orc.provider/v1","command":["{{ launcher }}"]}
+JSON
+    ;;
+  *execution.run*)
+    cat <<'JSON'
+{"version":"orc.provider/v1","command":["{{ launcher }}"]}
+JSON
+    ;;
+  *session.bind*)
+    if [ -e '{{ resource }}' ]; then
+      cat <<'JSON'
+{"version":"orc.provider/v1","binding": {"kind":"persistence","status":"active","ref":"ready"}}
+JSON
+    else
+      cat <<'JSON'
+{"version":"orc.provider/v1","status":"declined","reason":"not ready"}
+JSON
+    fi
+    ;;
+  *session.stop*)
+    cat <<'JSON'
+{"version":"orc.provider/v1","command":["/bin/sh","-c","rm -f '{{ resource }}' && touch '{{ stopped }}'"]}
+JSON
+    ;;
+  *) printf '%s\n' 'null' ;;
+esac
+"#;
+
+    const PROVIDER_MANIFEST: &str = r#"version: orc.provider/v1
+name: {{ name }}
+command: {{ command }}
+actions:
+{% for action in actions %}  {{ action.capability }}: {{ action.description }}
+{% endfor %}
+"#;
 
     fn session(id: &str, role: SessionRole, status: LifecycleStatus) -> Session {
         Session {
@@ -992,6 +1821,13 @@ mod tests {
             directory: "/tmp".into(),
             registration: RegistrationSource::Connected,
             status,
+            runtime_timeout_seconds: None,
+            idle_timeout_seconds: None,
+            heartbeat_at: Some(Utc::now()),
+            termination_reason: None,
+            termination_cause: None,
+            termination_attempt_at: None,
+            termination_operation_id: None,
             connected_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -1009,9 +1845,891 @@ mod tests {
 
     #[test]
     fn inferred_id_is_short_and_stable() {
-        let id = inferred_session_id("codex", "abc");
-        assert_eq!(id, inferred_session_id("codex", "abc"));
+        let id = inferred_session_id("agent", "abc");
+        assert_eq!(id, inferred_session_id("agent", "abc"));
         assert_eq!(id.len(), 18);
+    }
+
+    #[test]
+    fn keepalive_renews_idle_lease_without_resetting_runtime() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let linked = register(
+            &scope,
+            Contract {
+                harness: "original-harness".into(),
+                model: Some("original-model".into()),
+                role: SessionRole::Worker,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some(format!("worker-{}", Uuid::new_v4())),
+                native_id: Some(Uuid::new_v4().to_string()),
+                run_id: Some("run".into()),
+                runtime_timeout_seconds: Some(7200),
+                idle_timeout_seconds: Some(300),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect("managed session");
+        let original_connected_at = linked.connected_at;
+        let old_heartbeat = original_connected_at - chrono::Duration::hours(1);
+        state::update(&scope, |workspace| {
+            workspace.sessions[0].heartbeat_at = Some(old_heartbeat);
+            Ok(())
+        })
+        .expect("age heartbeat");
+
+        let renewed = keepalive(&scope, &linked.id).expect("renew managed session");
+
+        assert_eq!(renewed.connected_at, original_connected_at);
+        assert!(renewed.heartbeat_at.is_some_and(|at| at > old_heartbeat));
+        assert_eq!(renewed.runtime_timeout_seconds, Some(7200));
+        assert_eq!(renewed.idle_timeout_seconds, Some(300));
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn keepalive_preserves_failed_termination_identity() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let linked = register(
+            &scope,
+            Contract {
+                role: SessionRole::Worker,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some(format!("worker-{}", Uuid::new_v4())),
+                native_id: Some(Uuid::new_v4().to_string()),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect("managed session");
+        let attempt_at = Utc::now() - chrono::Duration::seconds(5);
+        state::update(&scope, |workspace| {
+            let session = workspace.sessions.first_mut().expect("managed session");
+            session.termination_reason = Some("termination failed: unavailable".into());
+            session.termination_cause = Some("runtime timeout exceeded".into());
+            session.termination_attempt_at = Some(attempt_at);
+            session.termination_operation_id = Some("stable-operation".into());
+            Ok(())
+        })
+        .expect("record failed termination");
+
+        let renewed = keepalive(&scope, &linked.id).expect("renew managed session");
+
+        assert_eq!(
+            renewed.termination_reason.as_deref(),
+            Some("termination failed: unavailable")
+        );
+        assert_eq!(
+            renewed.termination_cause.as_deref(),
+            Some("runtime timeout exceeded")
+        );
+        assert_eq!(renewed.termination_attempt_at, Some(attempt_at));
+        assert_eq!(
+            renewed.termination_operation_id.as_deref(),
+            Some("stable-operation")
+        );
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn managed_orchestrator_can_renew_its_idle_lease() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let linked = register(
+            &scope,
+            Contract {
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some(format!("orchestrator-{}", Uuid::new_v4())),
+                native_id: Some(Uuid::new_v4().to_string()),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect("managed orchestrator");
+
+        let renewed = keepalive(&scope, &linked.id).expect("renew orchestrator lease");
+
+        assert!(renewed.heartbeat_at >= linked.heartbeat_at);
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn archive_and_reconciliation_preserve_a_termination_claim() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let linked = register(
+            &scope,
+            Contract::default(),
+            SessionLink {
+                id: Some(format!("worker-{}", Uuid::new_v4())),
+                native_id: Some(Uuid::new_v4().to_string()),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect("managed session");
+        state::update(&scope, |workspace| {
+            let selected = workspace
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == linked.id)
+                .expect("session");
+            selected.status = LifecycleStatus::Terminating;
+            selected.termination_reason = Some("termination pending operation".into());
+            selected.providers = vec![binding(
+                "persistence",
+                ProviderKind::Persistence,
+                BindingStatus::Active,
+            )];
+            Ok(())
+        })
+        .expect("claim termination");
+
+        archive(&scope, Some(&linked.id), None).expect_err("archive must reject termination");
+        state::update(&scope, |workspace| {
+            let selected = workspace
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == linked.id)
+                .expect("session");
+            apply_enrichment(selected, &[], None, None);
+            Ok(())
+        })
+        .expect("reconcile terminating session");
+
+        let workspace = state::read(&scope).expect("workspace");
+        let selected = selected_session(&workspace, &linked.id).expect("session");
+        assert_eq!(selected.status, LifecycleStatus::Terminating);
+        assert_eq!(
+            selected.termination_reason.as_deref(),
+            Some("termination pending operation")
+        );
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_launch_does_not_start_after_concurrent_termination() {
+        let directory = tempfile::tempdir().expect("launch fixture");
+        let scope_directory = directory.path().join("scope");
+        let provider_directory = directory.path().join("providers");
+        fs::create_dir_all(&scope_directory).expect("scope");
+        fs::create_dir_all(&provider_directory).expect("providers");
+        let scope = fs::canonicalize(scope_directory).expect("canonical scope");
+        let provider = directory.path().join("provider.sh");
+        let resolving = directory.path().join("resolving");
+        let release = directory.path().join("release");
+        let launched = directory.path().join("launched");
+        fs::write(
+            &provider,
+            render_fixture(
+                LAUNCH_RACE_PROVIDER,
+                serde_json::json!({
+                    "resolving": resolving.display().to_string(),
+                    "release": release.display().to_string(),
+                    "launched": launched.display().to_string(),
+                }),
+            ),
+        )
+        .expect("provider script");
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o755))
+            .expect("provider executable");
+        fs::write(
+            provider_directory.join("provider.yaml"),
+            render_fixture(
+                PROVIDER_MANIFEST,
+                serde_json::json!({
+                    "name": "launch-race",
+                    "command": provider.display().to_string(),
+                    "actions": [
+                        {
+                            "capability": "session.launch",
+                            "description": "Launch a session",
+                        },
+                        {
+                            "capability": "session.stop",
+                            "description": "Stop a session",
+                        },
+                    ],
+                }),
+            ),
+        )
+        .expect("provider manifest");
+        let mut config = Config::default();
+        config.providers.directory = provider_directory;
+        let worker_config = config.clone();
+        let worker_scope = scope.clone();
+        let worker = std::thread::spawn(move || {
+            launch(
+                &worker_config,
+                &worker_scope,
+                "test-harness".into(),
+                None,
+                Some("persistent".into()),
+                SessionLease::default(),
+                Vec::new(),
+            )
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !resolving.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launch resolution did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let session_id = state::read(&scope)
+            .expect("workspace")
+            .sessions
+            .first()
+            .expect("managed session")
+            .id
+            .clone();
+
+        terminate(&config, &scope, &session_id, "test cancellation")
+            .expect("terminate managed session");
+        fs::write(&release, []).expect("release launch provider");
+        worker
+            .join()
+            .expect("launch thread")
+            .expect_err("cancelled launch must fail");
+
+        assert!(!launched.exists());
+        let _ = fs::remove_file(state::path(&scope));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_launch_is_not_cancellable_before_its_resource_is_ready() {
+        let directory = tempfile::tempdir().expect("launch fixture");
+        let scope_directory = directory.path().join("scope");
+        let provider_directory = directory.path().join("providers");
+        fs::create_dir_all(&scope_directory).expect("scope");
+        fs::create_dir_all(&provider_directory).expect("providers");
+        let scope = fs::canonicalize(scope_directory).expect("canonical scope");
+        let provider = directory.path().join("provider.sh");
+        let launcher = directory.path().join("launcher.sh");
+        let spawned = directory.path().join("spawned");
+        let release = directory.path().join("release");
+        let resource = directory.path().join("resource");
+        let stopped = directory.path().join("stopped");
+        fs::write(
+            &launcher,
+            render_fixture(
+                READY_LAUNCHER,
+                serde_json::json!({
+                    "spawned": spawned.display().to_string(),
+                    "release": release.display().to_string(),
+                    "resource": resource.display().to_string(),
+                }),
+            ),
+        )
+        .expect("launcher script");
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755))
+            .expect("launcher executable");
+        fs::write(
+            &provider,
+            render_fixture(
+                READY_PROVIDER,
+                serde_json::json!({
+                    "launcher": launcher.display().to_string(),
+                    "resource": resource.display().to_string(),
+                    "stopped": stopped.display().to_string(),
+                }),
+            ),
+        )
+        .expect("provider script");
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o755))
+            .expect("provider executable");
+        fs::write(
+            provider_directory.join("provider.yaml"),
+            render_fixture(
+                PROVIDER_MANIFEST,
+                serde_json::json!({
+                    "name": "launch-ready",
+                    "command": provider.display().to_string(),
+                    "actions": [
+                        {
+                            "capability": "execution.run",
+                            "description": "Execute a launch plan",
+                        },
+                        {
+                            "capability": "session.bind",
+                            "description": "Inspect a session",
+                        },
+                        {
+                            "capability": "session.launch",
+                            "description": "Launch a session",
+                        },
+                        {
+                            "capability": "session.stop",
+                            "description": "Stop a session",
+                        },
+                    ],
+                }),
+            ),
+        )
+        .expect("provider manifest");
+        let mut config = Config::default();
+        config.providers.directory = provider_directory;
+        let worker_config = config.clone();
+        let worker_scope = scope.clone();
+        let launch_worker = std::thread::spawn(move || {
+            launch(
+                &worker_config,
+                &worker_scope,
+                "test-harness".into(),
+                None,
+                Some("persistent".into()),
+                SessionLease::default(),
+                Vec::new(),
+            )
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !spawned.exists() {
+            if launch_worker.is_finished() {
+                let result = launch_worker.join().expect("launch thread");
+                panic!("managed launch exited before spawning: {result:?}");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "managed launch command did not spawn"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let session_id = state::read(&scope)
+            .expect("workspace")
+            .sessions
+            .first()
+            .expect("managed session")
+            .id
+            .clone();
+        let stop_config = config.clone();
+        let stop_scope = scope.clone();
+        let stop_id = session_id.clone();
+        let stop_worker = std::thread::spawn(move || {
+            terminate(&stop_config, &stop_scope, &stop_id, "test cancellation")
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!stopped.exists(), "stop cannot run before launch readiness");
+
+        fs::write(&release, []).expect("release managed resource");
+        let _ = launch_worker.join().expect("launch thread");
+        let terminated = stop_worker
+            .join()
+            .expect("stop thread")
+            .expect("terminate managed session");
+
+        assert_eq!(terminated.status, LifecycleStatus::Cancelled);
+        assert!(stopped.exists());
+        assert!(!resource.exists());
+        let _ = fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn reregistration_cannot_weaken_a_managed_session_lease() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let linked = register(
+            &scope,
+            Contract {
+                harness: "original-harness".into(),
+                model: Some("original-model".into()),
+                role: SessionRole::Worker,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some(format!("worker-{}", Uuid::new_v4())),
+                native_id: Some(Uuid::new_v4().to_string()),
+                run_id: Some("run".into()),
+                provider_ref: Some("managed-a".into()),
+                runtime_timeout_seconds: Some(3600),
+                idle_timeout_seconds: Some(300),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect("managed session");
+
+        let reregistered = register(
+            &scope,
+            Contract {
+                harness: "replacement-harness".into(),
+                model: Some("replacement-model".into()),
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some(linked.id.clone()),
+                native_id: Some("native-b".into()),
+                provider_ref: Some("managed-b".into()),
+                runtime_timeout_seconds: Some(0),
+                idle_timeout_seconds: Some(0),
+                source: RegistrationSource::Connected,
+                ..SessionLink::default()
+            },
+        )
+        .expect("repeat registration");
+
+        assert_eq!(reregistered.role, SessionRole::Worker);
+        assert_eq!(reregistered.harness, "original-harness");
+        assert_eq!(reregistered.model.as_deref(), Some("original-model"));
+        assert_eq!(reregistered.registration, RegistrationSource::Managed);
+        assert_eq!(reregistered.runtime_timeout_seconds, Some(3600));
+        assert_eq!(reregistered.idle_timeout_seconds, Some(300));
+        assert_eq!(reregistered.run_id.as_deref(), Some("run"));
+        assert_eq!(reregistered.native_id, linked.native_id);
+        assert_eq!(reregistered.provider_ref.as_deref(), Some("managed-a"));
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn managed_child_cannot_create_an_orchestrator_registration() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let orchestrator = register(
+            &scope,
+            Contract {
+                harness: "root-harness".into(),
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some("root".into()),
+                native_id: Some("root-native".into()),
+                source: RegistrationSource::Connected,
+                ..SessionLink::default()
+            },
+        )
+        .expect("orchestrator");
+        let worker = register(
+            &scope,
+            Contract {
+                harness: "child-harness".into(),
+                role: SessionRole::Worker,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some("worker".into()),
+                native_id: Some("worker-native".into()),
+                parent_id: Some(orchestrator.id),
+                run_id: Some("run".into()),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect("managed worker");
+        let mut forged = Contract {
+            harness: "forged-harness".into(),
+            role: SessionRole::Orchestrator,
+            ..Contract::default()
+        };
+
+        let error = register_for_caller(
+            &scope,
+            &mut forged,
+            SessionLink {
+                id: Some("forged-root".into()),
+                native_id: Some("forged-native".into()),
+                source: RegistrationSource::Connected,
+                ..SessionLink::default()
+            },
+            Some(&worker.id),
+        )
+        .expect_err("managed child registration must fail");
+
+        assert!(error.to_string().contains("only refresh its own"));
+        assert!(
+            read_workspace(&scope)
+                .expect("workspace")
+                .sessions
+                .iter()
+                .all(|session| session.id != "forged-root")
+        );
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn orchestrator_child_registration_uses_a_distinct_session() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let orchestrator = register(
+            &scope,
+            Contract {
+                harness: "root-harness".into(),
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some("root".into()),
+                native_id: Some("root-native".into()),
+                source: RegistrationSource::Connected,
+                ..SessionLink::default()
+            },
+        )
+        .expect("orchestrator");
+        let mut child_contract = Contract {
+            harness: "child-harness".into(),
+            role: SessionRole::Implementer,
+            ..Contract::default()
+        };
+
+        let child = register_for_caller(
+            &scope,
+            &mut child_contract,
+            SessionLink {
+                native_id: Some("child-native".into()),
+                parent_id: Some(orchestrator.id.clone()),
+                run_id: Some("run".into()),
+                node_id: Some("implement".into()),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+            Some(&orchestrator.id),
+        )
+        .expect("managed child");
+
+        assert_ne!(child.id, orchestrator.id);
+        assert_eq!(child.parent_id.as_deref(), Some(orchestrator.id.as_str()));
+        let workspace = read_workspace(&scope).expect("workspace");
+        assert!(workspace.sessions.iter().any(|session| {
+            session.id == orchestrator.id && session.role == SessionRole::Orchestrator
+        }));
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn connected_worker_cannot_promote_its_own_registration() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let worker = register(
+            &scope,
+            Contract {
+                harness: "worker-harness".into(),
+                role: SessionRole::Worker,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some("worker".into()),
+                native_id: Some("worker-native".into()),
+                parent_id: Some("root".into()),
+                source: RegistrationSource::Connected,
+                ..SessionLink::default()
+            },
+        )
+        .expect("worker");
+        let mut forged = Contract {
+            harness: "replacement".into(),
+            role: SessionRole::Orchestrator,
+            ..Contract::default()
+        };
+
+        let refreshed = register_for_caller(
+            &scope,
+            &mut forged,
+            SessionLink {
+                id: Some(worker.id.clone()),
+                native_id: Some("other-native".into()),
+                source: RegistrationSource::Connected,
+                ..SessionLink::default()
+            },
+            Some(&worker.id),
+        )
+        .expect("refresh worker");
+
+        assert_eq!(refreshed.role, SessionRole::Worker);
+        assert_eq!(refreshed.harness, "worker-harness");
+        assert_eq!(refreshed.native_id, "worker-native");
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn stale_expiration_cannot_stop_a_renewed_session() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let linked = register(
+            &scope,
+            Contract {
+                role: SessionRole::Worker,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some(format!("worker-{}", Uuid::new_v4())),
+                native_id: Some(Uuid::new_v4().to_string()),
+                run_id: Some("run".into()),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect("managed session");
+        let observed_heartbeat = linked.heartbeat_at;
+        let renewed = keepalive(&scope, &linked.id).expect("renew lease");
+        let mut config = Config::default();
+        config.providers.directory = directory.path().join("providers");
+
+        let result = terminate_expired(
+            &config,
+            &scope,
+            &linked.id,
+            "idle timeout exceeded",
+            Some(observed_heartbeat),
+            None,
+        )
+        .expect("stale expiration is ignored");
+
+        assert_eq!(result.status, LifecycleStatus::Working);
+        assert_eq!(result.heartbeat_at, renewed.heartbeat_at);
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn hard_expiration_is_not_cancelled_by_a_new_heartbeat() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let linked = register(
+            &scope,
+            Contract {
+                role: SessionRole::Worker,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some(format!("worker-{}", Uuid::new_v4())),
+                native_id: Some(Uuid::new_v4().to_string()),
+                run_id: Some("run".into()),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect("managed session");
+        keepalive(&scope, &linked.id).expect("new heartbeat");
+        let mut config = Config::default();
+        config.providers.directory = directory.path().join("providers");
+
+        terminate_expired(
+            &config,
+            &scope,
+            &linked.id,
+            "runtime timeout exceeded",
+            None,
+            None,
+        )
+        .expect_err("hard expiration must attempt termination");
+
+        let session = read_workspace(&scope)
+            .expect("workspace")
+            .sessions
+            .into_iter()
+            .find(|session| session.id == linked.id)
+            .expect("managed session");
+        assert!(
+            session
+                .termination_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("termination failed:"))
+        );
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn failed_provider_stop_releases_the_termination_claim() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let linked = register(
+            &scope,
+            Contract {
+                role: SessionRole::Worker,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some(format!("worker-{}", Uuid::new_v4())),
+                native_id: Some(Uuid::new_v4().to_string()),
+                run_id: Some("run".into()),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect("managed session");
+        let mut config = Config::default();
+        config.providers.directory = directory.path().join("providers");
+
+        terminate(&config, &scope, &linked.id, "idle timeout exceeded")
+            .expect_err("missing stop provider");
+
+        let restored = read_workspace(&scope)
+            .expect("workspace")
+            .sessions
+            .into_iter()
+            .find(|session| session.id == linked.id)
+            .expect("restored session");
+        assert_eq!(restored.status, LifecycleStatus::Working);
+        assert!(
+            restored
+                .termination_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("termination failed:"))
+        );
+        assert_eq!(
+            restored.termination_cause.as_deref(),
+            Some("idle timeout exceeded")
+        );
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn lifecycle_update_cannot_override_a_termination_claim() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let linked = register(
+            &scope,
+            Contract {
+                role: SessionRole::Worker,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some(format!("worker-{}", Uuid::new_v4())),
+                native_id: Some(Uuid::new_v4().to_string()),
+                run_id: Some("run".into()),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect("managed session");
+        state::update(&scope, |workspace| {
+            let session = workspace
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == linked.id)
+                .expect("registered session");
+            session.status = LifecycleStatus::Cancelled;
+            session.termination_reason = Some(format!("termination pending {}", Uuid::new_v4()));
+            Ok(())
+        })
+        .expect("claim termination");
+
+        let error = update_session(&scope, &linked.id, LifecycleStatus::Done)
+            .expect_err("termination claim must be exclusive");
+
+        assert!(error.to_string().contains("termination is in progress"));
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn lifecycle_update_cannot_overwrite_a_completed_termination() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let linked = register(
+            &scope,
+            Contract {
+                role: SessionRole::Worker,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some(format!("worker-{}", Uuid::new_v4())),
+                native_id: Some(Uuid::new_v4().to_string()),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect("managed session");
+        state::update(&scope, |workspace| {
+            let session = workspace
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == linked.id)
+                .expect("registered session");
+            session.status = LifecycleStatus::Cancelled;
+            session.termination_reason = Some("runtime timeout exceeded".into());
+            Ok(())
+        })
+        .expect("complete termination");
+
+        let error = update_session(&scope, &linked.id, LifecycleStatus::Done)
+            .expect_err("completed termination must remain terminal");
+
+        assert!(error.to_string().contains("was terminated"));
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn interrupted_termination_reuses_its_provider_operation_id() {
+        let first = termination_operation_id(None, None);
+        let claim = format!("termination pending {first}");
+
+        assert_eq!(termination_operation_id(Some(&claim), None), first);
+        assert_eq!(termination_operation_id(None, Some(&first)), first);
+    }
+
+    #[test]
+    fn termination_claim_lock_distinguishes_live_and_interrupted_work() {
+        let directory = tempfile::tempdir().expect("termination scope");
+        let scope = directory.path();
+        let session_id = "worker";
+        let operation_id = Uuid::new_v4().to_string();
+        let claim = format!("termination pending {operation_id}");
+        let guard = TerminationGuard::acquire(scope, session_id, std::time::Duration::ZERO)
+            .expect("termination lock")
+            .expect("unclaimed operation");
+
+        assert!(termination_claim_active(scope, session_id, &claim).expect("active claim"));
+        drop(guard);
+        assert!(!termination_claim_active(scope, session_id, &claim).expect("released claim"));
+    }
+
+    #[test]
+    fn termination_locks_use_independent_full_digests() {
+        let scope = Path::new("/tmp/orc-termination-shards");
+        let paths = (0..1024)
+            .map(|index| termination_lock_path(scope, &format!("session-{index}")))
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(paths.len(), 1024);
+        assert!(paths.iter().all(|path| {
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.len() == 64)
+        }));
+    }
+
+    #[test]
+    fn termination_lock_is_removed_after_release() {
+        let directory = tempfile::tempdir().expect("termination scope");
+        let path = termination_lock_path(directory.path(), "worker");
+        let guard =
+            TerminationGuard::acquire(directory.path(), "worker", std::time::Duration::ZERO)
+                .expect("termination lock")
+                .expect("unclaimed operation");
+
+        assert!(path.exists());
+        drop(guard);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn direct_launch_rejects_unenforceable_timeouts() {
+        let error = launch(
+            &Config::default(),
+            Path::new("."),
+            "true".into(),
+            None,
+            None,
+            SessionLease {
+                runtime_timeout_seconds: Some(1),
+                idle_timeout_seconds: None,
+            },
+            Vec::new(),
+        )
+        .expect_err("direct launch cannot enforce a lease");
+
+        assert!(error.to_string().contains("require --managed"));
     }
 
     #[test]
@@ -1176,11 +2894,15 @@ mod tests {
             LifecycleStatus::Working,
         );
         selected.providers = vec![binding(
-            "zmx",
+            "persistence-a",
             ProviderKind::Persistence,
             BindingStatus::Active,
         )];
-        let unavailable = binding("zmx", ProviderKind::Persistence, BindingStatus::Unavailable);
+        let unavailable = binding(
+            "persistence-a",
+            ProviderKind::Persistence,
+            BindingStatus::Unavailable,
+        );
 
         apply_enrichment(&mut selected, &[unavailable], None, None);
 
@@ -1195,7 +2917,7 @@ mod tests {
             LifecycleStatus::Working,
         );
         selected.providers = vec![binding(
-            "wezterm",
+            "display-a",
             ProviderKind::Display,
             BindingStatus::Active,
         )];
@@ -1213,10 +2935,14 @@ mod tests {
             LifecycleStatus::Working,
         );
         selected.providers = vec![
-            binding("zmx", ProviderKind::Persistence, BindingStatus::Active),
-            binding("wezterm", ProviderKind::Display, BindingStatus::Active),
+            binding(
+                "persistence-a",
+                ProviderKind::Persistence,
+                BindingStatus::Active,
+            ),
+            binding("display-a", ProviderKind::Display, BindingStatus::Active),
         ];
-        let remaining_display = binding("wezterm", ProviderKind::Display, BindingStatus::Active);
+        let remaining_display = binding("display-a", ProviderKind::Display, BindingStatus::Active);
 
         apply_enrichment(&mut selected, &[remaining_display], None, None);
 
@@ -1231,11 +2957,15 @@ mod tests {
             LifecycleStatus::Disconnected,
         );
         selected.providers = vec![binding(
-            "zmx",
+            "persistence-a",
             ProviderKind::Persistence,
             BindingStatus::Unavailable,
         )];
-        let live = binding("zmx", ProviderKind::Persistence, BindingStatus::Active);
+        let live = binding(
+            "persistence-a",
+            ProviderKind::Persistence,
+            BindingStatus::Active,
+        );
 
         apply_enrichment(&mut selected, &[live], None, None);
 
@@ -1250,7 +2980,11 @@ mod tests {
             LifecycleStatus::Working,
         );
         selected.updated_at = chrono::DateTime::UNIX_EPOCH;
-        let live = binding("zmx", ProviderKind::Persistence, BindingStatus::Active);
+        let live = binding(
+            "persistence-a",
+            ProviderKind::Persistence,
+            BindingStatus::Active,
+        );
         selected.providers = vec![live.clone()];
 
         apply_enrichment(&mut selected, &[live], None, None);
@@ -1279,7 +3013,7 @@ mod tests {
         let mut selected = session("session", SessionRole::Verifier, LifecycleStatus::Done);
         selected.updated_at = chrono::DateTime::UNIX_EPOCH;
         selected.providers = vec![binding(
-            "wezterm",
+            "display-a",
             ProviderKind::Display,
             BindingStatus::Active,
         )];

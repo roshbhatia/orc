@@ -1,4 +1,8 @@
-use std::{env, fs, path::PathBuf, time::Duration};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[cfg(test)]
 use std::sync::OnceLock;
@@ -11,9 +15,47 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Config {
     pub cache: CacheConfig,
+    pub daemon: DaemonConfig,
+    pub lifecycle: LifecycleConfig,
     pub providers: ProviderConfig,
     pub workflows: WorkflowConfig,
     pub ui: UiConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DaemonConfig {
+    pub autostart: bool,
+    pub scan_interval_ms: u64,
+    pub idle_shutdown_seconds: u64,
+    pub termination_retry_seconds: u64,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            autostart: true,
+            scan_interval_ms: 5_000,
+            idle_shutdown_seconds: 60,
+            termination_retry_seconds: 60,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct LifecycleConfig {
+    pub runtime_timeout_seconds: u64,
+    pub idle_timeout_seconds: u64,
+}
+
+impl Default for LifecycleConfig {
+    fn default() -> Self {
+        Self {
+            runtime_timeout_seconds: 28_800,
+            idle_timeout_seconds: 1_800,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
@@ -96,6 +138,18 @@ pub fn data_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".local/share"))
 }
 
+#[cfg(not(test))]
+fn data_dirs() -> Vec<PathBuf> {
+    env::var_os("XDG_DATA_DIRS")
+        .map(|value| env::split_paths(&value).collect())
+        .unwrap_or_else(|| {
+            vec![
+                PathBuf::from("/usr/local/share"),
+                PathBuf::from("/usr/share"),
+            ]
+        })
+}
+
 pub fn state_home() -> PathBuf {
     #[cfg(test)]
     {
@@ -114,9 +168,11 @@ pub fn state_home() -> PathBuf {
 }
 
 pub fn path() -> PathBuf {
-    env::var_os("ORC_CONFIG")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| config_home().join("orc/config.yaml"))
+    expand_home(
+        env::var_os("ORC_CONFIG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| config_home().join("orc/config.yaml")),
+    )
 }
 
 pub fn load() -> Result<Config> {
@@ -139,6 +195,30 @@ pub fn load() -> Result<Config> {
     if let Ok(value) = env::var("ORC_CACHE_PROVIDER_TTL_MS") {
         config.cache.provider_ttl_ms = value.parse().context("parse provider cache TTL")?;
     }
+    if let Ok(value) = env::var("ORC_DAEMON_AUTOSTART") {
+        config.daemon.autostart = parse_bool(&value, "daemon autostart")?;
+    }
+    if let Ok(value) = env::var("ORC_DAEMON_SCAN_INTERVAL_MS") {
+        config.daemon.scan_interval_ms = value.parse().context("parse daemon scan interval")?;
+    }
+    if let Ok(value) = env::var("ORC_DAEMON_IDLE_SHUTDOWN_SECONDS") {
+        config.daemon.idle_shutdown_seconds = value
+            .parse()
+            .context("parse daemon idle shutdown timeout")?;
+    }
+    if let Ok(value) = env::var("ORC_DAEMON_TERMINATION_RETRY_SECONDS") {
+        config.daemon.termination_retry_seconds = value
+            .parse()
+            .context("parse daemon termination retry interval")?;
+    }
+    if let Ok(value) = env::var("ORC_LIFECYCLE_RUNTIME_TIMEOUT_SECONDS") {
+        config.lifecycle.runtime_timeout_seconds =
+            value.parse().context("parse lifecycle runtime timeout")?;
+    }
+    if let Ok(value) = env::var("ORC_LIFECYCLE_IDLE_TIMEOUT_SECONDS") {
+        config.lifecycle.idle_timeout_seconds =
+            value.parse().context("parse lifecycle idle timeout")?;
+    }
     if let Some(value) = env::var_os("ORC_WORKFLOWS_REPOSITORY") {
         config.workflows.repository = value.into();
     }
@@ -157,8 +237,16 @@ pub fn load() -> Result<Config> {
     if let Ok(value) = env::var("ORC_UI_INSPECTOR_PERCENT") {
         config.ui.inspector_percent = value.parse().context("parse UI inspector size")?;
     }
+    config.providers.directory = expand_home(config.providers.directory);
+    config.workflows.repository = expand_home(config.workflows.repository);
     if config.providers.timeout_ms == 0 {
         bail!("providers.timeoutMs must be positive");
+    }
+    if !(100..=3_600_000).contains(&config.daemon.scan_interval_ms) {
+        bail!("daemon.scanIntervalMs must be between 100 and 3600000");
+    }
+    if config.workflows.max_depth == 0 {
+        bail!("workflows.maxDepth must be positive");
     }
     if config.ui.refresh_ms < 50 {
         bail!("ui.refreshMs must be at least 50");
@@ -170,6 +258,18 @@ pub fn load() -> Result<Config> {
         bail!("ui.inspectorPercent must be between 20 and 80");
     }
     Ok(config)
+}
+
+fn expand_home(path: PathBuf) -> PathBuf {
+    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+        return path;
+    };
+    if path == Path::new("~") {
+        return home;
+    }
+    path.strip_prefix("~/")
+        .map(|suffix| home.join(suffix))
+        .unwrap_or(path)
 }
 
 fn parse_bool(value: &str, name: &str) -> Result<bool> {
@@ -184,10 +284,56 @@ impl Config {
     pub fn provider_timeout(&self) -> Duration {
         Duration::from_millis(self.providers.timeout_ms)
     }
+
+    pub fn provider_directories(&self) -> Vec<PathBuf> {
+        #[cfg(test)]
+        {
+            vec![self.providers.directory.clone()]
+        }
+        #[cfg(not(test))]
+        {
+            provider_search_directories(&self.providers.directory, &data_home(), data_dirs().iter())
+        }
+    }
 }
 
 pub fn schema() -> serde_json::Value {
-    serde_json::to_value(schema_for!(Config)).expect("config schema serializes")
+    let mut schema = serde_json::to_value(schema_for!(Config)).expect("config schema serializes");
+    for pointer in [
+        "/$defs/ProviderConfig/properties/directory/default",
+        "/properties/providers/default/directory",
+    ] {
+        *schema
+            .pointer_mut(pointer)
+            .expect("provider path default exists") =
+            serde_json::Value::String("~/.config/orc/providers".into());
+    }
+    for pointer in [
+        "/$defs/WorkflowConfig/properties/repository/default",
+        "/properties/workflows/default/repository",
+    ] {
+        *schema
+            .pointer_mut(pointer)
+            .expect("workflow path default exists") =
+            serde_json::Value::String("~/.local/share/orc/workflows".into());
+    }
+    schema
+}
+
+fn provider_search_directories<'a>(
+    configured: &Path,
+    user_data: &Path,
+    system_data: impl IntoIterator<Item = &'a PathBuf>,
+) -> Vec<PathBuf> {
+    let mut directories = vec![configured.to_path_buf(), user_data.join("orc/providers")];
+    directories.extend(
+        system_data
+            .into_iter()
+            .map(|directory| directory.join("orc/providers")),
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    directories.retain(|directory| seen.insert(directory.clone()));
+    directories
 }
 
 #[cfg(test)]
@@ -198,6 +344,56 @@ mod tests {
     fn defaults_are_valid() {
         let config = Config::default();
         assert!(config.providers.timeout_ms > 0);
+        assert!(config.daemon.autostart);
+        assert!(config.lifecycle.runtime_timeout_seconds > 0);
         assert!(config.workflows.max_depth > 0);
+    }
+
+    #[test]
+    fn provider_search_prefers_user_configuration_then_xdg_data() {
+        let system = [
+            PathBuf::from("/first/share"),
+            PathBuf::from("/second/share"),
+        ];
+
+        assert_eq!(
+            provider_search_directories(
+                Path::new("/config/orc/providers"),
+                Path::new("/user/share"),
+                system.iter(),
+            ),
+            vec![
+                PathBuf::from("/config/orc/providers"),
+                PathBuf::from("/user/share/orc/providers"),
+                PathBuf::from("/first/share/orc/providers"),
+                PathBuf::from("/second/share/orc/providers"),
+            ]
+        );
+    }
+
+    #[test]
+    fn generated_schema_uses_portable_default_paths() {
+        let schema = schema();
+
+        assert_eq!(
+            schema.pointer("/$defs/ProviderConfig/properties/directory/default"),
+            Some(&serde_json::Value::String("~/.config/orc/providers".into()))
+        );
+        assert_eq!(
+            schema.pointer("/$defs/WorkflowConfig/properties/repository/default"),
+            Some(&serde_json::Value::String(
+                "~/.local/share/orc/workflows".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn home_relative_paths_expand() {
+        let home = env::var_os("HOME").map(PathBuf::from).expect("HOME");
+
+        assert_eq!(
+            expand_home(PathBuf::from("~/providers")),
+            home.join("providers")
+        );
     }
 }

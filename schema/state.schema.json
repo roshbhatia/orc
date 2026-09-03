@@ -66,15 +66,18 @@
     },
     "LifecycleStatus": {
       "enum": [
+        "pending",
         "queued",
         "working",
+        "terminating",
         "waiting",
         "blocked",
         "failed",
         "done",
         "cancelled",
         "disconnected",
-        "archived"
+        "archived",
+        "skipped"
       ],
       "type": "string"
     },
@@ -185,8 +188,25 @@
         "harness": {
           "type": "string"
         },
+        "heartbeatAt": {
+          "default": null,
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "id": {
           "type": "string"
+        },
+        "idleTimeoutSeconds": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "model": {
           "type": [
@@ -243,6 +263,15 @@
             "null"
           ]
         },
+        "runtimeTimeoutSeconds": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "status": {
           "$ref": "#/$defs/LifecycleStatus"
         },
@@ -252,6 +281,35 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "terminationAttemptAt": {
+          "default": null,
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "terminationCause": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "terminationOperationId": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "terminationReason": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "title": {
           "type": "string"
@@ -333,6 +391,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "childRunId": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "completion": {
           "$ref": "#/$defs/CompletionTarget"
         },
@@ -388,6 +453,14 @@
         },
         "purpose": {
           "type": "string"
+        },
+        "retryAfter": {
+          "default": null,
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "reviewBy": {
           "type": [
@@ -493,6 +566,13 @@
           },
           "type": "array"
         },
+        "executionNonce": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "expectedOutput": {
           "type": "string"
         },
@@ -529,6 +609,13 @@
             "null"
           ]
         },
+        "parentRunId": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "pendingGates": {
           "default": [],
           "items": {
@@ -544,6 +631,10 @@
             "integer",
             "null"
           ]
+        },
+        "resumeRequested": {
+          "default": false,
+          "type": "boolean"
         },
         "revision": {
           "default": null,

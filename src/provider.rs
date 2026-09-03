@@ -1,10 +1,23 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    time::Instant,
+    process::{Child, Command, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError},
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+#[cfg(unix)]
+use std::os::{
+    fd::{AsRawFd, FromRawFd},
+    unix::net::UnixStream,
+    unix::process::CommandExt,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -21,8 +34,10 @@ use crate::{
 
 const MAX_ACTIVITY_BYTES: u64 = 256 * 1024;
 const MAX_ACTIVITY_LINES: usize = 100;
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PROVIDER_CACHE_ENTRIES: usize = 256;
 const MAX_PROVIDER_CACHE_ENTRY_BYTES: u64 = 1024 * 1024;
+const MAX_PROVIDER_OUTPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
@@ -165,6 +180,7 @@ pub struct Validation {
 pub enum Action {
     Activity,
     Attach,
+    Cancel,
     Changes,
     Execute,
     Focus,
@@ -183,8 +199,9 @@ impl Action {
                 (Capability::SessionPersist, true),
                 (Capability::TerminalOpen, false),
             ],
+            Self::Cancel => &[(Capability::ExecutionCancel, false)],
             Self::Changes => &[(Capability::ChangesInspect, false)],
-            Self::Execute => &[(Capability::ExecutionRun, false)],
+            Self::Execute => &[(Capability::ExecutionRun, true)],
             Self::Focus => &[(Capability::TerminalFocus, false)],
             Self::Inspect => &[
                 (Capability::SessionInspect, false),
@@ -204,6 +221,7 @@ impl Action {
         match self {
             Self::Activity => "activity",
             Self::Attach => "attach",
+            Self::Cancel => "cancel",
             Self::Changes => "changes",
             Self::Execute => "execute",
             Self::Focus => "focus",
@@ -230,7 +248,7 @@ pub fn resolve_activity_plan(
         for provider in candidates(providers, capability) {
             request["capability"] = Value::String(capability.to_string());
             request["plan"] = Value::Null;
-            match invoke_raw(provider, &request, config)
+            match invoke_raw(provider, &request, config, None)
                 .and_then(|value| parse_plan(provider, value))
             {
                 Ok(Some(plan)) => return Ok(plan),
@@ -253,35 +271,51 @@ pub fn schema() -> serde_json::Value {
 }
 
 pub fn discover(config: &Config) -> Result<Vec<Manifest>> {
-    let directory = &config.providers.directory;
-    if !directory.exists() {
-        return Ok(Vec::new());
-    }
-    let mut paths = Vec::new();
-    collect_manifest_paths(directory, &mut paths)?;
-    paths.sort();
+    discover_in(config.provider_directories())
+}
+
+fn discover_in(directories: impl IntoIterator<Item = PathBuf>) -> Result<Vec<Manifest>> {
     let mut providers = Vec::new();
     let mut names = BTreeSet::new();
-    for path in paths {
-        let source = fs::read_to_string(&path)?;
-        let provider: Manifest = if path.extension().and_then(|value| value.to_str())
-            == Some("json")
-        {
-            serde_json::from_str(&source).with_context(|| format!("parse {}", path.display()))?
-        } else {
-            serde_yaml::from_str(&source).with_context(|| format!("parse {}", path.display()))?
-        };
-        validate_manifest(&provider, &path)?;
-        if !names.insert(provider.name.clone()) {
-            bail!(
-                "{}: duplicate provider name {}",
-                path.display(),
-                provider.name
-            );
+    for directory in directories {
+        if !directory.exists() {
+            continue;
         }
-        providers.push(provider);
+        let mut paths = Vec::new();
+        collect_manifest_paths(&directory, &mut paths)?;
+        paths.sort();
+        let mut directory_names = BTreeSet::new();
+        for path in paths {
+            let provider = read_manifest(&path)?;
+            if !directory_names.insert(provider.name.clone()) {
+                bail!(
+                    "{}: duplicate provider name {} in {}",
+                    path.display(),
+                    provider.name,
+                    directory.display()
+                );
+            }
+            if names.insert(provider.name.clone()) {
+                providers.push(provider);
+            }
+        }
     }
     Ok(providers)
+}
+
+fn read_manifest(path: &Path) -> Result<Manifest> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() > MAX_MANIFEST_BYTES {
+        bail!("{}: provider manifest exceeds 1 MiB", path.display());
+    }
+    let source = fs::read_to_string(path)?;
+    let provider = if path.extension().and_then(|value| value.to_str()) == Some("json") {
+        serde_json::from_str(&source).with_context(|| format!("parse {}", path.display()))?
+    } else {
+        serde_yaml::from_str(&source).with_context(|| format!("parse {}", path.display()))?
+    };
+    validate_manifest(&provider, path)?;
+    Ok(provider)
 }
 
 fn collect_manifest_paths(directory: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
@@ -295,7 +329,8 @@ fn collect_manifest_paths(directory: &Path, paths: &mut Vec<PathBuf>) -> Result<
         } else if matches!(
             path.extension().and_then(|value| value.to_str()),
             Some("json" | "yaml" | "yml")
-        ) {
+        ) && fs::metadata(&path)?.is_file()
+        {
             paths.push(path);
         }
     }
@@ -334,16 +369,55 @@ fn candidates(providers: &[Manifest], capability: Capability) -> Vec<&Manifest> 
     selected
 }
 
-fn invoke_raw(provider: &Manifest, request: &Value, config: &Config) -> Result<Value> {
+fn candidates_for_request<'a>(
+    providers: &'a [Manifest],
+    capability: Capability,
+    request: &Value,
+) -> Vec<&'a Manifest> {
+    let selected = request
+        .get("providers")
+        .and_then(|providers| providers.get(capability.to_string()))
+        .and_then(Value::as_str);
+    candidates(providers, capability)
+        .into_iter()
+        .filter(|provider| selected.is_none_or(|name| provider.name == name))
+        .collect()
+}
+
+fn invoke_raw(
+    provider: &Manifest,
+    request: &Value,
+    config: &Config,
+    tracker_directory: Option<&Path>,
+) -> Result<Value> {
     let started = Instant::now();
-    let stdout = tempfile::NamedTempFile::new().context("create provider stdout buffer")?;
-    let stderr = tempfile::NamedTempFile::new().context("create provider stderr buffer")?;
-    let child = Command::new(&provider.command)
+    let payload = serde_json::to_vec(request)?;
+    let mut command = Command::new(&provider.command);
+    command
         .current_dir(request.get("scope").and_then(Value::as_str).unwrap_or("."))
         .stdin(Stdio::piped())
-        .stdout(Stdio::from(stdout.reopen()?))
-        .stderr(Stdio::from(stderr.reopen()?))
-        .spawn();
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let tracker_guard = tracker_directory
+        .map(|directory| ProcessTrackerGuard::acquire(directory, Duration::from_secs(5)))
+        .transpose()?;
+    let mut tracker = tracker_directory.map(ProcessTracker::prepare).transpose()?;
+    if let Some(tracker) = tracker.as_mut() {
+        tracker.start_monitor()?;
+    }
+    let mut process_group = if tracker.is_none() {
+        Some(ProcessGroup::start(None)?)
+    } else {
+        None
+    };
+    prepare_child(
+        &mut command,
+        tracker
+            .as_ref()
+            .and_then(ProcessTracker::group_id)
+            .or_else(|| process_group.as_ref().and_then(ProcessGroup::id)),
+    );
+    let child = command.spawn();
     let mut child = match child {
         Ok(child) => child,
         Err(error) => {
@@ -357,16 +431,26 @@ fn invoke_raw(provider: &Manifest, request: &Value, config: &Config) -> Result<V
             return Err(error).with_context(|| format!("start provider {}", provider.name));
         }
     };
-    child
-        .stdin
-        .take()
-        .context("provider stdin")?
-        .write_all(&serde_json::to_vec(request)?)?;
-    let status = match child.wait_timeout(config.provider_timeout())? {
+    drop(tracker_guard);
+    let stdout = drain_bounded(child.stdout.take().context("provider stdout")?);
+    let stderr = drain_bounded(child.stderr.take().context("provider stderr")?);
+    let stdin = child.stdin.take().context("provider stdin")?;
+    let input_cancel = Arc::new(AtomicBool::new(false));
+    let input_cancel_writer = Arc::clone(&input_cancel);
+    let (input_sender, input_receiver) = mpsc::channel();
+    let input = thread::spawn(move || {
+        let _ = input_sender.send(write_provider_input(stdin, &payload, &input_cancel_writer));
+    });
+    let timeout = config.provider_timeout().saturating_sub(started.elapsed());
+    let status = match child.wait_timeout(timeout)? {
         Some(status) => status,
         None => {
-            child.kill()?;
+            input_cancel.store(true, Ordering::Relaxed);
+            finish_process_control(&mut tracker, &mut process_group, tracker_directory)?;
             let _ = child.wait();
+            let _ = input.join();
+            discard_drain(stdout);
+            discard_drain(stderr);
             record_invocation(
                 provider,
                 request,
@@ -377,8 +461,48 @@ fn invoke_raw(provider: &Manifest, request: &Value, config: &Config) -> Result<V
             bail!("{} timed out", provider.name);
         }
     };
-    let stdout = String::from_utf8_lossy(&fs::read(stdout.path())?).into_owned();
-    let stderr = String::from_utf8_lossy(&fs::read(stderr.path())?).into_owned();
+    finish_process_control(&mut tracker, &mut process_group, tracker_directory)?;
+    let remaining = config.provider_timeout().saturating_sub(started.elapsed());
+    let input_result = input_receiver.recv_timeout(remaining);
+    if input_result.is_err() {
+        input_cancel.store(true, Ordering::Relaxed);
+        let _ = finish_process_control(&mut tracker, &mut process_group, tracker_directory);
+    }
+    let writer_panicked = input.join().is_err();
+    let input_failure = if writer_panicked {
+        Some("provider stdin writer panicked".to_owned())
+    } else {
+        match input_result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!("provider request failed: {error}")),
+            Err(RecvTimeoutError::Timeout) => {
+                Some("provider timed out while reading its request".into())
+            }
+            Err(RecvTimeoutError::Disconnected) => Some("provider request writer stopped".into()),
+        }
+    };
+    if let Some(message) = input_failure {
+        discard_drain(stdout);
+        discard_drain(stderr);
+        record_invocation(
+            provider,
+            request,
+            false,
+            started.elapsed().as_millis(),
+            &message,
+        );
+        bail!("{}: {message}", provider.name);
+    }
+    let stdout = finish_drain_with_timeout(
+        stdout,
+        config.provider_timeout().saturating_sub(started.elapsed()),
+    )
+    .with_context(|| format!("{} timed out draining stdout", provider.name))?;
+    let stderr = finish_drain_with_timeout(
+        stderr,
+        config.provider_timeout().saturating_sub(started.elapsed()),
+    )
+    .with_context(|| format!("{} timed out draining stderr", provider.name))?;
     record_invocation(
         provider,
         request,
@@ -399,6 +523,52 @@ fn invoke_raw(provider: &Manifest, request: &Value, config: &Config) -> Result<V
         .with_context(|| format!("{} returned invalid JSON", provider.name))
 }
 
+#[cfg(unix)]
+fn write_provider_input<W>(mut writer: W, payload: &[u8], cancel: &AtomicBool) -> io::Result<()>
+where
+    W: AsRawFd + Write,
+{
+    unsafe extern "C" {
+        fn fcntl(fd: i32, command: i32, argument: i32) -> i32;
+    }
+    const GET_FLAGS: i32 = 3;
+    const SET_FLAGS: i32 = 4;
+    #[cfg(target_os = "linux")]
+    const NONBLOCK: i32 = 0x0800;
+    #[cfg(not(target_os = "linux"))]
+    const NONBLOCK: i32 = 0x0004;
+    let flags = unsafe { fcntl(writer.as_raw_fd(), GET_FLAGS, 0) };
+    if flags < 0 || unsafe { fcntl(writer.as_raw_fd(), SET_FLAGS, flags | NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut written = 0;
+    while written < payload.len() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "provider request delivery cancelled",
+            ));
+        }
+        match writer.write(&payload[written..]) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(count) => written += count,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_provider_input<W>(mut writer: W, payload: &[u8], _cancel: &AtomicBool) -> io::Result<()>
+where
+    W: Write,
+{
+    writer.write_all(payload)
+}
+
 fn record_invocation(
     provider: &Manifest,
     request: &Value,
@@ -411,6 +581,9 @@ fn record_invocation(
         return;
     }
     let path = directory.join(format!("{}.jsonl", provider.name));
+    let Some(_guard) = ActivityLogGuard::acquire(&path) else {
+        return;
+    };
     compact_activity_log(&path);
     let message: String = stderr
         .lines()
@@ -436,6 +609,57 @@ fn record_invocation(
         return;
     };
     let _ = writeln!(file, "{line}");
+}
+
+struct ActivityLogGuard {
+    #[cfg(unix)]
+    file: File,
+}
+
+impl ActivityLogGuard {
+    fn acquire(path: &Path) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            let lock_path = path.with_file_name(format!(
+                ".{}.lock",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .ok()?;
+            unsafe extern "C" {
+                fn flock(fd: i32, operation: i32) -> i32;
+            }
+            const LOCK_EX: i32 = 2;
+            const LOCK_NB: i32 = 4;
+            if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+                return None;
+            }
+            Some(Self { file })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Some(Self {})
+        }
+    }
+}
+
+impl Drop for ActivityLogGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn flock(fd: i32, operation: i32) -> i32;
+            }
+            const LOCK_UN: i32 = 8;
+            let _ = unsafe { flock(self.file.as_raw_fd(), LOCK_UN) };
+        }
+    }
 }
 
 fn compact_activity_log(path: &Path) {
@@ -534,7 +758,7 @@ fn cache_path(provider: &Manifest, request: &Value) -> Result<PathBuf> {
 
 fn invoke_cached(provider: &Manifest, request: &Value, config: &Config) -> Result<Value> {
     if config.cache.provider_ttl_ms == 0 {
-        return invoke_raw(provider, request, config);
+        return invoke_raw(provider, request, config, None);
     }
     let path = cache_path(provider, request)?;
     let now = chrono::Utc::now().timestamp_millis();
@@ -545,7 +769,7 @@ fn invoke_cached(provider: &Manifest, request: &Value, config: &Config) -> Resul
     {
         return Ok(cached.value);
     }
-    let value = invoke_raw(provider, request, config)?;
+    let value = invoke_raw(provider, request, config, None)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -732,6 +956,7 @@ fn validation_action_request(provider: &Manifest, capability: Capability, scope:
             "successCodes": [0]
         },
         "rebindCurrent": false,
+        "operationId": "orc-provider-validation-operation",
         "session": {
             "id": "orc-provider-validation",
             "nativeId": "orc-provider-validation",
@@ -870,13 +1095,15 @@ pub fn validate_all(config: &Config, scope: &Path, name: Option<&str>) -> Result
                 message: "manifest is valid".into(),
             }];
             checks.extend(requirements_checks(&provider));
-            checks.extend(provider_checks(invoke_raw(&provider, &request, config)));
+            checks.extend(provider_checks(invoke_raw(
+                &provider, &request, config, None,
+            )));
             checks.extend(provider.all_capabilities().into_iter().map(|capability| {
                 let request = validation_action_request(&provider, capability, scope);
                 validate_action_response(
                     &provider,
                     capability,
-                    invoke_raw(&provider, &request, config),
+                    invoke_raw(&provider, &request, config, None),
                 )
             }));
             let status = if checks.iter().all(|check| check.status == CheckStatus::Ok) {
@@ -915,19 +1142,60 @@ pub fn resolve_plan(
     action: Action,
     request: Value,
 ) -> Result<CommandPlan> {
-    resolve_plan_from(config, providers, action, request, None)
+    resolve_plan_from_tracked(config, providers, action, request, None, None, None)
+}
+
+pub(crate) fn resolve_plan_tracked(
+    config: &Config,
+    providers: &[Manifest],
+    action: Action,
+    request: Value,
+    tracker_directory: &Path,
+    cancelled: &dyn Fn() -> Result<bool>,
+) -> Result<CommandPlan> {
+    resolve_plan_from_tracked(
+        config,
+        providers,
+        action,
+        request,
+        None,
+        Some(tracker_directory),
+        Some(cancelled),
+    )
 }
 
 pub fn resolve_plan_from(
     config: &Config,
     providers: &[Manifest],
     action: Action,
+    request: Value,
+    plan: Option<CommandPlan>,
+) -> Result<CommandPlan> {
+    resolve_plan_from_tracked(config, providers, action, request, plan, None, None)
+}
+
+pub(crate) fn resolve_plan_from_tracked(
+    config: &Config,
+    providers: &[Manifest],
+    action: Action,
     mut request: Value,
     mut plan: Option<CommandPlan>,
+    tracker_directory: Option<&Path>,
+    cancelled: Option<&dyn Fn() -> Result<bool>>,
 ) -> Result<CommandPlan> {
     for &(capability, optional) in action.stages() {
-        let stage = candidates(providers, capability);
-        if stage.is_empty() && optional {
+        if let Some(check) = cancelled
+            && check()?
+        {
+            bail!("provider resolution cancelled");
+        }
+        let stage = candidates_for_request(providers, capability, &request);
+        let explicitly_selected = request
+            .get("providers")
+            .and_then(|providers| providers.get(capability.to_string()))
+            .and_then(Value::as_str)
+            .is_some();
+        if stage.is_empty() && optional && !explicitly_selected {
             continue;
         }
         if stage.is_empty() {
@@ -936,9 +1204,14 @@ pub fn resolve_plan_from(
         let mut accepted = None;
         let mut failures = Vec::new();
         for provider in stage {
+            if let Some(check) = cancelled
+                && check()?
+            {
+                bail!("provider resolution cancelled");
+            }
             request["capability"] = Value::String(capability.to_string());
             request["plan"] = serde_json::to_value(&plan)?;
-            match invoke_raw(provider, &request, config)
+            match invoke_raw(provider, &request, config, tracker_directory)
                 .and_then(|value| parse_plan(provider, value))
             {
                 Ok(Some(candidate)) => {
@@ -967,17 +1240,419 @@ pub struct CommandResult {
 }
 
 pub fn run_plan(plan: &CommandPlan, scope: &Path) -> Result<CommandResult> {
+    run_plan_tracked(plan, scope, None)
+}
+
+pub(crate) fn run_plan_tracked(
+    plan: &CommandPlan,
+    scope: &Path,
+    tracker_directory: Option<&Path>,
+) -> Result<CommandResult> {
+    run_plan_tracked_cancellable(plan, scope, tracker_directory, None)
+}
+
+pub(crate) fn run_plan_tracked_cancellable(
+    plan: &CommandPlan,
+    scope: &Path,
+    tracker_directory: Option<&Path>,
+    cancelled: Option<&dyn Fn() -> Result<bool>>,
+) -> Result<CommandResult> {
     let program = plan.command.first().context("command plan is empty")?;
-    let output = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(&plan.command[1..])
         .current_dir(plan.cwd.as_deref().map(Path::new).unwrap_or(scope))
         .envs(&plan.environment)
-        .output()?;
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let tracker_guard = tracker_directory
+        .map(|directory| ProcessTrackerGuard::acquire(directory, Duration::from_secs(5)))
+        .transpose()?;
+    if let Some(check) = cancelled
+        && check()?
+    {
+        bail!("command plan cancelled");
+    }
+    let mut tracker = tracker_directory.map(ProcessTracker::prepare).transpose()?;
+    let mut process_group = if tracker.is_none() {
+        Some(ProcessGroup::start(None)?)
+    } else {
+        None
+    };
+    if let Some(tracker) = tracker.as_mut() {
+        tracker.start_monitor()?;
+    }
+    prepare_child(
+        &mut command,
+        tracker
+            .as_ref()
+            .and_then(ProcessTracker::group_id)
+            .or_else(|| process_group.as_ref().and_then(ProcessGroup::id)),
+    );
+    let mut child = command.spawn()?;
+    drop(tracker_guard);
+    let stdout = drain_bounded(child.stdout.take().context("command plan stdout")?);
+    let stderr = drain_bounded(child.stderr.take().context("command plan stderr")?);
+    let status = child.wait()?;
+    finish_process_control(&mut tracker, &mut process_group, tracker_directory)?;
     Ok(CommandResult {
-        code: output.status.code().unwrap_or(1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        code: status.code().unwrap_or(1),
+        stdout: finish_drain(stdout)?,
+        stderr: finish_drain(stderr)?,
     })
+}
+
+fn finish_process_control(
+    tracker: &mut Option<ProcessTracker>,
+    process_group: &mut Option<ProcessGroup>,
+    tracker_directory: Option<&Path>,
+) -> Result<()> {
+    let _guard = tracker_directory
+        .map(|directory| ProcessTrackerGuard::acquire(directory, Duration::from_secs(5)))
+        .transpose()?;
+    if let Some(tracker) = tracker.as_mut() {
+        tracker.finish_monitor()?;
+    }
+    if let Some(process_group) = process_group.as_mut() {
+        process_group.finish()?;
+    }
+    Ok(())
+}
+
+struct ProcessTracker {
+    path: PathBuf,
+    file: File,
+    process_group: Option<ProcessGroup>,
+}
+
+impl ProcessTracker {
+    fn prepare(directory: &Path) -> Result<Self> {
+        fs::create_dir_all(directory).context("create command tracker directory")?;
+        let path = directory.join(format!("{}.process", uuid::Uuid::new_v4()));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .context("create command tracker")?;
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn flock(fd: i32, operation: i32) -> i32;
+            }
+            const LOCK_EX: i32 = 2;
+            if unsafe { flock(file.as_raw_fd(), LOCK_EX) } != 0 {
+                return Err(io::Error::last_os_error()).context("lock command tracker");
+            }
+        }
+        Ok(Self {
+            path,
+            file,
+            process_group: None,
+        })
+    }
+
+    fn fd(&self) -> i32 {
+        #[cfg(unix)]
+        {
+            self.file.as_raw_fd()
+        }
+        #[cfg(not(unix))]
+        {
+            -1
+        }
+    }
+
+    fn group_id(&self) -> Option<u32> {
+        self.process_group.as_ref().and_then(ProcessGroup::id)
+    }
+
+    fn start_monitor(&mut self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            let tracker_fd = self.fd();
+            self.process_group = Some(ProcessGroup::start(Some(tracker_fd))?);
+            self.verify()?;
+        }
+        Ok(())
+    }
+
+    fn verify(&self) -> Result<()> {
+        let process_id = self
+            .group_id()
+            .context("command process monitor is missing")?;
+        let bytes = fs::read(&self.path).context("read command tracker")?;
+        if bytes.as_slice() != process_id.to_ne_bytes() {
+            bail!("command tracker process identity changed");
+        }
+        Ok(())
+    }
+
+    fn finish_monitor(&mut self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn flock(fd: i32, operation: i32) -> i32;
+            }
+            const LOCK_UN: i32 = 8;
+            if unsafe { flock(self.file.as_raw_fd(), LOCK_UN) } != 0 {
+                return Err(io::Error::last_os_error()).context("unlock command tracker");
+            }
+        }
+        if let Some(mut process_group) = self.process_group.take() {
+            process_group.finish()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ProcessTracker {
+    fn drop(&mut self) {
+        self.process_group.take();
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+struct ProcessGroup {
+    monitor: Option<Child>,
+    #[cfg(unix)]
+    parent_lifeline: Option<UnixStream>,
+}
+
+impl ProcessGroup {
+    fn start(tracker_fd: Option<i32>) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            let (parent_reader, parent_lifeline) = if tracker_fd.is_none() {
+                let (reader, writer) = UnixStream::pair().context("create process lifeline")?;
+                (Some(reader), Some(writer))
+            } else {
+                (None, None)
+            };
+            let parent_fd = parent_reader.as_ref().map_or(-1, AsRawFd::as_raw_fd);
+            #[cfg(not(test))]
+            let mut command = {
+                let mut command = Command::new(std::env::current_exe()?);
+                command
+                    .arg("process-monitor")
+                    .arg(format!("--tracker-fd={}", tracker_fd.unwrap_or(-1)))
+                    .arg(format!("--parent-fd={parent_fd}"))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .process_group(0);
+                command
+            };
+            #[cfg(test)]
+            let mut command = {
+                let mut command = Command::new("/bin/sh");
+                command
+                    .args(["-c", TEST_PROCESS_MONITOR])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .process_group(0);
+                command
+            };
+            unsafe {
+                command.pre_exec(move || {
+                    if let Some(tracker_fd) = tracker_fd {
+                        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                        clear_close_on_exec(tracker_fd)?;
+                        write_process_id(tracker_fd)?;
+                    }
+                    if parent_fd >= 0 {
+                        clear_close_on_exec(parent_fd)?;
+                    }
+                    Ok(())
+                });
+            }
+            let monitor = command.spawn().context("start command process monitor")?;
+            Ok(Self {
+                monitor: Some(monitor),
+                parent_lifeline,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tracker_fd;
+            Ok(Self { monitor: None })
+        }
+    }
+
+    fn id(&self) -> Option<u32> {
+        self.monitor.as_ref().map(Child::id)
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if let Some(mut monitor) = self.monitor.take() {
+            terminate_process_group(&mut monitor)?;
+            monitor.wait().context("reap command process monitor")?;
+        }
+        #[cfg(unix)]
+        self.parent_lifeline.take();
+        Ok(())
+    }
+}
+
+#[cfg(all(unix, test))]
+const TEST_PROCESS_MONITOR: &str = r#"trap '' TERM
+while :; do sleep 3600; done
+"#;
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+#[cfg(unix)]
+fn clear_close_on_exec(fd: i32) -> io::Result<()> {
+    unsafe extern "C" {
+        fn fcntl(fd: i32, command: i32, argument: i32) -> i32;
+    }
+    const GET_DESCRIPTOR_FLAGS: i32 = 1;
+    const SET_DESCRIPTOR_FLAGS: i32 = 2;
+    const CLOSE_ON_EXEC: i32 = 1;
+    let flags = unsafe { fcntl(fd, GET_DESCRIPTOR_FLAGS, 0) };
+    if flags < 0 || unsafe { fcntl(fd, SET_DESCRIPTOR_FLAGS, flags & !CLOSE_ON_EXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_process_id(fd: i32) -> io::Result<()> {
+    unsafe extern "C" {
+        fn getpid() -> i32;
+        fn write(fd: i32, buffer: *const u8, count: usize) -> isize;
+    }
+    let process_id = (unsafe { getpid() } as u32).to_ne_bytes();
+    if unsafe { write(fd, process_id.as_ptr(), process_id.len()) } != process_id.len() as isize {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn monitor_process(tracker_fd: i32, parent_fd: i32) -> Result<()> {
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+    }
+    let _tracker = (tracker_fd >= 0).then(|| unsafe { File::from_raw_fd(tracker_fd) });
+    if parent_fd >= 0 {
+        let mut parent = unsafe { File::from_raw_fd(parent_fd) };
+        let mut sentinel = [0_u8; 1];
+        loop {
+            match parent.read(&mut sentinel) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error).context("read process lifeline"),
+            }
+        }
+        terminate_current_process_group();
+    }
+    loop {
+        thread::sleep(Duration::from_secs(60));
+    }
+}
+
+#[cfg(unix)]
+fn terminate_current_process_group() -> ! {
+    let group = unsafe { libc::getpgrp() };
+    if group > 0 {
+        unsafe {
+            libc::killpg(group, libc::SIGTERM);
+        }
+        thread::sleep(Duration::from_millis(250));
+        unsafe {
+            libc::killpg(group, libc::SIGKILL);
+        }
+    }
+    std::process::exit(0)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn monitor_process(_tracker_fd: i32, _parent_fd: i32) -> Result<()> {
+    Ok(())
+}
+
+pub(crate) struct ProcessTrackerGuard {
+    #[cfg(unix)]
+    file: File,
+}
+
+impl ProcessTrackerGuard {
+    pub(crate) fn acquire(directory: &Path, timeout: Duration) -> Result<Self> {
+        fs::create_dir_all(directory).context("create command tracker directory")?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(directory.join(".lock"))
+            .context("open command tracker lock")?;
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn flock(fd: i32, operation: i32) -> i32;
+            }
+            const LOCK_EX: i32 = 2;
+            const LOCK_NB: i32 = 4;
+            let deadline = Instant::now() + timeout;
+            loop {
+                if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+                    break;
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::WouldBlock {
+                    return Err(error).context("acquire command tracker lock");
+                }
+                if Instant::now() >= deadline {
+                    bail!("timed out acquiring the command tracker lock");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        Ok(Self {
+            #[cfg(unix)]
+            file,
+        })
+    }
+}
+
+impl Drop for ProcessTrackerGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn flock(fd: i32, operation: i32) -> i32;
+            }
+            const LOCK_UN: i32 = 8;
+            let _ = unsafe { flock(self.file.as_raw_fd(), LOCK_UN) };
+        }
+    }
+}
+
+fn prepare_child(command: &mut Command, process_group: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(process_group) = process_group {
+        unsafe {
+            command.pre_exec(move || {
+                unsafe extern "C" {
+                    fn setpgid(process_id: i32, process_group: i32) -> i32;
+                }
+                if setpgid(0, process_group as i32) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (command, process_group);
 }
 
 pub fn run_plan_with_timeout(
@@ -985,51 +1660,222 @@ pub fn run_plan_with_timeout(
     scope: &Path,
     timeout: std::time::Duration,
 ) -> Result<CommandResult> {
-    let program = plan.command.first().context("command plan is empty")?;
-    let stdout = tempfile::NamedTempFile::new()?;
-    let stderr = tempfile::NamedTempFile::new()?;
-    let mut child = Command::new(program)
-        .args(&plan.command[1..])
-        .current_dir(plan.cwd.as_deref().map(Path::new).unwrap_or(scope))
-        .envs(&plan.environment)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout.reopen()?))
-        .stderr(Stdio::from(stderr.reopen()?))
-        .spawn()
-        .with_context(|| format!("start command plan {program}"))?;
-    let status = match child.wait_timeout(timeout)? {
-        Some(status) => status,
-        None => {
-            child.kill()?;
-            let _ = child.wait();
-            bail!("command plan timed out after {}ms", timeout.as_millis());
-        }
-    };
-    Ok(CommandResult {
-        code: status.code().unwrap_or(1),
-        stdout: String::from_utf8_lossy(&fs::read(stdout.path())?).into_owned(),
-        stderr: String::from_utf8_lossy(&fs::read(stderr.path())?).into_owned(),
-    })
-}
-
-pub fn execute_plan(plan: &CommandPlan, scope: &Path, inherit: bool) -> Result<i32> {
+    let started = Instant::now();
     let program = plan.command.first().context("command plan is empty")?;
     let mut command = Command::new(program);
     command
         .args(&plan.command[1..])
         .current_dir(plan.cwd.as_deref().map(Path::new).unwrap_or(scope))
-        .envs(&plan.environment);
-    if inherit {
-        command
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-        return Ok(command.status()?.code().unwrap_or(1));
+        .envs(&plan.environment)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut process_group = ProcessGroup::start(None)?;
+    prepare_child(&mut command, process_group.id());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("start command plan {program}"))?;
+    let stdout = drain_bounded(child.stdout.take().context("command plan stdout")?);
+    let stderr = drain_bounded(child.stderr.take().context("command plan stderr")?);
+    let status = match child.wait_timeout(timeout)? {
+        Some(status) => status,
+        None => {
+            process_group.finish()?;
+            let _ = child.wait();
+            discard_drain(stdout);
+            discard_drain(stderr);
+            bail!("command plan timed out after {}ms", timeout.as_millis());
+        }
+    };
+    process_group.finish()?;
+    let stdout = match finish_drain_with_timeout(stdout, timeout.saturating_sub(started.elapsed()))
+    {
+        Ok(stdout) => stdout,
+        Err(error) => {
+            discard_drain(stderr);
+            return Err(error).context("timed command plan did not close stdout");
+        }
+    };
+    let stderr = finish_drain_with_timeout(stderr, timeout.saturating_sub(started.elapsed()))
+        .context("timed command plan did not close stderr")?;
+    Ok(CommandResult {
+        code: status.code().unwrap_or(1),
+        stdout,
+        stderr,
+    })
+}
+
+fn terminate_process_group(child: &mut Child) -> Result<()> {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+        const SIGKILL: i32 = 9;
+        if unsafe { kill(-(child.id() as i32), SIGKILL) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if child.try_wait()?.is_none() {
+                return Err(error).context("terminate command process group");
+            }
+        }
+        Ok(())
     }
-    let output = command.output()?;
-    print!("{}", String::from_utf8_lossy(&output.stdout));
-    eprint!("{}", String::from_utf8_lossy(&output.stderr));
-    Ok(output.status.code().unwrap_or(1))
+    #[cfg(not(unix))]
+    {
+        child.kill().context("terminate command")
+    }
+}
+
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+    stream_open: bool,
+}
+
+struct OutputDrain {
+    receiver: Receiver<io::Result<BoundedOutput>>,
+    cancel: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+fn drain_bounded<R>(mut reader: R) -> OutputDrain
+where
+    R: AsRawFd + Read + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let thread_cancel = Arc::clone(&cancel);
+    thread::spawn(move || {
+        let result = (|| {
+            let mut output = Vec::new();
+            let mut buffer = [0_u8; 8192];
+            let mut truncated = false;
+            let mut stream_open = false;
+            loop {
+                if thread_cancel.load(Ordering::Relaxed) {
+                    stream_open = true;
+                    break;
+                }
+                if !poll_readable(reader.as_raw_fd())? {
+                    continue;
+                }
+                let read = reader.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                let remaining = MAX_PROVIDER_OUTPUT_BYTES.saturating_sub(output.len());
+                output.extend_from_slice(&buffer[..read.min(remaining)]);
+                truncated |= read > remaining;
+            }
+            Ok(BoundedOutput {
+                bytes: output,
+                truncated,
+                stream_open,
+            })
+        })();
+        let _ = sender.send(result);
+    });
+    OutputDrain { receiver, cancel }
+}
+
+#[cfg(unix)]
+fn poll_readable(fd: i32) -> io::Result<bool> {
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+    unsafe extern "C" {
+        fn poll(fds: *mut PollFd, count: usize, timeout: i32) -> i32;
+    }
+    const POLLIN: i16 = 0x0001;
+    let mut descriptor = PollFd {
+        fd,
+        events: POLLIN,
+        revents: 0,
+    };
+    let result = unsafe { poll(&mut descriptor, 1, 100) };
+    if result >= 0 {
+        return Ok(result > 0);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::Interrupted {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+fn finish_drain(drain: OutputDrain) -> Result<String> {
+    finish_drain_with_timeout(drain, std::time::Duration::from_secs(1))
+}
+
+fn finish_drain_with_timeout(drain: OutputDrain, timeout: std::time::Duration) -> Result<String> {
+    let output = match drain.receiver.recv_timeout(timeout) {
+        Ok(output) => output?,
+        Err(RecvTimeoutError::Timeout) => {
+            drain.cancel.store(true, Ordering::Relaxed);
+            bail!("output stream did not close before the deadline");
+        }
+        Err(RecvTimeoutError::Disconnected) => bail!("output reader stopped unexpectedly"),
+    };
+    let mut rendered = String::from_utf8_lossy(&output.bytes).into_owned();
+    if output.truncated {
+        rendered.push_str("\n[output truncated by Orc]\n");
+    }
+    if output.stream_open {
+        rendered.push_str("\n[output stream remained open after command exit]\n");
+    }
+    Ok(rendered)
+}
+
+fn discard_drain(drain: OutputDrain) {
+    drain.cancel.store(true, Ordering::Relaxed);
+    let _ = drain
+        .receiver
+        .recv_timeout(std::time::Duration::from_millis(250));
+}
+
+pub fn execute_plan(plan: &CommandPlan, scope: &Path, inherit: bool) -> Result<i32> {
+    if inherit {
+        return execute_inherited_plan_after_spawn(plan, scope, (), |_| Ok(()));
+    }
+    let result = run_plan(plan, scope)?;
+    print!("{}", result.stdout);
+    eprint!("{}", result.stderr);
+    Ok(result.code)
+}
+
+pub fn execute_inherited_plan_after_spawn<F, G>(
+    plan: &CommandPlan,
+    scope: &Path,
+    guard: G,
+    after_spawn: F,
+) -> Result<i32>
+where
+    F: FnOnce(&mut Child) -> Result<()>,
+{
+    let program = plan.command.first().context("command plan is empty")?;
+    let mut command = Command::new(program);
+    command
+        .args(&plan.command[1..])
+        .current_dir(plan.cwd.as_deref().map(Path::new).unwrap_or(scope))
+        .envs(&plan.environment)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn()?;
+    if let Err(error) = after_spawn(&mut child) {
+        terminate_process_group(&mut child)?;
+        let _ = child.wait();
+        drop(guard);
+        return Err(error);
+    }
+    drop(guard);
+    Ok(child.wait()?.code().unwrap_or(1))
 }
 
 pub fn capture_plan(
@@ -1076,7 +1922,7 @@ pub fn discover_bindings(
             "scope": scope, "session": session, "plan": null,
             "rebindCurrent": rebind_current,
         });
-        let value = invoke_raw(provider, &request, config).ok()?;
+        let value = invoke_raw(provider, &request, config, None).ok()?;
         if value.get("status").and_then(Value::as_str) == Some("declined") { return None; }
         let binding = value.get("binding")?;
         Some(ProviderBinding {
@@ -1123,7 +1969,36 @@ pub fn describe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::render_fixture;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    const VALIDATION_MANIFEST: &str = r#"version: orc.provider/v1
+name: test
+command: {{ command }}
+actions:
+  changes.inspect: Inspect changes
+"#;
+
+    const VALIDATION_PROVIDER: &str = r#"#!/bin/sh
+request=$(cat)
+printf '%s\n' "$request" >> '{{ calls }}'
+case "$request" in
+  *provider.validate*)
+    cat <<'JSON'
+{"version":"orc.provider/v1","checks":[{"name":"protocol","status":"ok","message":"ready"}]}
+JSON
+    ;;
+  *)
+    cat <<'JSON'
+{"version":"orc.provider/v1","command":["true"],"successCodes":[0]}
+JSON
+    ;;
+esac
+"#;
 
     fn provider_manifest(name: &str, command: &Path, priority: i64) -> Manifest {
         Manifest {
@@ -1168,10 +2043,47 @@ actions:
         let mut config = Config::default();
         config.providers.directory = directory.path().to_path_buf();
 
-        let providers = discover(&config).expect("nested provider discovered");
+        let providers =
+            discover_in([config.providers.directory.clone()]).expect("nested provider discovered");
 
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].name, "example");
+    }
+
+    #[test]
+    fn configured_provider_overrides_an_installed_provider() {
+        let directory = tempfile::tempdir().expect("provider directories");
+        let configured = directory.path().join("configured");
+        let installed = directory.path().join("installed");
+        fs::create_dir_all(&configured).expect("configured directory");
+        fs::create_dir_all(&installed).expect("installed directory");
+        fs::write(
+            configured.join("provider.yaml"),
+            r#"version: orc.provider/v1
+name: example
+description: configured
+command: configured-provider
+actions:
+  session.bind: Bind a session
+"#,
+        )
+        .expect("configured manifest");
+        fs::write(
+            installed.join("provider.yaml"),
+            r#"version: orc.provider/v1
+name: example
+description: installed
+command: installed-provider
+actions:
+  session.bind: Bind a session
+"#,
+        )
+        .expect("installed manifest");
+
+        let providers = discover_in([configured, installed]).expect("provider discovery");
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].description, "configured");
     }
 
     #[test]
@@ -1204,6 +2116,162 @@ actions:
     }
 
     #[test]
+    fn provider_timeout_covers_blocked_request_delivery() {
+        let directory = tempfile::tempdir().expect("provider directory");
+        let command = write_provider(
+            directory.path(),
+            "blocked-input",
+            r#"#!/bin/sh
+sleep 10
+"#,
+        );
+        let provider = provider_manifest("blocked-input", &command, 0);
+        let mut config = Config::default();
+        config.providers.timeout_ms = 10;
+        let request = json!({
+            "version": "orc.provider/v1",
+            "scope": directory.path(),
+            "payload": "x".repeat(2 * 1024 * 1024),
+        });
+        let started = Instant::now();
+
+        let error = invoke_raw(&provider, &request, &config, None)
+            .expect_err("provider that ignores input must time out");
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn provider_timeout_covers_descendant_that_holds_request_pipe() {
+        let directory = tempfile::tempdir().expect("provider directory");
+        let command = write_provider(
+            directory.path(),
+            "inherited-input",
+            r#"#!/bin/sh
+(sleep 10) &
+exit 0
+"#,
+        );
+        let provider = provider_manifest("inherited-input", &command, 0);
+        let mut config = Config::default();
+        config.providers.timeout_ms = 20;
+        let request = json!({
+            "version": "orc.provider/v1",
+            "scope": directory.path(),
+            "payload": "x".repeat(2 * 1024 * 1024),
+        });
+        let started = Instant::now();
+
+        let error = invoke_raw(&provider, &request, &config, None)
+            .expect_err("provider descendant that holds stdin must time out");
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn request_can_select_a_provider_for_one_capability() {
+        let directory = tempfile::tempdir().expect("provider directory");
+        let command = directory.path().join("provider");
+        let first = provider_manifest("first", &command, 100);
+        let second = provider_manifest("second", &command, 0);
+        let request = json!({
+            "providers": {"changes.inspect": "second"}
+        });
+
+        let providers = [first, second];
+        let selected = candidates_for_request(&providers, Capability::ChangesInspect, &request);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "second");
+    }
+
+    #[test]
+    fn timeout_stops_descendants_that_hold_output_pipes() {
+        let plan = CommandPlan {
+            version: "orc.provider/v1".into(),
+            command: vec!["sh".into(), "-c".into(), "sleep 10 & wait".into()],
+            cwd: None,
+            environment: BTreeMap::new(),
+            success_codes: vec![0],
+        };
+        let started = Instant::now();
+
+        let error =
+            run_plan_with_timeout(&plan, Path::new("."), std::time::Duration::from_millis(10))
+                .expect_err("process tree must exceed the timeout");
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_drain_fails_when_an_inherited_pipe_stays_open() {
+        let (reader, _writer) = std::os::unix::net::UnixStream::pair().expect("pipe fixture");
+        let started = Instant::now();
+
+        let error = finish_drain(drain_bounded(reader)).expect_err("open pipe must miss deadline");
+
+        assert!(error.to_string().contains("did not close"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_plan_reaps_background_descendants() {
+        let directory = tempfile::tempdir().expect("tracker directory");
+        let plan = CommandPlan {
+            version: "orc.provider/v1".into(),
+            command: vec!["sh".into(), "-c".into(), "sleep 10 & printf ready".into()],
+            cwd: None,
+            environment: BTreeMap::new(),
+            success_codes: vec![0],
+        };
+        let started = Instant::now();
+
+        let result =
+            run_plan_tracked(&plan, Path::new("."), Some(directory.path())).expect("tracked plan");
+
+        assert_eq!(result.stdout, "ready");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("tracker entries")
+                .filter_map(|entry| entry.ok())
+                .filter(
+                    |entry| entry.path().extension().and_then(|value| value.to_str())
+                        == Some("process")
+                )
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn command_output_is_bounded_while_the_pipe_is_drained() {
+        let plan = CommandPlan {
+            version: "orc.provider/v1".into(),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                format!("yes x | head -c {}", MAX_PROVIDER_OUTPUT_BYTES + 4096),
+            ],
+            cwd: None,
+            environment: BTreeMap::new(),
+            success_codes: vec![0],
+        };
+
+        let result =
+            run_plan_with_timeout(&plan, Path::new("."), std::time::Duration::from_secs(2))
+                .expect("large output command");
+
+        assert!(result.stdout.len() < MAX_PROVIDER_OUTPUT_BYTES + 64);
+        assert!(result.stdout.ends_with("[output truncated by Orc]\n"));
+    }
+
+    #[test]
     fn command_plan_accepts_provider_declared_exit_codes() {
         let provider = Manifest {
             version: "orc.provider/v1".into(),
@@ -1232,13 +2300,65 @@ actions:
     }
 
     #[test]
+    fn cancellation_at_a_provider_phase_boundary_does_not_start_the_plan() {
+        let directory = tempfile::tempdir().expect("tracker directory");
+        let tracker_directory = directory.path().join("trackers");
+        let marker = directory.path().join("started");
+        let plan = CommandPlan {
+            version: "orc.provider/v1".into(),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                format!("touch {}", marker.display()),
+            ],
+            cwd: None,
+            environment: BTreeMap::new(),
+            success_codes: vec![0],
+        };
+        let guard = ProcessTrackerGuard::acquire(&tracker_directory, Duration::from_secs(1))
+            .expect("hold tracker boundary");
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let worker_cancelled = Arc::clone(&cancelled);
+        let worker_directory = tracker_directory.clone();
+        let worker = std::thread::spawn(move || {
+            run_plan_tracked_cancellable(
+                &plan,
+                Path::new("."),
+                Some(&worker_directory),
+                Some(&|| Ok(worker_cancelled.load(Ordering::SeqCst))),
+            )
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        drop(guard);
+
+        let error = worker
+            .join()
+            .expect("plan worker")
+            .expect_err("cancel plan");
+
+        assert!(error.to_string().contains("cancelled"));
+        assert!(!marker.exists());
+    }
+
+    #[test]
     fn plan_resolution_continues_after_a_provider_error() {
         let directory = tempfile::tempdir().expect("provider directory");
-        let broken = write_provider(directory.path(), "broken", "#!/bin/sh\nexit 7\n");
+        let broken = write_provider(
+            directory.path(),
+            "broken",
+            r#"#!/bin/sh
+exit 7
+"#,
+        );
         let working = write_provider(
             directory.path(),
             "working",
-            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"version\":\"orc.provider/v1\",\"command\":[\"true\"],\"successCodes\":[0]}'\n",
+            r#"#!/bin/sh
+cat >/dev/null
+cat <<'JSON'
+{"version":"orc.provider/v1","command":["true"],"successCodes":[0]}
+JSON
+"#,
         );
         let providers = vec![
             provider_manifest("broken", &broken, 100),
@@ -1280,23 +2400,16 @@ actions:
         let provider = write_provider(
             directory.path(),
             "provider",
-            &format!(
-                r#"#!/bin/sh
-request=$(cat)
-printf '%s\n' "$request" >> '{}'
-case "$request" in
-  *provider.validate*) printf '%s\n' '{{"version":"orc.provider/v1","checks":[{{"name":"protocol","status":"ok","message":"ready"}}]}}' ;;
-  *) printf '%s\n' '{{"version":"orc.provider/v1","command":["true"],"successCodes":[0]}}' ;;
-esac
-"#,
-                calls.display()
+            &render_fixture(
+                VALIDATION_PROVIDER,
+                serde_json::json!({ "calls": calls.display().to_string() }),
             ),
         );
         fs::write(
             directory.path().join("provider.yaml"),
-            format!(
-                "version: orc.provider/v1\nname: test\ncommand: {}\nactions:\n  changes.inspect: Inspect changes\n",
-                provider.display()
+            render_fixture(
+                VALIDATION_MANIFEST,
+                serde_json::json!({ "command": provider.display().to_string() }),
             ),
         )
         .expect("provider manifest");
@@ -1322,11 +2435,25 @@ esac
     fn activity_tail_discards_partial_first_line() {
         let directory = tempfile::tempdir().expect("activity directory");
         let path = directory.path().join("activity.jsonl");
-        fs::write(&path, b"first line\nsecond line\nthird line\n").expect("activity log");
+        let activity = br#"first line
+second line
+third line
+"#;
+        fs::write(&path, activity).expect("activity log");
 
         let tail = read_file_tail(&path, 20).expect("activity tail");
 
         assert_eq!(String::from_utf8(tail).expect("utf-8 tail"), "third line\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn activity_log_contention_drops_evidence_without_blocking() {
+        let directory = tempfile::tempdir().expect("activity directory");
+        let path = directory.path().join("activity.jsonl");
+        let _guard = ActivityLogGuard::acquire(&path).expect("activity log lock");
+
+        assert!(ActivityLogGuard::acquire(&path).is_none());
     }
 
     #[test]

@@ -1,18 +1,19 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
 use std::os::{fd::AsRawFd, unix::process::CommandExt};
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use minijinja::Environment;
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -21,14 +22,19 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     control::{self, Contract, SessionLink},
+    daemon,
     domain::{
         ActivityEvent, CompletionTarget, JudgePolicy, LifecycleStatus, PendingGate,
-        RegistrationSource, RunMode, SessionRole, WorkflowEdge, WorkflowNode, WorkflowRun,
+        RegistrationSource, RunMode, Session, SessionRole, WorkflowEdge, WorkflowNode, WorkflowRun,
+        WorkspaceState,
     },
     preferences::{self, AutonomyMode},
     provider::{self, Action, CommandPlan},
     state,
 };
+
+const MAX_WORKFLOW_LOG_BYTES: u64 = 1024 * 1024;
+const MAX_RETRY_ATTEMPTS: u32 = 100;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,7 +75,7 @@ pub struct ApprovalPolicy {
     pub gates: Vec<ApprovalGate>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextMode {
     Accumulate,
@@ -142,11 +148,15 @@ pub struct Step {
     pub duration: Option<String>,
     pub workflow: Option<String>,
     pub input_mapping: BTreeMap<String, String>,
+    #[serde(rename = "maxDepth", alias = "max_depth")]
     pub max_depth: Option<usize>,
     pub depends_on: Vec<String>,
     pub routes: Vec<Route>,
     pub retry: RetryPolicy,
+    #[serde(rename = "timeoutSeconds", alias = "timeout_seconds")]
     pub timeout_seconds: Option<u64>,
+    #[serde(rename = "idleTimeoutSeconds", alias = "idle_timeout_seconds")]
+    pub idle_timeout_seconds: Option<u64>,
     pub requires_approval: bool,
 }
 
@@ -175,6 +185,7 @@ impl Default for Step {
             routes: Vec::new(),
             retry: RetryPolicy::default(),
             timeout_seconds: None,
+            idle_timeout_seconds: None,
             requires_approval: false,
         }
     }
@@ -285,8 +296,22 @@ pub fn validate(definition: &Definition, base: &Path) -> Result<()> {
     if definition.name.trim().is_empty() || definition.goal.trim().is_empty() {
         bail!("name and goal are required");
     }
+    validate_name(&definition.name)?;
     if definition.limits.max_iterations == 0 || definition.limits.max_iterations > 500 {
         bail!("limits.max_iterations must be between 1 and 500");
+    }
+    if definition.limits.timeout_seconds == Some(0) {
+        bail!("limits.timeout_seconds must be positive when set");
+    }
+    if definition
+        .limits
+        .budget_usd
+        .is_some_and(|budget| !budget.is_finite() || budget < 0.0)
+    {
+        bail!("limits.budget_usd must be a finite non-negative number");
+    }
+    if definition.defaults.context != ContextMode::Explicit {
+        bail!("defaults.context must be explicit until implicit context modes are supported");
     }
     let step_names: BTreeSet<_> = definition
         .steps
@@ -302,6 +327,9 @@ pub fn validate(definition: &Definition, base: &Path) -> Result<()> {
     {
         bail!("step and parallel group names must be unique");
     }
+    if let Some(name) = step_names.intersection(&group_names).next() {
+        bail!("step and parallel group names overlap: {name}");
+    }
     if !step_names.contains(definition.entry_point.as_str())
         && !group_names.contains(definition.entry_point.as_str())
     {
@@ -311,6 +339,18 @@ pub fn validate(definition: &Definition, base: &Path) -> Result<()> {
     for step in &definition.steps {
         if step.name.is_empty() {
             bail!("a step has no name");
+        }
+        if step.retry.attempts > MAX_RETRY_ATTEMPTS {
+            bail!(
+                "step {} retry attempts exceed the limit of {MAX_RETRY_ATTEMPTS}",
+                step.name
+            );
+        }
+        if !step.input_mapping.is_empty() {
+            bail!(
+                "step {} uses input_mapping, which is not supported yet",
+                step.name
+            );
         }
         if matches!(step.r#type, StepKind::Agent)
             && step
@@ -322,20 +362,13 @@ pub fn validate(definition: &Definition, base: &Path) -> Result<()> {
         {
             bail!("agent {} needs a harness", step.name);
         }
-        if matches!(step.r#type, StepKind::Agent)
-            && step
-                .runtime
-                .execution
-                .as_ref()
-                .or(definition.defaults.runtime.execution.as_ref())
-                .is_none()
-        {
-            bail!("agent {} needs an execution provider", step.name);
-        }
         if matches!(step.r#type, StepKind::Script) && step.command.is_empty() {
             bail!("script {} needs command", step.name);
         }
         if matches!(step.r#type, StepKind::Workflow) {
+            if step.max_depth == Some(0) {
+                bail!("workflow step {} max_depth must be positive", step.name);
+            }
             let reference = step
                 .workflow
                 .as_deref()
@@ -353,29 +386,133 @@ pub fn validate(definition: &Definition, base: &Path) -> Result<()> {
             if route.to != "$end" && route.to != "self" && !all.contains(route.to.as_str()) {
                 bail!("{} routes to unknown step {}", step.name, route.to);
             }
+            validate_route_condition(route, &step.name)?;
         }
     }
+    let mut grouped_steps = BTreeSet::new();
     for group in &definition.parallel {
-        if group.agents.is_empty() == group.agent.is_none() {
+        if group.for_each.is_some() || group.agent.is_some() {
             bail!(
-                "parallel {} must define agents or one for_each agent",
+                "parallel {} uses dynamic for_each, which is not supported yet",
                 group.name
             );
+        }
+        if group.agents.is_empty() {
+            bail!(
+                "parallel {} must define at least one static agent",
+                group.name
+            );
+        }
+        if group.max_concurrent == Some(0) {
+            bail!("parallel {} max_concurrent must be positive", group.name);
         }
         for agent in &group.agents {
             if !step_names.contains(agent.as_str()) {
                 bail!("parallel {} references unknown step {agent}", group.name);
             }
+            if !grouped_steps.insert(agent.as_str()) {
+                bail!("step {agent} belongs to more than one parallel group");
+            }
+            if definition
+                .steps
+                .iter()
+                .find(|step| step.name == *agent)
+                .is_some_and(|step| step.depends_on.contains(&group.name))
+            {
+                bail!("parallel member {agent} cannot depend on its own group");
+            }
         }
-        if group.for_each.is_some() && group.agent.as_ref().is_none() {
-            bail!("parallel {} for_each needs agent", group.name);
+        for route in &group.routes {
+            if route.to != "$end" && route.to != "self" && !all.contains(route.to.as_str()) {
+                bail!(
+                    "parallel {} routes to unknown step {}",
+                    group.name,
+                    route.to
+                );
+            }
+            validate_route_condition(route, &group.name)?;
         }
+    }
+    if let Some(entry) = definition
+        .steps
+        .iter()
+        .find(|step| step.name == definition.entry_point)
+        && !entry.depends_on.is_empty()
+    {
+        bail!("entry point {} cannot have dependencies", entry.name);
+    }
+    if let Some(group) = definition
+        .parallel
+        .iter()
+        .find(|group| group.name == definition.entry_point)
+        && let Some(member) = group.agents.iter().find(|name| {
+            definition
+                .steps
+                .iter()
+                .find(|step| step.name == name.as_str())
+                .is_some_and(|step| !step.depends_on.is_empty())
+        })
+    {
+        bail!("entry parallel member {member} cannot have dependencies");
+    }
+    for step in definition
+        .steps
+        .iter()
+        .filter(|step| grouped_steps.contains(step.name.as_str()))
+    {
+        if !step.routes.is_empty() {
+            bail!("parallel member {} must use its group's routes", step.name);
+        }
+    }
+    if grouped_steps.contains(definition.entry_point.as_str()) {
+        bail!(
+            "entry point {} is a parallel member; use its group name instead",
+            definition.entry_point
+        );
+    }
+    if let Some((source, target)) = definition
+        .steps
+        .iter()
+        .flat_map(|step| {
+            step.routes
+                .iter()
+                .map(move |route| (step.name.as_str(), route.to.as_str()))
+        })
+        .chain(definition.parallel.iter().flat_map(|group| {
+            group
+                .routes
+                .iter()
+                .map(move |route| (group.name.as_str(), route.to.as_str()))
+        }))
+        .find(|(_, target)| grouped_steps.contains(target))
+    {
+        bail!("{source} routes to parallel member {target}; use its group name instead");
     }
     for gate in &definition.approval.gates {
         if !all.contains(gate.before.as_str()) {
             bail!("gate {} references unknown step {}", gate.id, gate.before);
         }
     }
+    Ok(())
+}
+
+fn route_template(condition: &str) -> String {
+    if condition.contains("{{") || condition.contains("{%") {
+        condition.to_owned()
+    } else {
+        format!("{{{{ {condition} }}}}")
+    }
+}
+
+fn validate_route_condition(route: &Route, source: &str) -> Result<()> {
+    let Some(condition) = route.when.as_deref() else {
+        return Ok(());
+    };
+    let template = route_template(condition);
+    let mut environment = Environment::new();
+    environment
+        .add_template("route", &template)
+        .with_context(|| format!("compile route condition for {source}"))?;
     Ok(())
 }
 
@@ -386,7 +523,10 @@ pub fn repository(config: &Config) -> Result<PathBuf> {
         run_git(&repository, ["init", "--quiet"])?;
         fs::write(
             repository.join("README.md"),
-            "# Orc workflows\n\nVersioned workflow definitions managed by Orc.\n",
+            r#"# Orc workflows
+
+Versioned workflow definitions managed by Orc.
+"#,
         )?;
         run_git(&repository, ["add", "README.md"])?;
         run_git(
@@ -430,7 +570,19 @@ pub fn scope_directory(config: &Config, scope: &Path) -> Result<PathBuf> {
 }
 
 pub fn path(config: &Config, scope: &Path, name: &str) -> Result<PathBuf> {
+    validate_name(name)?;
     Ok(scope_directory(config, scope)?.join(format!("{name}.yaml")))
+}
+
+fn validate_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        bail!("workflow name must contain only letters, numbers, '-' or '_'");
+    }
+    Ok(())
 }
 
 pub fn import(config: &Config, scope: &Path, source: &Path) -> Result<PathBuf> {
@@ -641,8 +793,19 @@ pub fn set_run_dependency(
     })
 }
 
-pub fn init(config: &Config, scope: &Path, name: &str) -> Result<PathBuf> {
-    let target = path(config, scope, name)?;
+pub fn init(config: &Config, scope: &Path, name: &str, harness: Option<&str>) -> Result<PathBuf> {
+    let scope = state::resolve_scope(scope)?;
+    let harness = harness.map(str::to_owned).or_else(|| {
+        state::read(&scope).ok().and_then(|workspace| {
+            workspace
+                .current_session()
+                .map(|session| session.harness.clone())
+        })
+    });
+    if harness.is_none() {
+        bail!("workflow init needs --harness outside an active Orc session");
+    }
+    let target = path(config, &scope, name)?;
     if target.exists() {
         bail!("workflow already exists: {name}");
     }
@@ -653,8 +816,7 @@ pub fn init(config: &Config, scope: &Path, name: &str) -> Result<PathBuf> {
         entry_point: "plan".into(),
         ..Definition::default()
     };
-    definition.defaults.runtime.harness = Some("codex".into());
-    definition.defaults.runtime.execution = Some("local".into());
+    definition.defaults.runtime.harness = harness;
     definition.steps.push(Step {
         name: "plan".into(),
         role: SessionRole::Planner,
@@ -798,7 +960,11 @@ pub fn plan(config: &Config, scope: &Path, definition: &Definition) -> Result<Pl
         })
         .collect::<Vec<_>>();
     let mut unresolved: BTreeSet<_> = steps.iter().map(|step| step.name.clone()).collect();
-    let mut resolved = BTreeSet::new();
+    let mut resolved = definition
+        .parallel
+        .iter()
+        .map(|group| group.name.clone())
+        .collect::<BTreeSet<_>>();
     let mut waves = Vec::new();
     while !unresolved.is_empty() {
         let wave: Vec<_> = unresolved
@@ -847,6 +1013,17 @@ pub fn materialize(
     definition_path: &Path,
     mode: RunMode,
 ) -> Result<WorkflowRun> {
+    materialize_with_parent(config, scope, definition_path, mode, None, None)
+}
+
+fn materialize_with_parent(
+    config: &Config,
+    scope: &Path,
+    definition_path: &Path,
+    mode: RunMode,
+    parent_run_id: Option<&str>,
+    parent_node_id: Option<&str>,
+) -> Result<WorkflowRun> {
     let scope = state::resolve_scope(scope)?;
     let definition_path = fs::canonicalize(definition_path)
         .with_context(|| format!("resolve workflow definition {}", definition_path.display()))?;
@@ -856,8 +1033,15 @@ pub fn materialize(
     let orchestrator = snapshot
         .current_session()
         .context("start a registered orchestrator before starting a workflow")?;
+    require_orchestrator(orchestrator)?;
     let now = Utc::now();
     let run_id = format!("run-{}", &Uuid::new_v4().to_string()[..12]);
+    let entry_members = definition
+        .parallel
+        .iter()
+        .find(|group| group.name == definition.entry_point)
+        .map(|group| group.agents.iter().cloned().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
     let nodes = definition
         .steps
         .iter()
@@ -889,8 +1073,14 @@ pub fn materialize(
                 .or_else(|| definition.defaults.runtime.execution.clone()),
             judge_policy: step.judge_policy,
             session_id: None,
-            status: LifecycleStatus::Queued,
+            child_run_id: None,
+            status: if step.name == definition.entry_point || entry_members.contains(&step.name) {
+                LifecycleStatus::Queued
+            } else {
+                LifecycleStatus::Pending
+            },
             attempt: 0,
+            retry_after: None,
             prompt: step.prompt.clone(),
             input: None,
             output: None,
@@ -957,11 +1147,14 @@ pub fn materialize(
         expected_output: definition.expected_output,
         status: LifecycleStatus::Queued,
         orchestrator_id: Some(orchestrator.id.clone()),
+        parent_run_id: parent_run_id.map(str::to_owned),
         definition: Some(definition_path.display().to_string()),
         revision: planned.revision,
         checkpoint: None,
         mode,
         process_id: None,
+        execution_nonce: None,
+        resume_requested: false,
         log_path: None,
         current_node: None,
         tokens: 0,
@@ -976,9 +1169,46 @@ pub fn materialize(
         updated_at: now,
     };
     state::update(&scope, |workspace| {
+        let active_orchestrator = workspace.sessions.iter().any(|session| {
+            session.id == orchestrator.id
+                && session.role == SessionRole::Orchestrator
+                && session.status.active()
+                && session.status != LifecycleStatus::Terminating
+        });
+        if !active_orchestrator {
+            bail!(
+                "orchestrator is not accepting new work: {}",
+                orchestrator.id
+            );
+        }
+        if let (Some(parent_run_id), Some(parent_node_id)) = (parent_run_id, parent_node_id) {
+            let parent = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == parent_run_id)
+                .with_context(|| format!("unknown parent run: {parent_run_id}"))?;
+            if !parent.status.active() || parent.status == LifecycleStatus::Terminating {
+                bail!("parent run is not accepting child workflows: {parent_run_id}");
+            }
+            let node = parent
+                .nodes
+                .iter_mut()
+                .find(|candidate| candidate.id == parent_node_id)
+                .with_context(|| format!("unknown parent node: {parent_node_id}"))?;
+            node.child_run_id = Some(run.id.clone());
+            node.updated_at = now;
+            parent.updated_at = now;
+        }
         workspace.runs.insert(0, run.clone());
         Ok(run)
     })
+}
+
+fn require_orchestrator(session: &Session) -> Result<()> {
+    if session.role != SessionRole::Orchestrator {
+        bail!("only an orchestrator can start a workflow");
+    }
+    Ok(())
 }
 
 fn required_gate(
@@ -1019,13 +1249,453 @@ fn required_gate(
     })
 }
 
-fn dependencies_done(run: &WorkflowRun, step: &Step) -> bool {
-    step.depends_on.iter().all(|dependency| {
-        run.nodes
+fn dependency_succeeded(run: &WorkflowRun, dependency: &str) -> bool {
+    run.nodes
+        .iter()
+        .find(|node| node.id == dependency)
+        .is_some_and(|node| node.status == LifecycleStatus::Done)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GroupOutcome {
+    Dormant,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+fn group_outcome(run: &WorkflowRun, group: &ParallelGroup) -> GroupOutcome {
+    let statuses = group
+        .agents
+        .iter()
+        .filter_map(|name| run.nodes.iter().find(|node| node.id == *name))
+        .map(|node| node.status)
+        .collect::<Vec<_>>();
+    if statuses
+        .iter()
+        .all(|status| *status == LifecycleStatus::Pending)
+    {
+        return GroupOutcome::Dormant;
+    }
+    let failed = statuses
+        .iter()
+        .filter(|status| **status == LifecycleStatus::Failed)
+        .count();
+    let terminal = statuses
+        .iter()
+        .all(|status| matches!(status, LifecycleStatus::Done | LifecycleStatus::Failed));
+    match group.failure_mode {
+        FailureMode::FailFast if failed > 0 => GroupOutcome::Failed,
+        FailureMode::ContinueOnError if terminal => GroupOutcome::Succeeded,
+        FailureMode::AllOrNothing if terminal && failed > 0 => GroupOutcome::Failed,
+        FailureMode::AllOrNothing if terminal => GroupOutcome::Succeeded,
+        FailureMode::FailFast if terminal => GroupOutcome::Succeeded,
+        _ => GroupOutcome::Running,
+    }
+}
+
+fn definition_dependency_succeeded(
+    definition: &Definition,
+    run: &WorkflowRun,
+    dependency: &str,
+) -> bool {
+    definition
+        .parallel
+        .iter()
+        .find(|group| group.name == dependency)
+        .map_or_else(
+            || dependency_succeeded(run, dependency),
+            |group| group_outcome(run, group) == GroupOutcome::Succeeded,
+        )
+}
+
+fn runtime_dependencies_done(definition: &Definition, run: &WorkflowRun, step: &Step) -> bool {
+    step.depends_on
+        .iter()
+        .all(|dependency| definition_dependency_succeeded(definition, run, dependency))
+}
+
+fn route_context(definition: &Definition, run: &WorkflowRun, source: &str) -> serde_json::Value {
+    let mut context = serde_json::Map::new();
+    context.insert(
+        "workflow".into(),
+        json!({
+            "input": definition.input,
+            "goal": definition.goal,
+        }),
+    );
+    context.insert(
+        "context".into(),
+        json!({ "iteration": iteration_count(run) }),
+    );
+    for node in &run.nodes {
+        context.insert(
+            node.id.clone(),
+            json!({
+                "output": node.output,
+                "status": node.status.to_string(),
+            }),
+        );
+    }
+    for group in &definition.parallel {
+        let outputs = group
+            .agents
             .iter()
-            .find(|node| node.id == *dependency)
-            .is_some_and(|node| node.status == LifecycleStatus::Done)
+            .filter_map(|name| {
+                run.nodes
+                    .iter()
+                    .find(|node| node.id == *name && node.status == LifecycleStatus::Done)
+                    .map(|node| (name.clone(), node.output.clone().unwrap_or_default()))
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let errors = group
+            .agents
+            .iter()
+            .filter_map(|name| {
+                run.nodes
+                    .iter()
+                    .find(|node| node.id == *name && node.status == LifecycleStatus::Failed)
+                    .map(|node| {
+                        (
+                            name.clone(),
+                            json!({
+                                "status": "failed",
+                                "message": node.activity.last().map(|event| &event.message),
+                            }),
+                        )
+                    })
+            })
+            .collect::<serde_json::Map<_, _>>();
+        context.insert(
+            group.name.clone(),
+            json!({ "outputs": outputs, "errors": errors }),
+        );
+    }
+    if let Some(node) = run.nodes.iter().find(|node| node.id == source) {
+        context.insert("output".into(), node.output.clone().unwrap_or_default());
+        context.insert("status".into(), json!(node.status.to_string()));
+    } else if let Some(group) = context.get(source).cloned() {
+        context.insert("output".into(), group);
+        context.insert("status".into(), json!("done"));
+    }
+    serde_json::Value::Object(context)
+}
+
+fn route_matches(route: &Route, context: &serde_json::Value) -> Result<bool> {
+    let Some(condition) = route.when.as_deref() else {
+        return Ok(true);
+    };
+    let template = route_template(condition);
+    let mut environment = Environment::new();
+    environment.add_template("route", &template)?;
+    let rendered = environment.get_template("route")?.render(context)?;
+    match rendered.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" | "" | "none" | "null" => Ok(false),
+        value => bail!("route condition must render a boolean, got {value:?}"),
+    }
+}
+
+fn selected_route<'a>(
+    routes: &'a [Route],
+    context: &serde_json::Value,
+) -> Result<Option<&'a Route>> {
+    for route in routes {
+        if route_matches(route, context)? {
+            return Ok(Some(route));
+        }
+    }
+    Ok(None)
+}
+
+fn iteration_count(run: &WorkflowRun) -> u32 {
+    run.nodes
+        .iter()
+        .map(|node| node.attempt)
+        .fold(0, u32::saturating_add)
+}
+
+fn routed_marker(source: &str, generation: u32) -> String {
+    format!("route:{source}:{generation}")
+}
+
+fn has_route_marker(run: &WorkflowRun, marker: &str) -> bool {
+    run.nodes
+        .iter()
+        .any(|node| node.activity.iter().any(|event| event.kind == marker))
+}
+
+fn record_route(run: &mut WorkflowRun, source: &str, marker: &str, target: Option<&str>) {
+    let index = run
+        .nodes
+        .iter()
+        .position(|node| node.id == source)
+        .or_else(|| (!run.nodes.is_empty()).then_some(0));
+    if let Some(node) = index.and_then(|index| run.nodes.get_mut(index)) {
+        node.record_activity(
+            marker,
+            target.map_or_else(
+                || "no route matched".into(),
+                |target| format!("routed to {target}"),
+            ),
+        );
+    }
+}
+
+fn activate_target(run: &mut WorkflowRun, definition: &Definition, target: &str) {
+    let names = definition
+        .parallel
+        .iter()
+        .find(|group| group.name == target)
+        .map(|group| group.agents.clone())
+        .unwrap_or_else(|| vec![target.to_owned()]);
+    for node in run.nodes.iter_mut().filter(|node| names.contains(&node.id)) {
+        if !matches!(
+            node.status,
+            LifecycleStatus::Working | LifecycleStatus::Waiting | LifecycleStatus::Terminating
+        ) {
+            node.status = LifecycleStatus::Queued;
+            node.retry_after = None;
+            node.updated_at = Utc::now();
+        }
+    }
+}
+
+fn route_targets(definition: &Definition) -> BTreeSet<&str> {
+    definition
+        .steps
+        .iter()
+        .flat_map(|step| &step.routes)
+        .chain(definition.parallel.iter().flat_map(|group| &group.routes))
+        .filter_map(|route| {
+            (!matches!(route.to.as_str(), "$end" | "self")).then_some(route.to.as_str())
+        })
+        .collect()
+}
+
+fn advance_state(run: &mut WorkflowRun, definition: &Definition) -> Result<bool> {
+    let snapshot = run.clone();
+    let mut decisions = Vec::new();
+    for step in &definition.steps {
+        let Some(node) = snapshot.nodes.iter().find(|node| node.id == step.name) else {
+            continue;
+        };
+        if node.status != LifecycleStatus::Done || step.routes.is_empty() {
+            continue;
+        }
+        let marker = routed_marker(&step.name, node.attempt);
+        if has_route_marker(&snapshot, &marker) {
+            continue;
+        }
+        let context = route_context(definition, &snapshot, &step.name);
+        decisions.push((
+            step.name.clone(),
+            marker,
+            selected_route(&step.routes, &context)?.map(|route| route.to.clone()),
+        ));
+    }
+    for group in &definition.parallel {
+        if group.routes.is_empty() || group_outcome(&snapshot, group) != GroupOutcome::Succeeded {
+            continue;
+        }
+        let generation = group
+            .agents
+            .iter()
+            .filter_map(|name| snapshot.nodes.iter().find(|node| node.id == *name))
+            .map(|node| node.attempt)
+            .fold(0, u32::saturating_add);
+        let marker = routed_marker(&group.name, generation);
+        if has_route_marker(&snapshot, &marker) {
+            continue;
+        }
+        let context = route_context(definition, &snapshot, &group.name);
+        decisions.push((
+            group.name.clone(),
+            marker,
+            selected_route(&group.routes, &context)?.map(|route| route.to.clone()),
+        ));
+    }
+
+    let mut ended = false;
+    for (source, marker, target) in decisions {
+        record_route(run, &source, &marker, target.as_deref());
+        match target.as_deref() {
+            Some("$end") => {
+                ended = true;
+                break;
+            }
+            Some("self") => activate_target(run, definition, &source),
+            Some(target) => activate_target(run, definition, target),
+            None => {}
+        }
+    }
+    if ended {
+        for node in &mut run.nodes {
+            if matches!(
+                node.status,
+                LifecycleStatus::Pending | LifecycleStatus::Queued | LifecycleStatus::Waiting
+            ) {
+                node.status = LifecycleStatus::Skipped;
+                node.retry_after = None;
+                node.updated_at = Utc::now();
+                node.record_activity("skipped", "workflow routed to $end");
+            }
+        }
+        return Ok(true);
+    }
+
+    let routed_targets = route_targets(definition);
+    let group_members = definition
+        .parallel
+        .iter()
+        .flat_map(|group| group.agents.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    loop {
+        let activatable = definition
+            .steps
+            .iter()
+            .filter(|step| {
+                !step.depends_on.is_empty()
+                    && !routed_targets.contains(step.name.as_str())
+                    && !group_members.contains(step.name.as_str())
+                    && run
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == step.name)
+                        .is_some_and(|node| node.status == LifecycleStatus::Pending)
+                    && runtime_dependencies_done(definition, run, step)
+            })
+            .map(|step| step.name.clone())
+            .collect::<Vec<_>>();
+        if activatable.is_empty() {
+            break;
+        }
+        for target in activatable {
+            activate_target(run, definition, &target);
+        }
+    }
+    Ok(false)
+}
+
+fn fatal_failure(definition: &Definition, run: &WorkflowRun) -> bool {
+    run.nodes.iter().any(|node| {
+        if node.status != LifecycleStatus::Failed {
+            return false;
+        }
+        definition
+            .parallel
+            .iter()
+            .find(|group| group.agents.contains(&node.id))
+            .is_none_or(|group| group_outcome(run, group) == GroupOutcome::Failed)
     })
+}
+
+fn workflow_complete(definition: &Definition, run: &WorkflowRun) -> bool {
+    !fatal_failure(definition, run)
+        && run.nodes.iter().all(|node| {
+            matches!(
+                node.status,
+                LifecycleStatus::Done | LifecycleStatus::Failed | LifecycleStatus::Skipped
+            )
+        })
+}
+
+fn workflow_deadline(definition: &Definition, run: &WorkflowRun) -> Option<DateTime<Utc>> {
+    definition.limits.timeout_seconds.and_then(|seconds| {
+        chrono::Duration::try_seconds(i64::try_from(seconds).ok()?)
+            .map(|limit| run.created_at + limit)
+    })
+}
+
+fn limit_violation(definition: &Definition, run: &WorkflowRun) -> Option<String> {
+    if workflow_deadline(definition, run).is_some_and(|deadline| Utc::now() >= deadline) {
+        return Some(format!(
+            "workflow timeout of {}s exceeded",
+            definition.limits.timeout_seconds.unwrap_or_default()
+        ));
+    }
+    if definition
+        .limits
+        .budget_usd
+        .is_some_and(|budget| run.cost_usd > budget)
+    {
+        return Some(format!(
+            "workflow budget of ${:.4} exceeded by ${:.4}",
+            definition.limits.budget_usd.unwrap_or_default(),
+            run.cost_usd
+        ));
+    }
+    None
+}
+
+fn fail_run_with_reason(
+    scope: &Path,
+    run_id: &str,
+    kind: &str,
+    reason: &str,
+) -> Result<WorkflowRun> {
+    state::update(scope, |workspace| {
+        let run = workspace
+            .runs
+            .iter_mut()
+            .find(|run| run.id == run_id)
+            .with_context(|| format!("unknown run: {run_id}"))?;
+        if run.status == LifecycleStatus::Terminating {
+            return Ok(run.clone());
+        }
+        for node in &mut run.nodes {
+            if node.status.active() {
+                node.status = LifecycleStatus::Skipped;
+                node.retry_after = None;
+                node.updated_at = Utc::now();
+                node.record_activity(kind, reason);
+            }
+        }
+        run.status = LifecycleStatus::Failed;
+        run.current_node = None;
+        run.process_id = None;
+        run.execution_nonce = None;
+        run.updated_at = Utc::now();
+        Ok(run.clone())
+    })
+}
+
+fn ready_steps(definition: &Definition, run: &WorkflowRun) -> Vec<Step> {
+    let mut group_counts = BTreeMap::<&str, usize>::new();
+    definition
+        .steps
+        .iter()
+        .filter(|step| {
+            run.nodes
+                .iter()
+                .find(|node| node.id == step.name)
+                .is_some_and(|node| {
+                    matches!(
+                        node.status,
+                        LifecycleStatus::Queued | LifecycleStatus::Waiting
+                    ) && node
+                        .retry_after
+                        .is_none_or(|retry_after| retry_after <= Utc::now())
+                })
+                && runtime_dependencies_done(definition, run, step)
+        })
+        .filter(|step| {
+            let Some(group) = definition
+                .parallel
+                .iter()
+                .find(|group| group.agents.contains(&step.name))
+            else {
+                return true;
+            };
+            let count = group_counts.entry(group.name.as_str()).or_default();
+            if group.max_concurrent.is_some_and(|limit| *count >= limit) {
+                return false;
+            }
+            *count += 1;
+            true
+        })
+        .cloned()
+        .collect()
 }
 
 fn parse_duration(value: Option<&str>) -> Result<Duration> {
@@ -1039,21 +1709,65 @@ fn parse_duration(value: Option<&str>) -> Result<Duration> {
     } else {
         bail!("duration must end in ms, s, or m");
     };
-    Ok(Duration::from_millis(number.parse::<u64>()? * scale))
+    let milliseconds = number
+        .parse::<u64>()?
+        .checked_mul(scale)
+        .context("duration is too large")?;
+    Ok(Duration::from_millis(milliseconds))
+}
+
+fn wait_for_duration(
+    scope: &Path,
+    run_id: &str,
+    duration: Duration,
+    workflow_deadline: Option<DateTime<Utc>>,
+) -> Result<()> {
+    let deadline = Instant::now()
+        .checked_add(duration)
+        .context("wait duration is too large")?;
+    loop {
+        let run = find_run(scope, run_id)?;
+        if run.status == LifecycleStatus::Terminating {
+            bail!("workflow wait cancelled");
+        }
+        if workflow_deadline.is_some_and(|deadline| Utc::now() >= deadline) {
+            bail!("workflow timeout exceeded");
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(());
+        }
+        thread::sleep((deadline - now).min(Duration::from_millis(50)));
+    }
 }
 
 struct StepOutcome {
+    status: LifecycleStatus,
     output: serde_json::Value,
     session_id: Option<String>,
     summary: String,
 }
 
+fn run_cancelled(
+    scope: &Path,
+    run_id: &str,
+    workflow_deadline: Option<DateTime<Utc>>,
+) -> Result<bool> {
+    Ok(
+        find_run(scope, run_id)?.status == LifecycleStatus::Terminating
+            || workflow_deadline.is_some_and(|deadline| Utc::now() >= deadline),
+    )
+}
+
 const EXECUTION_LEASE_ENV: &str = "ORC_EXECUTION_LEASE";
+const EXECUTION_RECOVERY_ENV: &str = "ORC_EXECUTION_RECOVERY";
 
 struct ExecutionLease {
     path: PathBuf,
     nonce: String,
     armed: bool,
+    #[cfg(unix)]
+    _identity: fs::File,
 }
 
 struct ExecutionLeaseGuard {
@@ -1063,6 +1777,8 @@ struct ExecutionLeaseGuard {
 
 impl ExecutionLeaseGuard {
     fn try_acquire(path: &Path) -> Result<Option<Self>> {
+        let directory = path.parent().context("execution lease has no directory")?;
+        fs::create_dir_all(directory).context("create execution lease directory")?;
         #[cfg(unix)]
         {
             let guard_path = path.with_file_name(format!(
@@ -1096,6 +1812,21 @@ impl ExecutionLeaseGuard {
             Ok(Some(Self {}))
         }
     }
+
+    fn acquire(path: &Path, timeout: Duration) -> Result<Self> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .context("execution lease guard timeout is too large")?;
+        loop {
+            if let Some(guard) = Self::try_acquire(path)? {
+                return Ok(guard);
+            }
+            if Instant::now() >= deadline {
+                bail!("timed out acquiring the execution lease guard");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 impl Drop for ExecutionLeaseGuard {
@@ -1121,32 +1852,45 @@ impl ExecutionLease {
         fs::create_dir_all(directory).context("create execution lease directory")?;
         let inherited = std::env::var(EXECUTION_LEASE_ENV).ok();
 
-        for _ in 0..3 {
+        let attempts = if inherited.is_some() { 200 } else { 3 };
+        for _ in 0..attempts {
             let Some(_guard) = ExecutionLeaseGuard::try_acquire(path)? else {
-                thread::sleep(Duration::from_millis(1));
+                thread::sleep(Duration::from_millis(10));
                 continue;
             };
             if let Some(record) = read_execution_lease(path)? {
                 if inherited.as_deref() == Some(record.nonce.as_str()) {
+                    let Some(identity) = try_acquire_execution_identity(path)? else {
+                        drop(_guard);
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    };
                     let lease = Self {
                         path: path.to_owned(),
                         nonce: record.nonce,
                         armed: true,
+                        #[cfg(unix)]
+                        _identity: identity,
                     };
                     lease.write_owner(std::process::id())?;
                     return Ok(Some(lease));
                 }
-                if process_is_live(record.process_id) {
+                if execution_identity_active(path)? {
                     return Ok(None);
                 }
                 remove_execution_lease(path, &record.nonce)?;
                 continue;
             }
 
+            let Some(identity) = try_acquire_execution_identity(path)? else {
+                return Ok(None);
+            };
             let lease = Self {
                 path: path.to_owned(),
                 nonce: Uuid::new_v4().to_string(),
                 armed: true,
+                #[cfg(unix)]
+                _identity: identity,
             };
             if lease.install(std::process::id())? {
                 return Ok(Some(lease));
@@ -1196,6 +1940,42 @@ impl ExecutionLease {
     }
 }
 
+fn execution_identity_path(path: &Path) -> PathBuf {
+    path.with_extension("identity")
+}
+
+fn try_acquire_execution_identity(path: &Path) -> Result<Option<fs::File>> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(execution_identity_path(path))
+        .context("open execution identity lock")?;
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        const LOCK_EX: i32 = 2;
+        const LOCK_NB: i32 = 4;
+        if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+            return Ok(Some(file));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        Err(error).context("acquire execution identity lock")
+    }
+    #[cfg(not(unix))]
+    Ok(Some(file))
+}
+
+fn execution_identity_active(path: &Path) -> Result<bool> {
+    Ok(try_acquire_execution_identity(path)?.is_none())
+}
+
 impl Drop for ExecutionLease {
     fn drop(&mut self) {
         if self.armed {
@@ -1214,6 +1994,77 @@ fn execution_lease_path(scope: &Path, run_id: &str) -> PathBuf {
         .join("orc/leases")
         .join(state::scope_key(scope))
         .join(format!("{}.lease", state::scope_key(Path::new(run_id))))
+}
+
+fn active_process_directory(scope: &Path, run_id: &str) -> PathBuf {
+    crate::config::state_home()
+        .join("orc/processes")
+        .join(state::scope_key(scope))
+        .join(state::scope_key(Path::new(run_id)))
+}
+
+fn clear_process_records(directory: &Path) -> Result<()> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("read command tracker directory"),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) == Some("process") {
+            if tracked_process_active(&path)? {
+                bail!(
+                    "tracked command is still active for {}; cancel the run before resuming",
+                    directory.display()
+                );
+            }
+            fs::remove_file(path).context("remove stale command tracker")?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn tracked_process_active(path: &Path) -> Result<bool> {
+    let file = match fs::OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("open command tracker {}", path.display()));
+        }
+    };
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+        return Ok(false);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(true);
+    }
+    Err(error).with_context(|| format!("lock command tracker {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn tracked_process_active(_path: &Path) -> Result<bool> {
+    Ok(false)
+}
+
+fn wait_for_tracker_release(path: &Path, timeout: Duration) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if !tracked_process_active(path)? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    if tracked_process_active(path)? {
+        bail!("tracked command monitor did not exit: {}", path.display());
+    }
+    Ok(())
 }
 
 fn read_execution_lease(path: &Path) -> Result<Option<ExecutionLeaseRecord>> {
@@ -1254,15 +2105,25 @@ fn process_is_live(process_id: u32) -> bool {
     signal_process(process_id, 0).is_ok()
 }
 
-fn execute_step(
-    config: &Config,
-    providers: &[provider::Manifest],
-    scope: &Path,
-    run: &WorkflowRun,
-    definition_path: &Path,
-    definition: &Definition,
-    step: &Step,
-) -> Result<StepOutcome> {
+struct StepExecution<'a> {
+    config: &'a Config,
+    providers: &'a [provider::Manifest],
+    scope: &'a Path,
+    run: &'a WorkflowRun,
+    definition_path: &'a Path,
+    definition: &'a Definition,
+    tracker_directory: &'a Path,
+    workflow_deadline: Option<DateTime<Utc>>,
+}
+
+fn execute_step(context: &StepExecution<'_>, step: &Step) -> Result<StepOutcome> {
+    let config = context.config;
+    let providers = context.providers;
+    let scope = context.scope;
+    let run = context.run;
+    let definition_path = context.definition_path;
+    let definition = context.definition;
+    let tracker_directory = context.tracker_directory;
     match step.r#type {
         StepKind::Agent => {
             let harness = step
@@ -1278,7 +2139,10 @@ fn execute_step(
                 .or_else(|| definition.defaults.runtime.model.clone());
             let prompt = step.prompt.clone().unwrap_or_else(|| {
                 format!(
-                    "Goal: {}\nExpected output: {}\nSuccess criteria:\n{}",
+                    r#"Goal: {}
+Expected output: {}
+Success criteria:
+{}"#,
                     step.goal,
                     step.expected_output,
                     step.success_criteria
@@ -1308,11 +2172,14 @@ fn execute_step(
                     parent_id: run.orchestrator_id.clone(),
                     run_id: Some(run.id.clone()),
                     node_id: Some(step.name.clone()),
+                    runtime_timeout_seconds: step.timeout_seconds,
+                    idle_timeout_seconds: step.idle_timeout_seconds,
                     source: RegistrationSource::Managed,
                     ..SessionLink::default()
                 },
             )?;
-            let request = json!({
+            assign_node_session(scope, &run.id, &step.name, &session.id)?;
+            let mut request = json!({
                 "version": "orc.provider/v1",
                 "action": "launch",
                 "scope": scope,
@@ -1327,26 +2194,70 @@ fn execute_step(
                     "ORC_RUN_ID": run.id,
                     "ORC_NODE_ID": step.name,
                 },
+                "providers": {},
             });
-            let plan = provider::resolve_plan(config, providers, Action::Launch, request)?;
-            let result = provider::run_plan(&plan, scope)?;
-            control::update_session(
-                scope,
-                &session.id,
-                if plan.accepts(result.code) {
-                    LifecycleStatus::Done
-                } else {
-                    LifecycleStatus::Failed
-                },
-            )?;
+            if let Some(execution) = step.runtime.execution.as_ref().or(definition
+                .defaults
+                .runtime
+                .execution
+                .as_ref())
+            {
+                request["providers"][provider::Capability::ExecutionRun.to_string()] =
+                    serde_json::Value::String(execution.clone());
+            }
+            let launched: Result<_> = (|| {
+                daemon::ensure_running(config)?;
+                let cancelled = || run_cancelled(scope, &run.id, context.workflow_deadline);
+                let plan = provider::resolve_plan_tracked(
+                    config,
+                    providers,
+                    Action::Launch,
+                    request,
+                    tracker_directory,
+                    &cancelled,
+                )?;
+                let result = provider::run_plan_tracked_cancellable(
+                    &plan,
+                    scope,
+                    Some(tracker_directory),
+                    Some(&cancelled),
+                )?;
+                Ok((plan, result))
+            })();
+            let (plan, result) = match launched {
+                Ok(value) => value,
+                Err(error) => {
+                    if let Err(cleanup_error) =
+                        control::terminate(config, scope, &session.id, "managed launch failed")
+                    {
+                        control::update_session(scope, &session.id, LifecycleStatus::Failed)?;
+                        return Err(error.context(format!(
+                            "managed session cleanup failed: {cleanup_error:#}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            };
             if !plan.accepts(result.code) {
+                if let Err(cleanup_error) =
+                    control::terminate(config, scope, &session.id, "managed launch failed")
+                {
+                    control::update_session(scope, &session.id, LifecycleStatus::Failed)?;
+                    bail!(
+                        "agent exited with {}: {}; managed session cleanup failed: {cleanup_error:#}",
+                        result.code,
+                        result.stderr.trim()
+                    );
+                }
                 bail!(
                     "agent exited with {}: {}",
                     result.code,
                     result.stderr.trim()
                 );
             }
+            control::update_session(scope, &session.id, LifecycleStatus::Done)?;
             Ok(StepOutcome {
+                status: LifecycleStatus::Done,
                 output: json!({ "stdout": result.stdout, "stderr": result.stderr }),
                 session_id: Some(session.id),
                 summary: "agent completed".into(),
@@ -1360,20 +2271,38 @@ fn execute_step(
                 environment: BTreeMap::new(),
                 success_codes: vec![0],
             };
-            let request = json!({
+            let mut request = json!({
                 "version": "orc.provider/v1",
                 "action": "execute",
                 "scope": scope,
                 "step": step.name,
+                "providers": {},
             });
-            let plan = provider::resolve_plan_from(
+            if let Some(execution) = step.runtime.execution.as_ref().or(definition
+                .defaults
+                .runtime
+                .execution
+                .as_ref())
+            {
+                request["providers"][provider::Capability::ExecutionRun.to_string()] =
+                    serde_json::Value::String(execution.clone());
+            }
+            let cancelled = || run_cancelled(scope, &run.id, context.workflow_deadline);
+            let plan = provider::resolve_plan_from_tracked(
                 config,
                 providers,
                 Action::Execute,
                 request,
                 Some(initial),
+                Some(tracker_directory),
+                Some(&cancelled),
             )?;
-            let result = provider::run_plan(&plan, scope)?;
+            let result = provider::run_plan_tracked_cancellable(
+                &plan,
+                scope,
+                Some(tracker_directory),
+                Some(&cancelled),
+            )?;
             if !plan.accepts(result.code) {
                 bail!(
                     "command exited with {}: {}",
@@ -1382,19 +2311,27 @@ fn execute_step(
                 );
             }
             Ok(StepOutcome {
+                status: LifecycleStatus::Done,
                 output: json!({ "stdout": result.stdout, "stderr": result.stderr }),
                 session_id: None,
                 summary: "command completed".into(),
             })
         }
         StepKind::Set => Ok(StepOutcome {
+            status: LifecycleStatus::Done,
             output: step.value.clone().unwrap_or(serde_json::Value::Null),
             session_id: None,
             summary: "value recorded".into(),
         }),
         StepKind::Wait => {
-            thread::sleep(parse_duration(step.duration.as_deref())?);
+            wait_for_duration(
+                scope,
+                &run.id,
+                parse_duration(step.duration.as_deref())?,
+                context.workflow_deadline,
+            )?;
             Ok(StepOutcome {
+                status: LifecycleStatus::Done,
                 output: json!({ "waited": step.duration }),
                 session_id: None,
                 summary: "wait completed".into(),
@@ -1413,23 +2350,95 @@ fn execute_step(
                     .unwrap_or(Path::new("."))
                     .join(reference)
             };
-            let child = materialize(config, scope, &child_path, RunMode::Foreground)?;
-            let child = execute(config, scope, &child.id)?;
+            let depth = run_depth(&state::read(scope)?, &run.id)?;
+            let depth_limit = step.max_depth.unwrap_or(config.workflows.max_depth);
+            if depth >= depth_limit {
+                bail!(
+                    "sub-workflow depth {} exceeds the configured limit {depth_limit}",
+                    depth + 1
+                );
+            }
+            let child = if let Some(child_run_id) = run
+                .nodes
+                .iter()
+                .find(|node| node.id == step.name)
+                .and_then(|node| node.child_run_id.as_deref())
+            {
+                find_run(scope, child_run_id)?
+            } else {
+                materialize_with_parent(
+                    config,
+                    scope,
+                    &child_path,
+                    RunMode::Foreground,
+                    Some(&run.id),
+                    Some(&step.name),
+                )?
+            };
+            let (mut child, mut executor) = spawn_executor(scope, &child.id)?;
+            let expected_process = child.process_id;
+            let expected_nonce = child.execution_nonce.clone();
+            while matches!(
+                child.status,
+                LifecycleStatus::Queued | LifecycleStatus::Working
+            ) {
+                if context
+                    .workflow_deadline
+                    .is_some_and(|deadline| Utc::now() >= deadline)
+                {
+                    cancel(config, scope, &child.id)?;
+                    bail!("workflow timeout exceeded");
+                }
+                if let Some(executor) = executor.as_mut()
+                    && let Some(status) = executor.try_wait()?
+                {
+                    child = reconcile_executor_exit(
+                        config,
+                        scope,
+                        &child.id,
+                        expected_process,
+                        expected_nonce.as_deref(),
+                        status,
+                    )?;
+                    if !matches!(
+                        child.status,
+                        LifecycleStatus::Queued | LifecycleStatus::Working
+                    ) {
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(50));
+                child = find_run(scope, &child.id)?;
+            }
+            if let Some(executor) = executor.as_mut() {
+                let _ = executor.wait();
+            }
+            if child.status == LifecycleStatus::Waiting {
+                return Ok(StepOutcome {
+                    status: LifecycleStatus::Waiting,
+                    output: serde_json::to_value(&child)?,
+                    session_id: None,
+                    summary: format!("sub-workflow {} is waiting", child.name),
+                });
+            }
             if child.status != LifecycleStatus::Done {
                 bail!("sub-workflow {} stopped as {}", child.name, child.status);
             }
             Ok(StepOutcome {
+                status: LifecycleStatus::Done,
                 output: serde_json::to_value(&child)?,
                 session_id: None,
                 summary: format!("sub-workflow {} completed", child.name),
             })
         }
         StepKind::HumanGate => Ok(StepOutcome {
+            status: LifecycleStatus::Done,
             output: json!({ "approved": true }),
             session_id: None,
             summary: "human gate approved".into(),
         }),
         StepKind::Terminate => Ok(StepOutcome {
+            status: LifecycleStatus::Done,
             output: json!({ "terminated": true }),
             session_id: None,
             summary: "workflow termination step completed".into(),
@@ -1437,21 +2446,90 @@ fn execute_step(
     }
 }
 
+fn assign_node_session(scope: &Path, run_id: &str, node_id: &str, session_id: &str) -> Result<()> {
+    state::update(scope, |workspace| {
+        let run = workspace
+            .runs
+            .iter_mut()
+            .find(|run| run.id == run_id)
+            .with_context(|| format!("unknown run: {run_id}"))?;
+        let node = run
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+            .with_context(|| format!("unknown node: {node_id}"))?;
+        node.session_id = Some(session_id.to_owned());
+        node.updated_at = Utc::now();
+        run.updated_at = Utc::now();
+        Ok(())
+    })
+}
+
+#[cfg(test)]
 pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRun> {
+    execute_owned(config, scope, run_id)
+}
+
+#[cfg(not(test))]
+pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRun> {
+    if std::env::var_os(EXECUTION_LEASE_ENV).is_some() {
+        return execute_owned(config, scope, run_id);
+    }
+    daemon::ensure_running(config)?;
+    let scope = state::resolve_scope(scope)?;
+    let (mut run, mut executor) = spawn_executor(&scope, run_id)?;
+    let expected_process = run.process_id;
+    let expected_nonce = run.execution_nonce.clone();
+    while matches!(
+        run.status,
+        LifecycleStatus::Queued | LifecycleStatus::Working
+    ) {
+        if let Some(child) = executor.as_mut()
+            && let Some(status) = child.try_wait()?
+        {
+            run = reconcile_executor_exit(
+                config,
+                &scope,
+                run_id,
+                expected_process,
+                expected_nonce.as_deref(),
+                status,
+            )?;
+            if !matches!(
+                run.status,
+                LifecycleStatus::Queued | LifecycleStatus::Working
+            ) {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+        run = find_run(&scope, run_id)?;
+    }
+    if let Some(child) = executor.as_mut() {
+        let _ = child.wait();
+    }
+    Ok(run)
+}
+
+fn execute_owned(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRun> {
     let scope = state::resolve_scope(scope)?;
     let initial = find_run(&scope, run_id)?;
-    if !initial.status.active() {
-        return Ok(initial);
-    }
-    if initial
-        .process_id
-        .is_some_and(|process_id| process_id != std::process::id() && process_is_live(process_id))
-    {
+    if !initial.status.active() || initial.status == LifecycleStatus::Terminating {
         return Ok(initial);
     }
     let Some(_lease) = ExecutionLease::acquire(&scope, run_id)? else {
         return find_run(&scope, run_id);
     };
+    isolate_executor_process()?;
+    let recovering = std::env::var_os(EXECUTION_RECOVERY_ENV).is_some();
+    let tracker_directory = active_process_directory(&scope, run_id);
+    if recovering {
+        terminate_tracked_processes(&tracker_directory)?;
+    } else {
+        let _tracker_guard =
+            provider::ProcessTrackerGuard::acquire(&tracker_directory, Duration::from_secs(5))?;
+        clear_process_records(&tracker_directory)?;
+    }
     let autonomy = preferences::read(&scope)?.autonomy;
     state::update(&scope, |workspace| {
         let run = workspace
@@ -1459,10 +2537,15 @@ pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRu
             .iter_mut()
             .find(|run| run.id == run_id)
             .with_context(|| format!("unknown run: {run_id}"))?;
-        if !run.status.active() {
+        if !run.status.active() || run.status == LifecycleStatus::Terminating {
             return Ok(());
         }
+        if recovering {
+            block_interrupted_nodes(run);
+        }
         run.process_id = Some(std::process::id());
+        run.execution_nonce = Some(_lease.nonce.clone());
+        run.resume_requested = false;
         run.status = LifecycleStatus::Working;
         run.updated_at = Utc::now();
         Ok(())
@@ -1476,6 +2559,9 @@ pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRu
             .find(|run| run.id == run_id)
             .cloned()
             .with_context(|| format!("unknown run: {run_id}"))?;
+        if run.status == LifecycleStatus::Terminating {
+            return Ok(run);
+        }
         if !run.status.active() {
             return Ok(run);
         }
@@ -1485,42 +2571,113 @@ pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRu
                 .context("run has no workflow definition")?,
         );
         let definition = load(&definition_path)?;
-        if run
-            .nodes
-            .iter()
-            .all(|node| node.status == LifecycleStatus::Done)
-        {
-            return finish_run(&scope, run_id, LifecycleStatus::Done);
+        if let Some(reason) = limit_violation(&definition, &run) {
+            let failed = fail_run_with_reason(&scope, run_id, "limit", &reason)?;
+            wake_parent(config, &scope, &failed)?;
+            return Ok(failed);
         }
-        if run
-            .nodes
-            .iter()
-            .any(|node| node.status == LifecycleStatus::Failed)
-        {
-            return finish_run(&scope, run_id, LifecycleStatus::Failed);
+        state::update(&scope, |workspace| {
+            let run = workspace
+                .runs
+                .iter_mut()
+                .find(|run| run.id == run_id)
+                .with_context(|| format!("unknown run: {run_id}"))?;
+            advance_state(run, &definition)?;
+            run.updated_at = Utc::now();
+            Ok(())
+        })?;
+        let run = find_run(&scope, run_id)?;
+        if workflow_complete(&definition, &run) {
+            let completed = finish_run(&scope, run_id, LifecycleStatus::Done)?;
+            wake_parent(config, &scope, &completed)?;
+            return Ok(completed);
+        }
+        if fatal_failure(&definition, &run) {
+            let failed = fail_run_with_reason(
+                &scope,
+                run_id,
+                "aborted",
+                "workflow stopped after a stage failure",
+            )?;
+            wake_parent(config, &scope, &failed)?;
+            return Ok(failed);
+        }
+        let iterations = iteration_count(&run);
+        if iterations >= definition.limits.max_iterations {
+            let reason = format!(
+                "workflow iteration limit of {} reached",
+                definition.limits.max_iterations
+            );
+            let failed = fail_run_with_reason(&scope, run_id, "limit", &reason)?;
+            wake_parent(config, &scope, &failed)?;
+            return Ok(failed);
         }
         if !run.pending_gates.is_empty() {
             return finish_run(&scope, run_id, LifecycleStatus::Waiting);
         }
-        let ready = definition
-            .steps
-            .iter()
-            .filter(|step| {
-                run.nodes
-                    .iter()
-                    .find(|node| node.id == step.name)
-                    .is_some_and(|node| {
-                        matches!(
-                            node.status,
-                            LifecycleStatus::Queued | LifecycleStatus::Waiting
-                        )
+        if run.nodes.iter().any(|node| {
+            node.status == LifecycleStatus::Waiting
+                && node.child_run_id.as_ref().is_some_and(|child_id| {
+                    snapshot.runs.iter().any(|child| {
+                        child.id == *child_id
+                            && matches!(
+                                child.status,
+                                LifecycleStatus::Queued
+                                    | LifecycleStatus::Working
+                                    | LifecycleStatus::Waiting
+                                    | LifecycleStatus::Blocked
+                            )
                     })
-                    && dependencies_done(&run, step)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+                })
+        }) {
+            return finish_run(&scope, run_id, LifecycleStatus::Waiting);
+        }
+        let remaining = definition.limits.max_iterations.saturating_sub(iterations) as usize;
+        let mut ready = ready_steps(&definition, &run);
+        ready.truncate(remaining);
         if ready.is_empty() {
-            return finish_run(&scope, run_id, LifecycleStatus::Blocked);
+            if let Some(retry_after) = run
+                .nodes
+                .iter()
+                .filter(|node| node.status == LifecycleStatus::Queued)
+                .filter_map(|node| node.retry_after)
+                .min()
+                && retry_after > Utc::now()
+            {
+                let duration = (retry_after - Utc::now()).to_std().unwrap_or_default();
+                wait_for_duration(
+                    &scope,
+                    run_id,
+                    duration,
+                    workflow_deadline(&definition, &run),
+                )?;
+                continue;
+            }
+            let settled = state::update(&scope, |workspace| {
+                let run = workspace
+                    .runs
+                    .iter_mut()
+                    .find(|run| run.id == run_id)
+                    .with_context(|| format!("unknown run: {run_id}"))?;
+                for node in run
+                    .nodes
+                    .iter_mut()
+                    .filter(|node| node.status == LifecycleStatus::Pending)
+                {
+                    node.status = LifecycleStatus::Skipped;
+                    node.updated_at = Utc::now();
+                    node.record_activity("skipped", "no active route reaches this stage");
+                }
+                Ok(run.clone())
+            })?;
+            if workflow_complete(&definition, &settled) {
+                let completed = finish_run(&scope, run_id, LifecycleStatus::Done)?;
+                wake_parent(config, &scope, &completed)?;
+                return Ok(completed);
+            }
+            let blocked = finish_run(&scope, run_id, LifecycleStatus::Blocked)?;
+            wake_parent(config, &scope, &blocked)?;
+            return Ok(blocked);
         }
         if let Some(gate) = ready
             .iter()
@@ -1533,18 +2690,18 @@ pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRu
                     .iter_mut()
                     .find(|run| run.id == run_id)
                     .context("run disappeared")?;
+                if run.status == LifecycleStatus::Terminating {
+                    return Ok(());
+                }
                 run.pending_gates.push(gate.clone());
                 run.status = LifecycleStatus::Waiting;
                 run.process_id = None;
+                run.execution_nonce = None;
                 run.current_node = Some(before.clone());
                 if let Some(node) = run.nodes.iter_mut().find(|node| node.id == before) {
                     node.status = LifecycleStatus::Waiting;
                     node.updated_at = Utc::now();
-                    node.activity.push(ActivityEvent {
-                        at: Utc::now(),
-                        kind: "gate".into(),
-                        message: gate.reason.clone(),
-                    });
+                    node.record_activity("gate", gate.reason.clone());
                 }
                 Ok(())
             })?;
@@ -1564,7 +2721,7 @@ pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRu
                 .iter_mut()
                 .find(|run| run.id == run_id)
                 .context("run disappeared")?;
-            if !run.status.active() {
+            if !run.status.active() || run.status == LifecycleStatus::Terminating {
                 return Ok(());
             }
             run.status = LifecycleStatus::Working;
@@ -1572,40 +2729,59 @@ pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRu
             for node in run.nodes.iter_mut().filter(|node| names.contains(&node.id)) {
                 node.status = LifecycleStatus::Working;
                 node.attempt += 1;
+                node.retry_after = None;
                 node.updated_at = Utc::now();
-                node.activity.push(ActivityEvent {
-                    at: Utc::now(),
-                    kind: "started".into(),
-                    message: format!("attempt {} started", node.attempt),
-                });
+                node.record_activity("started", format!("attempt {} started", node.attempt));
             }
             Ok(())
         })?;
+        let execution = StepExecution {
+            config,
+            providers: &providers,
+            scope: &scope,
+            run: &run,
+            definition_path: &definition_path,
+            definition: &definition,
+            tracker_directory: &tracker_directory,
+            workflow_deadline: workflow_deadline(&definition, &run),
+        };
+        let wave_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let results = thread::scope(|thread_scope| {
+            let deadline = execution.workflow_deadline;
+            let budget = definition.limits.budget_usd;
+            if deadline.is_some() || budget.is_some() {
+                let wave_done = std::sync::Arc::clone(&wave_done);
+                let monitor_scope = execution.scope;
+                let monitor_run_id = execution.run.id.as_str();
+                let tracker_directory = execution.tracker_directory;
+                thread_scope.spawn(move || {
+                    while !wave_done.load(std::sync::atomic::Ordering::SeqCst) {
+                        let timed_out = deadline.is_some_and(|deadline| Utc::now() >= deadline);
+                        let over_budget = budget.is_some_and(|limit| {
+                            find_run(monitor_scope, monitor_run_id)
+                                .is_ok_and(|run| run.cost_usd > limit)
+                        });
+                        if timed_out || over_budget {
+                            let _ = terminate_tracked_processes(tracker_directory);
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                });
+            }
             let handles = ready
                 .iter()
                 .map(|step| {
                     let name = step.name.clone();
-                    thread_scope.spawn(|| {
-                        (
-                            name,
-                            execute_step(
-                                config,
-                                &providers,
-                                &scope,
-                                &run,
-                                &definition_path,
-                                &definition,
-                                step,
-                            ),
-                        )
-                    })
+                    thread_scope.spawn(|| (name, execute_step(&execution, step)))
                 })
                 .collect::<Vec<_>>();
-            handles
+            let results = handles
                 .into_iter()
                 .map(|handle| handle.join().expect("workflow worker panicked"))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            wave_done.store(true, std::sync::atomic::Ordering::SeqCst);
+            results
         });
         state::update(&scope, |workspace| {
             let run = workspace
@@ -1613,7 +2789,7 @@ pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRu
                 .iter_mut()
                 .find(|run| run.id == run_id)
                 .context("run disappeared")?;
-            if !run.status.active() {
+            if !run.status.active() || run.status == LifecycleStatus::Terminating {
                 return Ok(());
             }
             for (name, result) in &results {
@@ -1629,30 +2805,37 @@ pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRu
                     .context("workflow node disappeared")?;
                 match result {
                     Ok(outcome) => {
-                        node.status = LifecycleStatus::Done;
+                        node.status = outcome.status;
+                        node.retry_after = None;
                         node.output = Some(outcome.output.clone());
                         node.session_id.clone_from(&outcome.session_id);
-                        node.activity.push(ActivityEvent {
-                            at: Utc::now(),
-                            kind: "completed".into(),
-                            message: outcome.summary.clone(),
-                        });
+                        node.record_activity(
+                            if outcome.status == LifecycleStatus::Waiting {
+                                "waiting"
+                            } else {
+                                "completed"
+                            },
+                            outcome.summary.clone(),
+                        );
                     }
                     Err(error) if node.attempt <= step.retry.attempts => {
                         node.status = LifecycleStatus::Queued;
-                        node.activity.push(ActivityEvent {
-                            at: Utc::now(),
-                            kind: "retry".into(),
-                            message: format!("{error:#}"),
-                        });
+                        node.retry_after = Some(
+                            Utc::now()
+                                + chrono::Duration::from_std(Duration::from_secs(
+                                    step.retry.backoff_seconds,
+                                ))
+                                .context("retry backoff is too large")?,
+                        );
+                        if matches!(step.r#type, StepKind::Workflow) {
+                            node.child_run_id = None;
+                        }
+                        node.record_activity("retry", format!("{error:#}"));
                     }
                     Err(error) => {
                         node.status = LifecycleStatus::Failed;
-                        node.activity.push(ActivityEvent {
-                            at: Utc::now(),
-                            kind: "failed".into(),
-                            message: format!("{error:#}"),
-                        });
+                        node.retry_after = None;
+                        node.record_activity("failed", format!("{error:#}"));
                     }
                 }
                 node.updated_at = Utc::now();
@@ -1663,12 +2846,97 @@ pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRu
     }
 }
 
+fn block_interrupted_nodes(run: &mut WorkflowRun) {
+    for node in run
+        .nodes
+        .iter_mut()
+        .filter(|node| node.status == LifecycleStatus::Working)
+    {
+        node.status = LifecycleStatus::Blocked;
+        node.updated_at = Utc::now();
+        node.record_activity(
+            "recovered",
+            "executor stopped before it committed the outcome; inspect before retrying",
+        );
+    }
+    run.current_node = None;
+}
+
+#[cfg(all(unix, not(test)))]
+fn isolate_executor_process() -> Result<()> {
+    unsafe extern "C" {
+        fn getpgid(pid: i32) -> i32;
+        fn setpgid(pid: i32, pgid: i32) -> i32;
+    }
+    let process_id = std::process::id() as i32;
+    if unsafe { getpgid(0) } == process_id {
+        return Ok(());
+    }
+    if unsafe { setpgid(0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("isolate workflow executor process group");
+    }
+    Ok(())
+}
+
+#[cfg(any(not(unix), test))]
+fn isolate_executor_process() -> Result<()> {
+    Ok(())
+}
+
 fn find_run(scope: &Path, run_id: &str) -> Result<WorkflowRun> {
     state::read(scope)?
         .runs
         .into_iter()
         .find(|run| run.id == run_id)
         .with_context(|| format!("unknown run: {run_id}"))
+}
+
+fn reconcile_executor_exit(
+    config: &Config,
+    scope: &Path,
+    run_id: &str,
+    expected_process: Option<u32>,
+    expected_nonce: Option<&str>,
+    status: std::process::ExitStatus,
+) -> Result<WorkflowRun> {
+    let (run, claimed) = state::update(scope, |workspace| {
+        let run = workspace
+            .runs
+            .iter_mut()
+            .find(|run| run.id == run_id)
+            .with_context(|| format!("unknown run: {run_id}"))?;
+        if run.process_id != expected_process
+            || run.execution_nonce.as_deref() != expected_nonce
+            || !matches!(
+                run.status,
+                LifecycleStatus::Queued | LifecycleStatus::Working
+            )
+        {
+            return Ok((run.clone(), false));
+        }
+        let message = format!("workflow executor exited before committing state: {status}");
+        if let Some(node) = run
+            .current_node
+            .as_ref()
+            .and_then(|id| run.nodes.iter_mut().find(|node| &node.id == id))
+        {
+            node.status = LifecycleStatus::Failed;
+            node.updated_at = Utc::now();
+            node.record_activity("failed", message);
+        }
+        run.status = LifecycleStatus::Failed;
+        run.process_id = None;
+        run.execution_nonce = None;
+        run.updated_at = Utc::now();
+        Ok((run.clone(), true))
+    })?;
+    if claimed {
+        let directory = active_process_directory(scope, run_id);
+        terminate_tracked_processes(&directory)?;
+        wake_parent(config, scope, &run)?;
+    }
+    Ok(run)
 }
 
 fn finish_run(scope: &Path, run_id: &str, status: LifecycleStatus) -> Result<WorkflowRun> {
@@ -1678,12 +2946,39 @@ fn finish_run(scope: &Path, run_id: &str, status: LifecycleStatus) -> Result<Wor
             .iter_mut()
             .find(|run| run.id == run_id)
             .with_context(|| format!("unknown run: {run_id}"))?;
+        if run.status == LifecycleStatus::Terminating {
+            return Ok(run.clone());
+        }
         run.status = status;
         run.current_node = None;
         run.process_id = None;
+        run.execution_nonce = None;
+        if !status.active() {
+            run.resume_requested = false;
+        }
         run.updated_at = Utc::now();
         Ok(run.clone())
     })
+}
+
+fn wake_parent(config: &Config, scope: &Path, child: &WorkflowRun) -> Result<()> {
+    let Some(parent_run_id) = child.parent_run_id.as_deref() else {
+        return Ok(());
+    };
+    state::update(scope, |workspace| {
+        let parent = workspace
+            .runs
+            .iter_mut()
+            .find(|run| run.id == parent_run_id)
+            .with_context(|| format!("unknown parent run: {parent_run_id}"))?;
+        if parent.status.active() && parent.status != LifecycleStatus::Terminating {
+            parent.resume_requested = true;
+            parent.updated_at = Utc::now();
+        }
+        Ok(())
+    })?;
+    spawn(config, scope, parent_run_id)?;
+    Ok(())
 }
 
 pub fn approve(
@@ -1700,6 +2995,9 @@ pub fn approve(
             .iter_mut()
             .find(|run| run.id == run_id)
             .with_context(|| format!("unknown run: {run_id}"))?;
+        if run.status == LifecycleStatus::Terminating {
+            return Ok(run.clone());
+        }
         let index = run
             .pending_gates
             .iter()
@@ -1709,11 +3007,7 @@ pub fn approve(
         run.approved_gates.push(gate.id);
         if let Some(node) = run.nodes.iter_mut().find(|node| node.id == gate.before) {
             node.status = LifecycleStatus::Queued;
-            node.activity.push(ActivityEvent {
-                at: Utc::now(),
-                kind: "approved".into(),
-                message: "gate approved".into(),
-            });
+            node.record_activity("approved", "gate approved");
         }
         run.status = LifecycleStatus::Queued;
         run.updated_at = Utc::now();
@@ -1726,42 +3020,266 @@ pub fn approve(
     }
 }
 
-pub fn cancel(scope: &Path, run_id: &str) -> Result<WorkflowRun> {
+pub fn cancel(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRun> {
     let scope = state::resolve_scope(scope)?;
-    let process_id = find_run(&scope, run_id)?.process_id;
-    if let Some(process_id) = process_id.filter(|id| *id != std::process::id()) {
-        terminate_executor(process_id)?;
+    let initial = find_run(&scope, run_id)?;
+    if matches!(
+        initial.status,
+        LifecycleStatus::Done | LifecycleStatus::Archived
+    ) {
+        return Ok(initial);
     }
-    state::update(&scope, |workspace| {
-        for session in workspace
-            .sessions
+    daemon::ensure_running(config)?;
+    let run_ids = state::update(&scope, |workspace| {
+        let run_ids = run_family(workspace, run_id)?;
+        let now = Utc::now();
+        for run in workspace
+            .runs
             .iter_mut()
-            .filter(|session| session.run_id.as_deref() == Some(run_id) && session.status.active())
+            .filter(|run| run_ids.contains(&run.id) && run.status.active())
         {
-            session.status = LifecycleStatus::Cancelled;
+            run.status = LifecycleStatus::Terminating;
+            run.resume_requested = false;
+            for node in run.nodes.iter_mut().filter(|node| node.status.active()) {
+                node.status = LifecycleStatus::Terminating;
+                node.updated_at = now;
+            }
+            run.updated_at = now;
+        }
+        Ok(run_ids)
+    })?;
+    let guards = run_ids
+        .iter()
+        .map(|id| {
+            ExecutionLeaseGuard::acquire(&execution_lease_path(&scope, id), Duration::from_secs(2))
+                .with_context(|| format!("workflow executor ownership is changing: {id}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for id in &run_ids {
+        terminate_run_executor(&scope, id, &execution_lease_path(&scope, id))?;
+    }
+
+    let linked_sessions = state::read(&scope)?
+        .sessions
+        .into_iter()
+        .filter(|session| {
+            session
+                .run_id
+                .as_ref()
+                .is_some_and(|id| run_ids.contains(id))
+                && session.registration == RegistrationSource::Managed
+                && session.role != SessionRole::Orchestrator
+                && matches!(
+                    session.status,
+                    LifecycleStatus::Queued
+                        | LifecycleStatus::Working
+                        | LifecycleStatus::Waiting
+                        | LifecycleStatus::Blocked
+                        | LifecycleStatus::Failed
+                        | LifecycleStatus::Disconnected
+                        | LifecycleStatus::Terminating
+                )
+        })
+        .map(|session| session.id)
+        .collect::<Vec<_>>();
+    for session_id in linked_sessions {
+        let stopped = control::terminate(config, &scope, &session_id, "workflow cancelled")
+            .with_context(|| format!("stop managed session {session_id}"))?;
+        if stopped.status != LifecycleStatus::Cancelled {
+            bail!("managed session {session_id} is still terminating; retry cancellation");
+        }
+    }
+    let cancelled = state::update(&scope, |workspace| {
+        for session in workspace.sessions.iter_mut().filter(|session| {
+            session
+                .run_id
+                .as_ref()
+                .is_some_and(|id| run_ids.contains(id))
+                && session.registration != RegistrationSource::Managed
+                && session.status.active()
+        }) {
+            session.status = LifecycleStatus::Disconnected;
+            session.termination_reason =
+                Some("workflow cancelled; unmanaged session left running".into());
             session.updated_at = Utc::now();
+        }
+        let now = Utc::now();
+        for run in workspace.runs.iter_mut().filter(|run| {
+            run_ids.contains(&run.id)
+                && !matches!(
+                    run.status,
+                    LifecycleStatus::Done | LifecycleStatus::Archived
+                )
+        }) {
+            for node in run.nodes.iter_mut().filter(|node| node.status.active()) {
+                node.status = LifecycleStatus::Cancelled;
+                node.updated_at = now;
+                node.record_activity("cancelled", "run cancelled");
+            }
+            run.status = LifecycleStatus::Cancelled;
+            run.current_node = None;
+            run.process_id = None;
+            run.execution_nonce = None;
+            run.resume_requested = false;
+            run.pending_gates.clear();
+            run.updated_at = now;
+        }
+        workspace
+            .runs
+            .iter()
+            .find(|run| run.id == run_id)
+            .cloned()
+            .with_context(|| format!("unknown run: {run_id}"))
+    })?;
+    drop(guards);
+    wake_parent(config, &scope, &cancelled)?;
+    Ok(cancelled)
+}
+
+fn run_family(workspace: &WorkspaceState, root_id: &str) -> Result<BTreeSet<String>> {
+    if !workspace.runs.iter().any(|run| run.id == root_id) {
+        bail!("unknown run: {root_id}");
+    }
+    let mut family = BTreeSet::from([root_id.to_owned()]);
+    loop {
+        let children = workspace
+            .runs
+            .iter()
+            .filter(|run| {
+                run.parent_run_id
+                    .as_ref()
+                    .is_some_and(|parent| family.contains(parent))
+            })
+            .map(|run| run.id.clone())
+            .collect::<Vec<_>>();
+        let before = family.len();
+        family.extend(children);
+        if family.len() == before {
+            return Ok(family);
+        }
+    }
+}
+
+fn run_depth(workspace: &WorkspaceState, run_id: &str) -> Result<usize> {
+    let mut depth = 0;
+    let mut current = run_id;
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(current.to_owned()) {
+            bail!("workflow run lineage contains a cycle at {current}");
         }
         let run = workspace
             .runs
-            .iter_mut()
-            .find(|run| run.id == run_id)
-            .with_context(|| format!("unknown run: {run_id}"))?;
-        for node in run.nodes.iter_mut().filter(|node| node.status.active()) {
-            node.status = LifecycleStatus::Cancelled;
-            node.updated_at = Utc::now();
-            node.activity.push(ActivityEvent {
-                at: Utc::now(),
-                kind: "cancelled".into(),
-                message: "run cancelled".into(),
-            });
+            .iter()
+            .find(|run| run.id == current)
+            .with_context(|| format!("unknown run: {current}"))?;
+        let Some(parent) = run.parent_run_id.as_deref() else {
+            return Ok(depth);
+        };
+        depth += 1;
+        current = parent;
+    }
+}
+
+fn terminate_run_executor(scope: &Path, run_id: &str, lease_path: &Path) -> Result<()> {
+    let current = find_run(scope, run_id)?;
+    let process_directory = active_process_directory(scope, run_id);
+    let lease = read_execution_lease(lease_path)?;
+    if execution_identity_active(lease_path)? {
+        match (current.process_id, current.execution_nonce.as_deref()) {
+            (Some(process_id), Some(nonce)) => {
+                let record = lease
+                    .as_ref()
+                    .context("workflow executor lease is missing")?;
+                if record.process_id != process_id || record.nonce != nonce {
+                    bail!("workflow executor identity changed; refusing cancellation");
+                }
+            }
+            (None, None) => {}
+            _ => bail!("workflow executor state has an incomplete identity"),
         }
-        run.status = LifecycleStatus::Cancelled;
-        run.current_node = None;
-        run.process_id = None;
-        run.pending_gates.clear();
-        run.updated_at = Utc::now();
-        Ok(run.clone())
-    })
+    }
+    terminate_tracked_processes(&process_directory)?;
+    if execution_identity_active(lease_path)? {
+        wait_for_execution_identity_release(lease_path, Duration::from_secs(2))?;
+    }
+    if let Some(lease) = lease {
+        remove_execution_lease(lease_path, &lease.nonce)?;
+    }
+    Ok(())
+}
+
+fn terminate_tracked_processes(directory: &Path) -> Result<()> {
+    let paths = {
+        let _guard = provider::ProcessTrackerGuard::acquire(directory, Duration::from_secs(5))?;
+        signal_tracked_processes(directory)?
+    };
+    for path in paths {
+        if wait_for_tracker_release(&path, Duration::from_secs(2)).is_err() {
+            {
+                let _guard =
+                    provider::ProcessTrackerGuard::acquire(directory, Duration::from_secs(5))?;
+                if let Some(target) = tracked_process_target(&path)?
+                    && process_target_is_live(target)
+                {
+                    signal_target(target, 9).context("kill tracked command process group")?;
+                }
+            }
+            wait_for_tracker_release(&path, Duration::from_secs(2))?;
+        }
+        let _ = fs::remove_file(path);
+    }
+    Ok(())
+}
+
+fn signal_tracked_processes(directory: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("read command tracker directory"),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("process") {
+            continue;
+        }
+        if !tracked_process_active(&path)? {
+            let _ = fs::remove_file(path);
+            continue;
+        }
+        let Some(target) = tracked_process_target(&path)? else {
+            continue;
+        };
+        if process_target_is_live(target) {
+            signal_target(target, 15).context("stop tracked command process group")?;
+        }
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+fn tracked_process_target(path: &Path) -> Result<Option<i32>> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let bytes = loop {
+        let bytes = fs::read(path).context("read command tracker")?;
+        if bytes.len() == 4 {
+            break bytes;
+        }
+        if !tracked_process_active(path)? {
+            let _ = fs::remove_file(path);
+            return Ok(None);
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("active command tracker is incomplete: {}", path.display());
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let process_id = u32::from_ne_bytes(bytes.try_into().expect("tracker length checked"));
+    if process_id == 0 || process_id > i32::MAX as u32 {
+        bail!("invalid tracked process id {process_id}");
+    }
+    Ok(Some(-(process_id as i32)))
 }
 
 fn terminate_executor(process_id: u32) -> Result<()> {
@@ -1770,6 +3288,30 @@ fn terminate_executor(process_id: u32) -> Result<()> {
         bail!("could not stop workflow executor {process_id}");
     }
     Ok(())
+}
+
+fn wait_for_execution_identity_release(path: &Path, timeout: Duration) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if !execution_identity_active(path)? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    if execution_identity_active(path)? {
+        bail!("workflow executor did not release its identity after cancellation");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_target_is_live(target: i32) -> bool {
+    signal_target(target, 0).is_ok()
+}
+
+#[cfg(not(unix))]
+fn process_target_is_live(_target: i32) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -1781,7 +3323,11 @@ fn process_group_target(process_id: u32) -> Option<i32> {
         fn getpgid(pid: i32) -> i32;
     }
     let process_group = unsafe { getpgid(process_id as i32) };
-    (process_group == process_id as i32).then_some(-process_group)
+    if process_group == process_id as i32 {
+        return Some(-process_group);
+    }
+    let orphaned_group = -(process_id as i32);
+    process_target_is_live(orphaned_group).then_some(orphaned_group)
 }
 
 #[cfg(not(unix))]
@@ -1823,6 +3369,7 @@ pub fn set_process(
     scope: &Path,
     run_id: &str,
     process_id: u32,
+    execution_nonce: &str,
     log_path: Option<&Path>,
 ) -> Result<WorkflowRun> {
     let scope = state::resolve_scope(scope)?;
@@ -1832,10 +3379,11 @@ pub fn set_process(
             .iter_mut()
             .find(|run| run.id == run_id)
             .with_context(|| format!("unknown run: {run_id}"))?;
-        if !run.status.active() {
+        if !run.status.active() || run.status == LifecycleStatus::Terminating {
             return Ok(run.clone());
         }
         run.process_id = Some(process_id);
+        run.execution_nonce = Some(execution_nonce.to_owned());
         run.log_path = log_path.map(|path| path.display().to_string());
         run.status = LifecycleStatus::Working;
         run.updated_at = Utc::now();
@@ -1843,50 +3391,83 @@ pub fn set_process(
     })
 }
 
-pub fn fail(scope: &Path, run_id: &str, error: &anyhow::Error) -> Result<WorkflowRun> {
+pub fn fail(
+    config: &Config,
+    scope: &Path,
+    run_id: &str,
+    error: &anyhow::Error,
+) -> Result<WorkflowRun> {
     let scope = state::resolve_scope(scope)?;
-    state::update(&scope, |workspace| {
+    let failed = state::update(&scope, |workspace| {
         let run = workspace
             .runs
             .iter_mut()
             .find(|run| run.id == run_id)
             .with_context(|| format!("unknown run: {run_id}"))?;
+        if !run.status.active() || run.status == LifecycleStatus::Terminating {
+            return Ok(run.clone());
+        }
         if let Some(node) = run
             .current_node
             .as_ref()
             .and_then(|id| run.nodes.iter_mut().find(|node| &node.id == id))
         {
             node.status = LifecycleStatus::Failed;
-            node.activity.push(ActivityEvent {
-                at: Utc::now(),
-                kind: "failed".into(),
-                message: format!("{error:#}"),
-            });
+            node.record_activity("failed", format!("{error:#}"));
         }
         run.status = LifecycleStatus::Failed;
         run.process_id = None;
+        run.execution_nonce = None;
         run.updated_at = Utc::now();
         Ok(run.clone())
-    })
+    })?;
+    wake_parent(config, &scope, &failed)?;
+    Ok(failed)
 }
 
-pub fn spawn(scope: &Path, run_id: &str) -> Result<WorkflowRun> {
+pub fn spawn(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRun> {
+    daemon::ensure_running(config)?;
+    let (run, executor) = spawn_executor(scope, run_id)?;
+    if let Some(mut executor) = executor {
+        thread::spawn(move || {
+            let _ = executor.wait();
+        });
+    }
+    Ok(run)
+}
+
+pub(crate) fn executor_active(scope: &Path, run: &WorkflowRun) -> Result<bool> {
+    let (Some(process_id), Some(nonce)) = (run.process_id, run.execution_nonce.as_deref()) else {
+        return Ok(false);
+    };
+    let path = execution_lease_path(scope, &run.id);
+    if !execution_identity_active(&path)? {
+        return Ok(false);
+    }
+    let Some(record) = read_execution_lease(&path)? else {
+        return Ok(false);
+    };
+    Ok(record.process_id == process_id && record.nonce == nonce)
+}
+
+fn spawn_executor(
+    scope: &Path,
+    run_id: &str,
+) -> Result<(WorkflowRun, Option<std::process::Child>)> {
     let scope = state::resolve_scope(scope)?;
     let initial = find_run(&scope, run_id)?;
-    if !initial.status.active() {
-        return Ok(initial);
-    }
-    if initial.process_id.is_some_and(process_is_live) {
-        return Ok(initial);
+    if !initial.status.active() || initial.status == LifecycleStatus::Terminating {
+        return Ok((initial, None));
     }
     let Some(mut lease) = ExecutionLease::acquire(&scope, run_id)? else {
-        return find_run(&scope, run_id);
+        return find_run(&scope, run_id).map(|run| (run, None));
     };
     let log_directory = crate::config::state_home()
         .join("orc/logs")
         .join(state::scope_key(&scope));
     fs::create_dir_all(&log_directory)?;
     let log_path = log_directory.join(format!("{run_id}.log"));
+    compact_workflow_log(&log_path)?;
     let stdout = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1905,28 +3486,148 @@ pub fn spawn(scope: &Path, run_id: &str) -> Result<WorkflowRun> {
         .stdout(stdout)
         .stderr(stderr)
         .env(EXECUTION_LEASE_ENV, &lease.nonce);
+    if initial.process_id.is_some() {
+        command.env(EXECUTION_RECOVERY_ENV, "1");
+    }
+    for name in [
+        "ORC_SESSION_ID",
+        "ORC_NATIVE_SESSION_ID",
+        "ORC_PARENT_SESSION_ID",
+        "ORC_RUN_ID",
+        "ORC_NODE_ID",
+        "ORC_PROVIDER_REF",
+    ] {
+        command.env_remove(name);
+    }
     #[cfg(unix)]
     command.process_group(0);
-    let child = command
+    let mut child = command
         .spawn()
         .context("start background workflow executor")?;
     if let Err(error) = lease.write_owner(child.id()) {
         let _ = terminate_executor(child.id());
+        let _ = child.wait();
         return Err(error);
     }
-    let run = set_process(&scope, run_id, child.id(), Some(&log_path));
-    if run.is_err() {
-        let _ = terminate_executor(child.id());
-    } else {
-        lease.disarm();
+    let run = match set_process(&scope, run_id, child.id(), &lease.nonce, Some(&log_path)) {
+        Ok(run)
+            if run.status == LifecycleStatus::Working
+                && run.process_id == Some(child.id())
+                && run.execution_nonce.as_deref() == Some(lease.nonce.as_str()) =>
+        {
+            lease.disarm();
+            return Ok((run, Some(child)));
+        }
+        Ok(run) => run,
+        Err(error) => {
+            let _ = terminate_executor(child.id());
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    let _ = terminate_executor(child.id());
+    let _ = child.wait();
+    Ok((run, None))
+}
+
+fn compact_workflow_log(path: &Path) -> Result<()> {
+    let length = match fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("inspect workflow log"),
+    };
+    if length <= MAX_WORKFLOW_LOG_BYTES {
+        return Ok(());
     }
-    run
+    let mut source = fs::File::open(path).context("open workflow log")?;
+    source
+        .seek(SeekFrom::Start(length - MAX_WORKFLOW_LOG_BYTES))
+        .context("seek workflow log")?;
+    let mut tail = Vec::with_capacity(MAX_WORKFLOW_LOG_BYTES as usize);
+    source
+        .read_to_end(&mut tail)
+        .context("read workflow log tail")?;
+    let mut target = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .context("truncate workflow log")?;
+    target
+        .write_all(b"[earlier workflow output omitted]\n")
+        .and_then(|()| target.write_all(&tail))
+        .context("compact workflow log")
+}
+
+pub(crate) fn read_log_tail(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path).context("open workflow log")?;
+    let length = file.metadata().context("inspect workflow log")?.len();
+    file.seek(SeekFrom::Start(
+        length.saturating_sub(MAX_WORKFLOW_LOG_BYTES),
+    ))
+    .context("seek workflow log")?;
+    let mut bytes = Vec::with_capacity(length.min(MAX_WORKFLOW_LOG_BYTES) as usize);
+    file.read_to_end(&mut bytes)
+        .context("read workflow log tail")?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::render_fixture;
     use std::sync::{Arc, Barrier, atomic::AtomicUsize, atomic::Ordering};
+
+    const STOP_PROVIDER: &str = r#"#!/bin/sh
+if [ "${1:-}" = stop ]; then
+  : > "$2"
+  exit 0
+fi
+cat >/dev/null
+cat <<'JSON'
+{{ plan }}
+JSON
+"#;
+
+    const STOP_PROVIDER_MANIFEST: &str = r#"version: orc.provider/v1
+name: stop-test
+command: {{ command }}
+actions:
+  session.stop: Stop a test session
+"#;
+
+    #[test]
+    fn workflow_log_compaction_and_read_are_bounded() {
+        let directory = tempfile::tempdir().expect("log directory");
+        let path = directory.path().join("run.log");
+        let mut contents = vec![b'x'; MAX_WORKFLOW_LOG_BYTES as usize + 128];
+        contents.extend_from_slice(b"\nfinal event\n");
+        fs::write(&path, contents).expect("workflow log");
+
+        compact_workflow_log(&path).expect("compact workflow log");
+        let tail = read_log_tail(&path).expect("read workflow log tail");
+
+        assert!(fs::metadata(&path).expect("workflow log").len() < MAX_WORKFLOW_LOG_BYTES + 64);
+        assert!(tail.ends_with("final event\n"));
+        assert!(tail.len() <= MAX_WORKFLOW_LOG_BYTES as usize);
+    }
+
+    #[test]
+    fn workflow_activity_is_bounded_and_utf8_safe() {
+        let (_directory, _config, scope, mut run) = workflow_fixture("1ms");
+        let node = run.nodes.first_mut().expect("workflow node");
+        for attempt in 0..300 {
+            node.record_activity("retry", format!("{attempt}:{}", "é".repeat(3000)));
+        }
+
+        assert_eq!(node.activity.len(), 256);
+        assert!(
+            node.activity
+                .iter()
+                .all(|event| event.message.len() <= 4096)
+        );
+        assert!(node.activity[0].message.starts_with("44:"));
+        remove_fixture_state(&scope, &run.id);
+    }
 
     fn workflow_fixture(duration: &str) -> (tempfile::TempDir, Config, PathBuf, WorkflowRun) {
         let directory = tempfile::tempdir().expect("workflow fixture directory");
@@ -1993,6 +3694,420 @@ mod tests {
         (directory, config, scope, run)
     }
 
+    fn materialize_definition(
+        directory: &tempfile::TempDir,
+        config: &Config,
+        scope: &Path,
+        definition: &Definition,
+    ) -> WorkflowRun {
+        let path = directory.path().join(format!("{}.yaml", definition.name));
+        fs::write(
+            &path,
+            serde_yaml::to_string(definition).expect("serialize workflow"),
+        )
+        .expect("write workflow");
+        materialize(config, scope, &path, RunMode::Foreground).expect("materialize workflow")
+    }
+
+    fn set_step(name: &str) -> Step {
+        Step {
+            name: name.into(),
+            r#type: StepKind::Set,
+            value: Some(json!(true)),
+            ..Step::default()
+        }
+    }
+
+    #[test]
+    fn entry_point_is_the_only_initially_active_root() {
+        let (directory, config, scope, _) = workflow_fixture("1ms");
+        let definition = Definition {
+            name: "entry-only".into(),
+            goal: "run only the reachable branch".into(),
+            entry_point: "start".into(),
+            steps: vec![
+                Step {
+                    routes: vec![Route {
+                        to: "$end".into(),
+                        when: None,
+                    }],
+                    ..set_step("start")
+                },
+                set_step("unrelated"),
+            ],
+            ..Definition::default()
+        };
+        let run = materialize_definition(&directory, &config, &scope, &definition);
+
+        assert_eq!(run.nodes[0].status, LifecycleStatus::Queued);
+        assert_eq!(run.nodes[1].status, LifecycleStatus::Pending);
+        let completed = execute(&config, &scope, &run.id).expect("execute entry branch");
+        assert_eq!(completed.status, LifecycleStatus::Done);
+        assert_eq!(completed.nodes[0].attempt, 1);
+        assert_eq!(completed.nodes[1].status, LifecycleStatus::Skipped);
+        assert_eq!(completed.nodes[1].attempt, 0);
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn routes_choose_the_first_matching_condition() {
+        let (directory, config, scope, _) = workflow_fixture("1ms");
+        let definition = Definition {
+            name: "ordered-routes".into(),
+            goal: "choose one route".into(),
+            entry_point: "start".into(),
+            steps: vec![
+                Step {
+                    routes: vec![
+                        Route {
+                            to: "chosen".into(),
+                            when: Some("{{ output }}".into()),
+                        },
+                        Route {
+                            to: "fallback".into(),
+                            when: None,
+                        },
+                    ],
+                    ..set_step("start")
+                },
+                set_step("chosen"),
+                set_step("fallback"),
+            ],
+            ..Definition::default()
+        };
+        let run = materialize_definition(&directory, &config, &scope, &definition);
+
+        let completed = execute(&config, &scope, &run.id).expect("execute routed workflow");
+        assert_eq!(completed.status, LifecycleStatus::Done);
+        assert_eq!(completed.nodes[0].attempt, 1);
+        assert_eq!(completed.nodes[1].attempt, 1);
+        assert_eq!(completed.nodes[2].status, LifecycleStatus::Skipped);
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn self_route_stops_at_the_iteration_limit() {
+        let (directory, config, scope, _) = workflow_fixture("1ms");
+        let definition = Definition {
+            name: "bounded-loop".into(),
+            goal: "bound a self route".into(),
+            entry_point: "loop".into(),
+            limits: Limits {
+                max_iterations: 2,
+                ..Limits::default()
+            },
+            steps: vec![Step {
+                routes: vec![Route {
+                    to: "self".into(),
+                    when: None,
+                }],
+                ..set_step("loop")
+            }],
+            ..Definition::default()
+        };
+        let run = materialize_definition(&directory, &config, &scope, &definition);
+
+        let failed = execute(&config, &scope, &run.id).expect("execute bounded loop");
+        assert_eq!(failed.status, LifecycleStatus::Failed);
+        assert_eq!(failed.nodes[0].attempt, 2);
+        assert!(
+            failed.nodes[0].activity.iter().any(|event| {
+                event.kind == "limit" && event.message.contains("iteration limit")
+            })
+        );
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn parallel_group_enforces_concurrency_and_continue_on_error() {
+        let (directory, config, scope, _) = workflow_fixture("1ms");
+        let definition = Definition {
+            name: "partial-parallel".into(),
+            goal: "accept one successful group member".into(),
+            entry_point: "workers".into(),
+            steps: vec![
+                Step {
+                    name: "fails".into(),
+                    r#type: StepKind::Wait,
+                    duration: None,
+                    ..Step::default()
+                },
+                set_step("succeeds"),
+            ],
+            parallel: vec![ParallelGroup {
+                name: "workers".into(),
+                agents: vec!["fails".into(), "succeeds".into()],
+                max_concurrent: Some(1),
+                failure_mode: FailureMode::ContinueOnError,
+                ..ParallelGroup::default()
+            }],
+            ..Definition::default()
+        };
+        let run = materialize_definition(&directory, &config, &scope, &definition);
+
+        assert_eq!(ready_steps(&definition, &run).len(), 1);
+        let completed = execute(&config, &scope, &run.id).expect("execute partial group");
+        assert_eq!(completed.status, LifecycleStatus::Done);
+        assert_eq!(completed.nodes[0].status, LifecycleStatus::Failed);
+        assert_eq!(completed.nodes[1].status, LifecycleStatus::Done);
+        assert_eq!(completed.nodes[0].attempt, 1);
+        assert_eq!(completed.nodes[1].attempt, 1);
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn continue_on_error_routes_after_every_member_fails() {
+        let (directory, config, scope, _) = workflow_fixture("1ms");
+        let definition = Definition {
+            name: "failed-parallel".into(),
+            goal: "continue after collecting every group error".into(),
+            entry_point: "workers".into(),
+            steps: vec![
+                Step {
+                    name: "left".into(),
+                    r#type: StepKind::Wait,
+                    ..Step::default()
+                },
+                Step {
+                    name: "right".into(),
+                    r#type: StepKind::Wait,
+                    ..Step::default()
+                },
+                set_step("finish"),
+            ],
+            parallel: vec![ParallelGroup {
+                name: "workers".into(),
+                agents: vec!["left".into(), "right".into()],
+                failure_mode: FailureMode::ContinueOnError,
+                routes: vec![Route {
+                    to: "finish".into(),
+                    when: None,
+                }],
+                ..ParallelGroup::default()
+            }],
+            ..Definition::default()
+        };
+        let run = materialize_definition(&directory, &config, &scope, &definition);
+
+        let completed = execute(&config, &scope, &run.id).expect("continue after group errors");
+
+        assert_eq!(completed.status, LifecycleStatus::Done);
+        assert_eq!(completed.nodes[0].status, LifecycleStatus::Failed);
+        assert_eq!(completed.nodes[1].status, LifecycleStatus::Failed);
+        assert_eq!(completed.nodes[2].status, LifecycleStatus::Done);
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn parallel_group_routes_to_a_downstream_stage() {
+        let (directory, config, scope, _) = workflow_fixture("1ms");
+        let definition = Definition {
+            name: "parallel-route".into(),
+            goal: "route after the whole group completes".into(),
+            entry_point: "workers".into(),
+            steps: vec![set_step("left"), set_step("right"), set_step("join")],
+            parallel: vec![ParallelGroup {
+                name: "workers".into(),
+                agents: vec!["left".into(), "right".into()],
+                max_concurrent: Some(2),
+                routes: vec![
+                    Route {
+                        to: "join".into(),
+                        when: Some("{{ workers.outputs | length == 2 }}".into()),
+                    },
+                    Route {
+                        to: "$end".into(),
+                        when: None,
+                    },
+                ],
+                ..ParallelGroup::default()
+            }],
+            ..Definition::default()
+        };
+        let run = materialize_definition(&directory, &config, &scope, &definition);
+
+        let completed = execute(&config, &scope, &run.id).expect("execute routed group");
+        assert_eq!(completed.status, LifecycleStatus::Done);
+        assert!(completed.nodes.iter().all(|node| node.attempt == 1));
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn parallel_failure_modes_stop_at_the_declared_boundary() {
+        for (mode, second_attempt) in [(FailureMode::FailFast, 0), (FailureMode::AllOrNothing, 1)] {
+            let (directory, config, scope, _) = workflow_fixture("1ms");
+            let definition = Definition {
+                name: format!("failure-{mode:?}").to_ascii_lowercase(),
+                goal: "enforce the group failure mode".into(),
+                entry_point: "workers".into(),
+                steps: vec![
+                    Step {
+                        name: "fails".into(),
+                        r#type: StepKind::Wait,
+                        duration: None,
+                        ..Step::default()
+                    },
+                    set_step("second"),
+                ],
+                parallel: vec![ParallelGroup {
+                    name: "workers".into(),
+                    agents: vec!["fails".into(), "second".into()],
+                    max_concurrent: Some(1),
+                    failure_mode: mode,
+                    ..ParallelGroup::default()
+                }],
+                ..Definition::default()
+            };
+            let run = materialize_definition(&directory, &config, &scope, &definition);
+
+            let failed = execute(&config, &scope, &run.id).expect("execute failing group");
+            assert_eq!(failed.status, LifecycleStatus::Failed);
+            assert_eq!(failed.nodes[1].attempt, second_attempt);
+            remove_fixture_state(&scope, &run.id);
+        }
+    }
+
+    #[test]
+    fn timeout_and_budget_limits_fail_before_more_work_starts() {
+        let (directory, config, scope, _) = workflow_fixture("1ms");
+        let definition = Definition {
+            name: "budget".into(),
+            goal: "stop over budget".into(),
+            entry_point: "work".into(),
+            limits: Limits {
+                budget_usd: Some(1.0),
+                ..Limits::default()
+            },
+            steps: vec![set_step("work")],
+            ..Definition::default()
+        };
+        let run = materialize_definition(&directory, &config, &scope, &definition);
+        state::update(&scope, |workspace| {
+            workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run")
+                .cost_usd = 1.01;
+            Ok(())
+        })
+        .expect("record cost");
+
+        let failed = execute(&config, &scope, &run.id).expect("enforce budget");
+        assert_eq!(failed.status, LifecycleStatus::Failed);
+        assert_eq!(failed.nodes[0].attempt, 0);
+        assert!(
+            failed.nodes[0]
+                .activity
+                .iter()
+                .any(|event| { event.kind == "limit" && event.message.contains("budget") })
+        );
+        remove_fixture_state(&scope, &run.id);
+
+        let (directory, config, scope, _) = workflow_fixture("1ms");
+        let definition = Definition {
+            name: "timeout".into(),
+            goal: "stop after deadline".into(),
+            entry_point: "wait".into(),
+            limits: Limits {
+                timeout_seconds: Some(1),
+                ..Limits::default()
+            },
+            steps: vec![Step {
+                name: "wait".into(),
+                r#type: StepKind::Wait,
+                duration: Some("30s".into()),
+                ..Step::default()
+            }],
+            ..Definition::default()
+        };
+        let run = materialize_definition(&directory, &config, &scope, &definition);
+        let started = Instant::now();
+
+        let failed = execute(&config, &scope, &run.id).expect("enforce timeout");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(failed.status, LifecycleStatus::Failed);
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn unsupported_dynamic_context_features_fail_validation() {
+        let mut definition = Definition {
+            name: "unsupported".into(),
+            goal: "reject inert workflow fields".into(),
+            entry_point: "work".into(),
+            steps: vec![set_step("work")],
+            ..Definition::default()
+        };
+        definition.defaults.context = ContextMode::Accumulate;
+        assert!(validate(&definition, Path::new(".")).is_err());
+
+        definition.defaults.context = ContextMode::Explicit;
+        definition.steps[0]
+            .input_mapping
+            .insert("source".into(), "target".into());
+        assert!(validate(&definition, Path::new(".")).is_err());
+
+        definition.steps[0].input_mapping.clear();
+        definition.parallel.push(ParallelGroup {
+            name: "dynamic".into(),
+            for_each: Some(ForEach {
+                source: "items".into(),
+                r#as: "item".into(),
+            }),
+            agent: Some("work".into()),
+            ..ParallelGroup::default()
+        });
+        assert!(validate(&definition, Path::new(".")).is_err());
+
+        let grouped_entry = Definition {
+            name: "grouped-entry".into(),
+            goal: "reject an ambiguous group entry".into(),
+            entry_point: "work".into(),
+            steps: vec![set_step("work")],
+            parallel: vec![ParallelGroup {
+                name: "workers".into(),
+                agents: vec!["work".into()],
+                ..ParallelGroup::default()
+            }],
+            ..Definition::default()
+        };
+        assert!(
+            validate(&grouped_entry, Path::new("."))
+                .expect_err("reject a group member as the entry point")
+                .to_string()
+                .contains("use its group name")
+        );
+
+        let routed_member = Definition {
+            name: "routed-member".into(),
+            goal: "reject an ambiguous route target".into(),
+            entry_point: "start".into(),
+            steps: vec![
+                Step {
+                    routes: vec![Route {
+                        to: "work".into(),
+                        when: None,
+                    }],
+                    ..set_step("start")
+                },
+                set_step("work"),
+            ],
+            parallel: vec![ParallelGroup {
+                name: "workers".into(),
+                agents: vec!["work".into()],
+                ..ParallelGroup::default()
+            }],
+            ..Definition::default()
+        };
+        assert!(
+            validate(&routed_member, Path::new("."))
+                .expect_err("reject a route to one group member")
+                .to_string()
+                .contains("use its group name")
+        );
+    }
+
     fn remove_fixture_state(scope: &Path, run_id: &str) {
         let _ = fs::remove_file(state::path(scope));
         let _ = fs::remove_file(preferences::path(scope));
@@ -2007,8 +4122,8 @@ mod tests {
             entry_point: "a".into(),
             defaults: WorkflowDefaults {
                 runtime: Runtime {
-                    harness: Some("codex".into()),
-                    execution: Some("local".into()),
+                    harness: Some("agent-a".into()),
+                    execution: Some("executor-a".into()),
                     ..Runtime::default()
                 },
                 ..WorkflowDefaults::default()
@@ -2037,6 +4152,115 @@ mod tests {
     }
 
     #[test]
+    fn workflow_lease_overrides_accept_documented_names() {
+        let definition: Definition = serde_yaml::from_str(
+            r#"name: lease
+goal: test leases
+entry_point: work
+steps:
+  - name: work
+    timeoutSeconds: 120
+    idleTimeoutSeconds: 30
+    maxDepth: 4
+"#,
+        )
+        .expect("parse workflow");
+
+        assert_eq!(definition.steps[0].timeout_seconds, Some(120));
+        assert_eq!(definition.steps[0].idle_timeout_seconds, Some(30));
+        assert_eq!(definition.steps[0].max_depth, Some(4));
+    }
+
+    #[test]
+    fn workflow_init_requires_or_inherits_a_harness_and_uses_provider_selection() {
+        let directory = tempfile::tempdir().expect("workflow fixture");
+        let scope_directory = directory.path().join("scope");
+        fs::create_dir_all(&scope_directory).expect("scope directory");
+        let scope = fs::canonicalize(scope_directory).expect("canonical scope");
+        let mut config = Config::default();
+        config.workflows.repository = directory.path().join("catalog");
+        config.workflows.auto_commit = false;
+
+        let missing = init(&config, &scope, "missing", None)
+            .expect_err("an external caller must choose a harness");
+        assert!(missing.to_string().contains("needs --harness"));
+        assert!(!config.workflows.repository.exists());
+
+        let path =
+            init(&config, &scope, "planned", Some("test-harness")).expect("initialize workflow");
+        let definition = load(&path).expect("load initialized workflow");
+        validate(&definition, path.parent().expect("workflow parent"))
+            .expect("initialized workflow validates");
+        assert_eq!(
+            definition.defaults.runtime.harness.as_deref(),
+            Some("test-harness")
+        );
+        assert_eq!(definition.defaults.runtime.execution, None);
+        let _ = fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn interrupted_side_effects_require_an_explicit_retry() {
+        let (_directory, _config, scope, mut run) = workflow_fixture("1ms");
+        run.status = LifecycleStatus::Working;
+        run.current_node = Some(run.nodes[0].id.clone());
+        run.nodes[0].status = LifecycleStatus::Working;
+
+        block_interrupted_nodes(&mut run);
+
+        assert_eq!(run.nodes[0].status, LifecycleStatus::Blocked);
+        assert_eq!(run.current_node, None);
+        assert!(
+            run.nodes[0]
+                .activity
+                .last()
+                .is_some_and(|event| event.message.contains("inspect before retrying"))
+        );
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn nested_workflow_materialization_links_the_parent_node() {
+        let (directory, config, scope, parent) = workflow_fixture("1ms");
+        let child_definition = Definition {
+            name: "child".into(),
+            goal: "complete child".into(),
+            entry_point: "done".into(),
+            steps: vec![Step {
+                name: "done".into(),
+                r#type: StepKind::Set,
+                value: Some(json!(true)),
+                ..Step::default()
+            }],
+            ..Definition::default()
+        };
+        let child_path = directory.path().join("child.yaml");
+        fs::write(
+            &child_path,
+            serde_yaml::to_string(&child_definition).expect("serialize child workflow"),
+        )
+        .expect("write child workflow");
+
+        let child = materialize_with_parent(
+            &config,
+            &scope,
+            &child_path,
+            RunMode::Foreground,
+            Some(&parent.id),
+            Some("wait"),
+        )
+        .expect("materialize child workflow");
+        let stored_parent = find_run(&scope, &parent.id).expect("parent run");
+
+        assert_eq!(child.parent_run_id.as_deref(), Some(parent.id.as_str()));
+        assert_eq!(
+            stored_parent.nodes[0].child_run_id.as_deref(),
+            Some(child.id.as_str())
+        );
+        remove_fixture_state(&scope, &parent.id);
+    }
+
+    #[test]
     fn plan_rejects_dependency_cycles() {
         let definition = Definition {
             name: "cycle".into(),
@@ -2044,8 +4268,8 @@ mod tests {
             entry_point: "a".into(),
             defaults: WorkflowDefaults {
                 runtime: Runtime {
-                    harness: Some("codex".into()),
-                    execution: Some("local".into()),
+                    harness: Some("agent-a".into()),
+                    execution: Some("executor-a".into()),
                     ..Runtime::default()
                 },
                 ..WorkflowDefaults::default()
@@ -2067,6 +4291,21 @@ mod tests {
 
         let error = plan(&Config::default(), Path::new("."), &definition).unwrap_err();
         assert!(error.to_string().contains("dependency cycle"));
+    }
+
+    #[test]
+    fn workflow_names_cannot_escape_the_catalog() {
+        let error = validate_name("../../config").expect_err("reject path traversal");
+        assert!(error.to_string().contains("workflow name"));
+    }
+
+    #[test]
+    fn worker_session_cannot_own_a_workflow() {
+        let (_directory, _config, scope, _run) = workflow_fixture("1ms");
+        let mut worker = state::read(&scope).expect("workspace").sessions[0].clone();
+        worker.role = SessionRole::Worker;
+        let error = require_orchestrator(&worker).expect_err("worker must not own workflow");
+        assert!(error.to_string().contains("only an orchestrator"));
     }
 
     #[test]
@@ -2111,6 +4350,27 @@ mod tests {
             .expect("lease owner");
 
         assert_ne!(lease.nonce, "stale");
+    }
+
+    #[test]
+    fn execution_identity_is_live_only_while_its_lease_is_held() {
+        let directory = tempfile::tempdir().expect("lease directory");
+        let path = directory.path().join("run.lease");
+        let lease = ExecutionLease::acquire_at(&path)
+            .expect("acquire execution lease")
+            .expect("lease owner");
+
+        assert!(execution_identity_active(&path).expect("inspect active identity"));
+        drop(lease);
+        let released = (0..50).any(|_| {
+            if !execution_identity_active(&path).expect("inspect released identity") {
+                true
+            } else {
+                thread::sleep(Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(released);
     }
 
     #[cfg(unix)]
@@ -2201,8 +4461,286 @@ mod tests {
     }
 
     #[test]
+    fn cancel_interrupts_a_wait_step() {
+        let (_directory, config, scope, run) = workflow_fixture("30s");
+        let execution_config = config.clone();
+        let execution_scope = scope.clone();
+        let run_id = run.id.clone();
+        let executor = thread::spawn(move || execute(&execution_config, &execution_scope, &run_id));
+        for _ in 0..100 {
+            if find_run(&scope, &run.id).expect("active run").nodes[0].status
+                == LifecycleStatus::Working
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let started = Instant::now();
+        let cancelled = cancel(&config, &scope, &run.id).expect("cancel wait");
+        executor
+            .join()
+            .expect("execution thread")
+            .expect("execute cancelled wait");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(cancelled.status, LifecycleStatus::Cancelled);
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn retry_backoff_delays_the_next_attempt() {
+        let (_directory, config, scope, run) = workflow_fixture("1ms");
+        let definition_path = PathBuf::from(run.definition.as_deref().expect("definition path"));
+        let mut definition = load(&definition_path).expect("load workflow");
+        definition.steps[0].r#type = StepKind::Script;
+        definition.steps[0].command = vec!["sh".into(), "-c".into(), "exit 1".into()];
+        definition.steps[0].retry = RetryPolicy {
+            attempts: 1,
+            backoff_seconds: 1,
+        };
+        fs::write(
+            &definition_path,
+            serde_yaml::to_string(&definition).expect("serialize workflow"),
+        )
+        .expect("write workflow");
+
+        let started = Instant::now();
+        let failed = execute(&config, &scope, &run.id).expect("execute retries");
+
+        assert!(started.elapsed() >= Duration::from_millis(900));
+        assert_eq!(failed.status, LifecycleStatus::Failed);
+        assert_eq!(failed.nodes[0].attempt, 2);
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn persisted_retry_deadline_delays_recovered_execution() {
+        let (_directory, config, scope, run) = workflow_fixture("1ms");
+        state::update(&scope, |workspace| {
+            let node = &mut workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run")
+                .nodes[0];
+            node.retry_after = Some(Utc::now() + chrono::Duration::seconds(1));
+            Ok(())
+        })
+        .expect("persist retry deadline");
+
+        let started = Instant::now();
+        let completed = execute(&config, &scope, &run.id).expect("resume delayed workflow");
+
+        assert!(started.elapsed() >= Duration::from_millis(900));
+        assert_eq!(completed.status, LifecycleStatus::Done);
+        assert_eq!(completed.nodes[0].attempt, 1);
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn fatal_parallel_failure_suppresses_retry_backoff() {
+        let (_directory, config, scope, run) = workflow_fixture("1ms");
+        let definition_path = PathBuf::from(run.definition.as_deref().expect("definition path"));
+        let mut definition = load(&definition_path).expect("load workflow");
+        definition.steps[0].r#type = StepKind::Script;
+        definition.steps[0].command = vec!["sh".into(), "-c".into(), "exit 1".into()];
+        definition.steps[0].retry = RetryPolicy {
+            attempts: 1,
+            backoff_seconds: 60,
+        };
+        let mut fatal_step = definition.steps[0].clone();
+        fatal_step.name = "fatal".into();
+        fatal_step.retry = RetryPolicy::default();
+        definition.steps.push(fatal_step);
+        fs::write(
+            &definition_path,
+            serde_yaml::to_string(&definition).expect("serialize workflow"),
+        )
+        .expect("write workflow");
+        state::update(&scope, |workspace| {
+            let run = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            let mut fatal_node = run.nodes[0].clone();
+            fatal_node.id = "fatal".into();
+            fatal_node.name = "fatal".into();
+            run.nodes.push(fatal_node);
+            Ok(())
+        })
+        .expect("add fatal node");
+
+        let started = Instant::now();
+        let failed = execute(&config, &scope, &run.id).expect("execute parallel failures");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(failed.status, LifecycleStatus::Failed);
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn stale_executor_exit_cannot_fail_its_replacement() {
+        let (_directory, config, scope, run) = workflow_fixture("1ms");
+        state::update(&scope, |workspace| {
+            let run = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            run.status = LifecycleStatus::Working;
+            run.process_id = Some(200);
+            run.execution_nonce = Some("replacement".into());
+            Ok(())
+        })
+        .expect("install replacement identity");
+        let status = Command::new("true").status().expect("exit status");
+
+        let current =
+            reconcile_executor_exit(&config, &scope, &run.id, Some(100), Some("old"), status)
+                .expect("ignore stale watcher");
+
+        assert_eq!(current.status, LifecycleStatus::Working);
+        assert_eq!(current.process_id, Some(200));
+        assert_eq!(current.execution_nonce.as_deref(), Some("replacement"));
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn termination_claim_cannot_be_overwritten() {
+        let (_directory, config, scope, run) = workflow_fixture("1ms");
+        state::update(&scope, |workspace| {
+            let run = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            run.status = LifecycleStatus::Terminating;
+            run.nodes[0].status = LifecycleStatus::Terminating;
+            Ok(())
+        })
+        .expect("claim termination");
+
+        let finished = finish_run(&scope, &run.id, LifecycleStatus::Done).expect("finish run");
+        let started = set_process(&scope, &run.id, 42, "nonce", None).expect("set process");
+        let updated =
+            control::update_run(&scope, &run.id, LifecycleStatus::Done).expect("ignore run update");
+        let reported = control::report_node(
+            &scope,
+            &run.id,
+            "wait",
+            None,
+            control::NodeReport {
+                status: LifecycleStatus::Done,
+                output: None,
+                message: None,
+                tokens: None,
+                cost_usd: None,
+            },
+        )
+        .expect("ignore node report");
+        let approved = approve(&config, &scope, &run.id, None, false)
+            .expect("ignore approval during termination");
+
+        assert_eq!(finished.status, LifecycleStatus::Terminating);
+        assert_eq!(started.status, LifecycleStatus::Terminating);
+        assert_eq!(updated.status, LifecycleStatus::Terminating);
+        assert_eq!(reported.status, LifecycleStatus::Terminating);
+        assert_eq!(approved.status, LifecycleStatus::Terminating);
+        assert!(started.process_id.is_none());
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_escalates_when_a_tracked_command_ignores_termination() {
+        let directory = tempfile::tempdir().expect("tracker directory");
+        let tracker_directory = directory.path().join("trackers");
+        let worker_directory = tracker_directory.clone();
+        let plan = CommandPlan {
+            version: "orc.provider/v1".into(),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "trap '' TERM; while :; do sleep 3600; done".into(),
+            ],
+            cwd: None,
+            environment: BTreeMap::new(),
+            success_codes: vec![0],
+        };
+        let worker = thread::spawn(move || {
+            provider::run_plan_tracked(&plan, Path::new("."), Some(&worker_directory))
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let tracker_exists = fs::read_dir(&tracker_directory)
+                .ok()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| entry.ok())
+                .any(|entry| {
+                    entry.path().extension().and_then(|value| value.to_str()) == Some("process")
+                });
+            if tracker_exists {
+                break;
+            }
+            assert!(Instant::now() < deadline, "tracked command did not start");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let started = Instant::now();
+        terminate_tracked_processes(&tracker_directory).expect("terminate tracked process");
+        let result = worker.join().expect("tracked command thread");
+
+        assert!(
+            result.is_ok(),
+            "tracked runner must reconcile after cancellation"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            fs::read_dir(&tracker_directory)
+                .expect("tracker directory")
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    entry.path().extension().and_then(|value| value.to_str()) == Some("process")
+                })
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn cancel_reconciles_nodes_and_linked_sessions() {
-        let (_directory, _config, scope, run) = workflow_fixture("1s");
+        use std::os::unix::fs::PermissionsExt;
+
+        let (directory, config, scope, run) = workflow_fixture("1s");
+        let marker = directory.path().join("managed-session-stopped");
+        let provider = directory.path().join("stop-provider.sh");
+        let plan = serde_json::to_string(&json!({
+            "version": "orc.provider/v1",
+            "command": [provider, "stop", marker],
+            "cwd": scope,
+            "environment": {},
+            "successCodes": [0]
+        }))
+        .expect("stop plan");
+        fs::write(
+            &provider,
+            render_fixture(STOP_PROVIDER, serde_json::json!({ "plan": plan })),
+        )
+        .expect("write stop provider");
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o755))
+            .expect("make stop provider executable");
+        fs::write(
+            config.providers.directory.join("stop.yaml"),
+            render_fixture(
+                STOP_PROVIDER_MANIFEST,
+                serde_json::json!({ "command": provider.display().to_string() }),
+            ),
+        )
+        .expect("write stop provider manifest");
         let linked = control::register(
             &scope,
             Contract {
@@ -2214,8 +4752,10 @@ mod tests {
             SessionLink {
                 id: Some(format!("worker-{}", Uuid::new_v4())),
                 native_id: Some(Uuid::new_v4().to_string()),
+                parent_id: run.orchestrator_id.clone(),
                 run_id: Some(run.id.clone()),
                 node_id: Some("wait".into()),
+                source: RegistrationSource::Managed,
                 ..SessionLink::default()
             },
         )
@@ -2240,7 +4780,7 @@ mod tests {
         })
         .expect("mark work active");
 
-        let cancelled = cancel(&scope, &run.id).expect("cancel workflow");
+        let cancelled = cancel(&config, &scope, &run.id).expect("cancel workflow");
         let workspace = state::read(&scope).expect("read cancelled workflow");
         let linked = workspace
             .sessions
@@ -2251,6 +4791,63 @@ mod tests {
         assert_eq!(cancelled.nodes[0].status, LifecycleStatus::Cancelled);
         assert!(cancelled.pending_gates.is_empty());
         assert_eq!(linked.status, LifecycleStatus::Cancelled);
+        assert!(marker.exists(), "managed session stop provider must run");
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn cancel_reconciles_descendant_runs() {
+        let (_directory, config, scope, run) = workflow_fixture("1s");
+        let child_id = format!("run-{}", Uuid::new_v4());
+        state::update(&scope, |workspace| {
+            let mut child = workspace
+                .runs
+                .iter()
+                .find(|candidate| candidate.id == run.id)
+                .cloned()
+                .expect("parent run");
+            child.id.clone_from(&child_id);
+            child.parent_run_id = Some(run.id.clone());
+            child.status = LifecycleStatus::Working;
+            workspace.runs.push(child);
+            Ok(())
+        })
+        .expect("add child run");
+
+        cancel(&config, &scope, &run.id).expect("cancel run family");
+
+        let workspace = state::read(&scope).expect("read run family");
+        assert_eq!(
+            workspace
+                .runs
+                .iter()
+                .find(|candidate| candidate.id == child_id)
+                .expect("child run")
+                .status,
+            LifecycleStatus::Cancelled
+        );
+        remove_fixture_state(&scope, &run.id);
+        remove_fixture_state(&scope, &child_id);
+    }
+
+    #[test]
+    fn cancel_preserves_a_completed_run() {
+        let (_directory, config, scope, run) = workflow_fixture("1ms");
+        let completed = state::update(&scope, |workspace| {
+            let run = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            run.status = LifecycleStatus::Done;
+            Ok(run.clone())
+        })
+        .expect("complete run");
+
+        let result = cancel(&config, &scope, &run.id).expect("cancel completed run");
+
+        assert_eq!(result.status, LifecycleStatus::Done);
+        assert_eq!(result.updated_at, completed.updated_at);
         remove_fixture_state(&scope, &run.id);
     }
 }

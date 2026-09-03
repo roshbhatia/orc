@@ -9,8 +9,9 @@ executes versioned workflow graphs. External providers add harness, execution,
 persistence, display, activity, and change integrations.
 
 The core is a standalone Rust CLI. Its full-screen interface uses Ratatui and
-Rataflow. Orc does not require a broker, terminal multiplexer, or specific
-agent harness.
+Rataflow. Orc does not require a remote broker, terminal multiplexer, or
+specific agent harness. A small local supervisor enforces leases for managed
+child sessions and exits when no managed work remains.
 
 ## Terms
 
@@ -64,6 +65,29 @@ orc connect \
 ```
 
 Register a child session with `--parent <orc-session-id>`.
+
+Managed sessions have two leases. The runtime lease sets a hard deadline.
+The idle lease expires when no useful activity is reported. An orchestrator
+renews the idle lease only after it verifies that work continues:
+
+```bash
+orc session keepalive <child-session-id>
+```
+
+Orc starts the supervisor when the first managed child registers. Use
+`orc start`, `orc stop`, or `orc daemon status` to manage it directly. On lease
+expiry, Orc calls the external `session.stop` provider and records the reason.
+Connected orchestrators and unmanaged sessions are never timed out.
+Set either lifecycle timeout to `0` to disable that deadline. Agent workflow
+steps can override them with `timeoutSeconds` and `idleTimeoutSeconds`.
+Only the orchestrator can renew a lease. A keepalive renews the idle deadline;
+it never moves the hard runtime deadline or changes the lease policy.
+`orc stop` records a cooperative stop request and waits for a clean exit. A
+manual sweep refuses to run while the daemon owns the lease loop.
+
+Orc is a reliability control plane, not a security boundary between processes
+running as the same operating-system user. Use a sandboxed execution provider
+when a harness must not access Orc state or process controls.
 
 ```bash
 orc status --json
@@ -177,7 +201,7 @@ activity  activity.read | execution.logs | session.inspect
 changes   changes.inspect
 launch    session.launch -> session.persist? -> execution.run
 execute   execution.run
-stop      session.stop
+stop      session.stop | execution.cancel
 ```
 
 Orc writes one `orc.provider/v1` request to each provider command. A provider
@@ -185,6 +209,18 @@ can return a command plan, a session binding, a description, or an explicit
 decline. An explicit decline lets the next provider handle that capability.
 Command plans may declare `successCodes`; the default is `[0]`. This lets a
 provider preserve command-specific results such as Traces exit status 2.
+Lifecycle requests include an immutable `operationId`. A `session.stop` or
+`execution.cancel` provider must make retries with the same operation ID
+idempotent. Providers must bind the action to the strongest stable identity
+their backend exposes and document weaker guarantees. Zmx exposes only a
+name-based kill. Its adapter verifies the recorded process ID and creation time
+immediately before that kill, but it cannot make name reuse atomic. Use a
+sandboxed execution provider when that same-user race is outside your trust
+boundary.
+
+Local command plans must stay in their assigned process group. A command that
+detaches with `setsid` leaves local supervision. Use an execution provider when
+work needs an independent daemon or a stronger containment boundary.
 
 The final command plan inherits terminal state. Captured output preserves ANSI
 color in the TUI. Reconciliation caches content-addressed description
@@ -201,8 +237,18 @@ nix profile install github:roshbhatia/orc#provider-zmx
 nix profile install github:roshbhatia/orc#provider-wezterm
 ```
 
+Every provider directory owns its adapter, manifest, and Nix runtime
+dependencies. `#extras` installs all providers. `#full` installs provider-neutral
+core plus that bundle. The default package remains core only.
+
+Orc reads provider manifests in precedence order. It checks the configured
+provider directory first, then `$XDG_DATA_HOME/orc/providers`, then each
+`orc/providers` directory under `$XDG_DATA_DIRS`. A higher-precedence provider
+shadows an installed provider with the same name. Nix profile installs are
+therefore discoverable without copying their manifests into user config.
+
 Without providers, Orc still records sessions, workflows, nodes, and contracts.
-Orc requires no broker process.
+The local supervisor has no harness or terminal integration of its own.
 
 ## Configure Orc
 
@@ -214,6 +260,14 @@ the canonical workspace directory.
 # yaml-language-server: $schema=https://raw.githubusercontent.com/roshbhatia/orc/main/schema/orc.schema.json
 cache:
   providerTtlMs: 30000
+daemon:
+  autostart: true
+  scanIntervalMs: 5000
+  idleShutdownSeconds: 60
+  terminationRetrySeconds: 60
+lifecycle:
+  runtimeTimeoutSeconds: 28800
+  idleTimeoutSeconds: 1800
 providers:
   directory: ~/.config/orc/providers
   timeoutMs: 15000
@@ -227,10 +281,16 @@ ui:
   inspectorPercent: 38
 ```
 
+Set `daemon.terminationRetrySeconds` to `0` to retry a failed termination on
+the next daemon sweep. Positive values impose that many seconds between
+attempts.
+
 Every scalar supports a nested environment override:
 
 ```bash
 ORC_CACHE_PROVIDER_TTL_MS=0 orc status
+ORC_DAEMON_AUTOSTART=false orc status
+ORC_LIFECYCLE_IDLE_TIMEOUT_SECONDS=3600 orc start
 ORC_PROVIDERS_DIRECTORY=/tmp/orc-providers orc providers
 ORC_PROVIDERS_TIMEOUT_MS=10000 orc
 ORC_WORKFLOWS_REPOSITORY=/tmp/orc-workflows orc workflow list
@@ -248,7 +308,7 @@ Open the control plane
 ```text
 Open the control plane
 
-Usage: tui [OPTIONS]
+Usage: orc tui [OPTIONS]
 
 Options:
       --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
@@ -262,12 +322,96 @@ Show workspace status
 ```text
 Show workspace status
 
-Usage: status [OPTIONS]
+Usage: orc status [OPTIONS]
 
 Options:
       --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
       --json
   -h, --help           Print help
+```
+
+### `orc start`
+
+Start the managed-session supervisor
+
+```text
+Start the managed-session supervisor
+
+Usage: orc start
+
+Options:
+  -h, --help  Print help
+```
+
+### `orc stop`
+
+Stop the managed-session supervisor
+
+```text
+Stop the managed-session supervisor
+
+Usage: orc stop
+
+Options:
+  -h, --help  Print help
+```
+
+### `orc daemon`
+
+Manage the managed-session supervisor
+
+```text
+Manage the managed-session supervisor
+
+Usage: orc daemon <COMMAND>
+
+Commands:
+  start
+  stop
+  status
+  sweep
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+### `orc daemon start`
+
+```text
+Usage: orc daemon start
+
+Options:
+  -h, --help  Print help
+```
+
+### `orc daemon stop`
+
+```text
+Usage: orc daemon stop
+
+Options:
+  -h, --help  Print help
+```
+
+### `orc daemon status`
+
+```text
+Usage: orc daemon status [OPTIONS]
+
+Options:
+      --json
+  -h, --help  Print help
+```
+
+### `orc daemon sweep`
+
+```text
+Usage: orc daemon sweep [OPTIONS]
+
+Options:
+      --json
+  -h, --help  Print help
 ```
 
 ### `orc mode`
@@ -277,7 +421,7 @@ Show or change this workspace's autonomy mode
 ```text
 Show or change this workspace's autonomy mode
 
-Usage: mode [OPTIONS] [MODE]
+Usage: orc mode [OPTIONS] [MODE]
 
 Arguments:
   [MODE]
@@ -294,7 +438,7 @@ List registered sessions
 ```text
 List registered sessions
 
-Usage: list [OPTIONS]
+Usage: orc list [OPTIONS]
 
 Options:
       --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
@@ -309,19 +453,19 @@ Register the current session
 ```text
 Register the current session
 
-Usage: connect [OPTIONS]
+Usage: orc connect [OPTIONS]
 
 Options:
-      --scope <SCOPE>                      [env: ORC_SCOPE=] [default: .]
-      --harness <HARNESS>                  [default: unknown]
+      --scope <SCOPE>                              [env: ORC_SCOPE=] [default: .]
+      --harness <HARNESS>                          [default: unknown]
       --model <MODEL>
-      --role <ROLE>                        [default: worker]
-      --title <TITLE>                      [default: "Agent session"]
-      --purpose <PURPOSE>                  [default: "Agent session"]
-      --goal <GOAL>                        [default: "Complete the assigned work"]
-      --expected-output <EXPECTED_OUTPUT>  [default: "A verified result"]
+      --role <ROLE>                                [default: worker]
+      --title <TITLE>                              [default: "Agent session"]
+      --purpose <PURPOSE>                          [default: "Agent session"]
+      --goal <GOAL>                                [default: "Complete the assigned work"]
+      --expected-output <EXPECTED_OUTPUT>          [default: "A verified result"]
       --success <SUCCESS_CRITERIA>
-      --completion <COMPLETION>            [default: orchestrator]
+      --completion <COMPLETION>                    [default: orchestrator]
       --review-by <REVIEW_BY>
       --id <ID>
       --native-id <NATIVE_ID>
@@ -329,10 +473,12 @@ Options:
       --run <RUN_ID>
       --node <NODE_ID>
       --provider-ref <PROVIDER_REF>
-      --source <SOURCE>                    [default: connected]
+      --source <SOURCE>                            [default: connected]
+      --runtime-timeout <RUNTIME_TIMEOUT_SECONDS>
+      --idle-timeout <IDLE_TIMEOUT_SECONDS>
       --hook-input
       --quiet
-  -h, --help                               Print help
+  -h, --help                                       Print help
 ```
 
 ### `orc session`
@@ -342,17 +488,18 @@ Manage sessions
 ```text
 Manage sessions
 
-Usage: session <COMMAND>
+Usage: orc session <COMMAND>
 
 Commands:
   register
   adopt
   archive
-  prune     Stop an active agent through its provider, then archive it
+  prune      Stop an active agent through its provider, then archive it
   current
   list
   update
-  help      Print this message or the help of the given subcommand(s)
+  keepalive  Renew a managed session's idle lease
+  help       Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -361,19 +508,19 @@ Options:
 ### `orc session register`
 
 ```text
-Usage: register [OPTIONS]
+Usage: orc session register [OPTIONS]
 
 Options:
-      --scope <SCOPE>                      [env: ORC_SCOPE=] [default: .]
-      --harness <HARNESS>                  [default: unknown]
+      --scope <SCOPE>                              [env: ORC_SCOPE=] [default: .]
+      --harness <HARNESS>                          [default: unknown]
       --model <MODEL>
-      --role <ROLE>                        [default: worker]
-      --title <TITLE>                      [default: "Agent session"]
-      --purpose <PURPOSE>                  [default: "Agent session"]
-      --goal <GOAL>                        [default: "Complete the assigned work"]
-      --expected-output <EXPECTED_OUTPUT>  [default: "A verified result"]
+      --role <ROLE>                                [default: worker]
+      --title <TITLE>                              [default: "Agent session"]
+      --purpose <PURPOSE>                          [default: "Agent session"]
+      --goal <GOAL>                                [default: "Complete the assigned work"]
+      --expected-output <EXPECTED_OUTPUT>          [default: "A verified result"]
       --success <SUCCESS_CRITERIA>
-      --completion <COMPLETION>            [default: orchestrator]
+      --completion <COMPLETION>                    [default: orchestrator]
       --review-by <REVIEW_BY>
       --id <ID>
       --native-id <NATIVE_ID>
@@ -381,16 +528,18 @@ Options:
       --run <RUN_ID>
       --node <NODE_ID>
       --provider-ref <PROVIDER_REF>
-      --source <SOURCE>                    [default: connected]
+      --source <SOURCE>                            [default: connected]
+      --runtime-timeout <RUNTIME_TIMEOUT_SECONDS>
+      --idle-timeout <IDLE_TIMEOUT_SECONDS>
       --hook-input
       --quiet
-  -h, --help                               Print help
+  -h, --help                                       Print help
 ```
 
 ### `orc session adopt`
 
 ```text
-Usage: adopt [OPTIONS]
+Usage: orc session adopt [OPTIONS]
 
 Options:
       --scope <SCOPE>                      [env: ORC_SCOPE=] [default: .]
@@ -411,7 +560,7 @@ Options:
 ### `orc session archive`
 
 ```text
-Usage: archive [OPTIONS] [ID]
+Usage: orc session archive [OPTIONS] [ID]
 
 Arguments:
   [ID]
@@ -431,7 +580,7 @@ Stop an active agent through its provider, then archive it
 ```text
 Stop an active agent through its provider, then archive it
 
-Usage: prune [OPTIONS] <ID>
+Usage: orc session prune [OPTIONS] <ID>
 
 Arguments:
   <ID>
@@ -444,7 +593,7 @@ Options:
 ### `orc session current`
 
 ```text
-Usage: current [OPTIONS]
+Usage: orc session current [OPTIONS]
 
 Options:
       --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
@@ -455,7 +604,7 @@ Options:
 ### `orc session list`
 
 ```text
-Usage: list [OPTIONS]
+Usage: orc session list [OPTIONS]
 
 Options:
       --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
@@ -466,7 +615,7 @@ Options:
 ### `orc session update`
 
 ```text
-Usage: update [OPTIONS] --status <STATUS> <ID>
+Usage: orc session update [OPTIONS] --status <STATUS> <ID>
 
 Arguments:
   <ID>
@@ -477,6 +626,23 @@ Options:
   -h, --help             Print help
 ```
 
+### `orc session keepalive`
+
+Renew a managed session's idle lease
+
+```text
+Renew a managed session's idle lease
+
+Usage: orc session keepalive [OPTIONS] [ID]
+
+Arguments:
+  [ID]
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+  -h, --help           Print help
+```
+
 ### `orc run`
 
 Manage workflow runs
@@ -484,7 +650,7 @@ Manage workflow runs
 ```text
 Manage workflow runs
 
-Usage: run <COMMAND>
+Usage: orc run <COMMAND>
 
 Commands:
   create
@@ -504,7 +670,7 @@ Options:
 ### `orc run create`
 
 ```text
-Usage: create [OPTIONS] --name <NAME> --goal <GOAL> --expected-output <EXPECTED_OUTPUT>
+Usage: orc run create [OPTIONS] --name <NAME> --goal <GOAL> --expected-output <EXPECTED_OUTPUT>
 
 Options:
       --scope <SCOPE>                      [env: ORC_SCOPE=] [default: .]
@@ -521,7 +687,7 @@ Options:
 ### `orc run agent`
 
 ```text
-Usage: agent [OPTIONS] --role <ROLE> --harness <HARNESS> <ID>
+Usage: orc run agent [OPTIONS] --role <ROLE> --harness <HARNESS> <ID>
 
 Arguments:
   <ID>
@@ -537,7 +703,7 @@ Options:
 ### `orc run list`
 
 ```text
-Usage: list [OPTIONS]
+Usage: orc run list [OPTIONS]
 
 Options:
       --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
@@ -548,7 +714,7 @@ Options:
 ### `orc run show`
 
 ```text
-Usage: show [OPTIONS] <ID>
+Usage: orc run show [OPTIONS] <ID>
 
 Arguments:
   <ID>
@@ -562,7 +728,7 @@ Options:
 ### `orc run update`
 
 ```text
-Usage: update [OPTIONS] --status <STATUS> <ID>
+Usage: orc run update [OPTIONS] --status <STATUS> <ID>
 
 Arguments:
   <ID>
@@ -576,7 +742,7 @@ Options:
 ### `orc run resume`
 
 ```text
-Usage: resume [OPTIONS] <ID>
+Usage: orc run resume [OPTIONS] <ID>
 
 Arguments:
   <ID>
@@ -589,7 +755,7 @@ Options:
 ### `orc run approve`
 
 ```text
-Usage: approve [OPTIONS] <ID>
+Usage: orc run approve [OPTIONS] <ID>
 
 Arguments:
   <ID>
@@ -604,7 +770,7 @@ Options:
 ### `orc run cancel`
 
 ```text
-Usage: cancel [OPTIONS] <ID>
+Usage: orc run cancel [OPTIONS] <ID>
 
 Arguments:
   <ID>
@@ -621,7 +787,7 @@ Manage workflow nodes
 ```text
 Manage workflow nodes
 
-Usage: node <COMMAND>
+Usage: orc node <COMMAND>
 
 Commands:
   upsert
@@ -638,7 +804,7 @@ Options:
 ### `orc node upsert`
 
 ```text
-Usage: upsert [OPTIONS] --run <RUN_ID> <ID>
+Usage: orc node upsert [OPTIONS] --run <RUN_ID> <ID>
 
 Arguments:
   <ID>
@@ -668,7 +834,7 @@ Options:
 ### `orc node update`
 
 ```text
-Usage: update [OPTIONS] --run <RUN_ID> --status <STATUS> <ID>
+Usage: orc node update [OPTIONS] --run <RUN_ID> --status <STATUS> <ID>
 
 Arguments:
   <ID>
@@ -683,7 +849,7 @@ Options:
 ### `orc node edit`
 
 ```text
-Usage: edit [OPTIONS] --run <RUN_ID> <ID>
+Usage: orc node edit [OPTIONS] --run <RUN_ID> <ID>
 
 Arguments:
   <ID>
@@ -704,7 +870,7 @@ Options:
 ### `orc node delete`
 
 ```text
-Usage: delete [OPTIONS] --run <RUN_ID> <ID>
+Usage: orc node delete [OPTIONS] --run <RUN_ID> <ID>
 
 Arguments:
   <ID>
@@ -718,7 +884,7 @@ Options:
 ### `orc node dependency`
 
 ```text
-Usage: dependency [OPTIONS] --run <RUN_ID> --on <ON> <ID>
+Usage: orc node dependency [OPTIONS] --run <RUN_ID> --on <ON> <ID>
 
 Arguments:
   <ID>
@@ -738,7 +904,7 @@ Manage provider manifests
 ```text
 Manage provider manifests
 
-Usage: provider <COMMAND>
+Usage: orc provider <COMMAND>
 
 Commands:
   list
@@ -752,7 +918,7 @@ Options:
 ### `orc provider list`
 
 ```text
-Usage: list [OPTIONS]
+Usage: orc provider list [OPTIONS]
 
 Options:
       --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
@@ -763,7 +929,7 @@ Options:
 ### `orc provider validate`
 
 ```text
-Usage: validate [OPTIONS] [NAME]
+Usage: orc provider validate [OPTIONS] [NAME]
 
 Arguments:
   [NAME]
@@ -781,7 +947,7 @@ Manage versioned workflow definitions
 ```text
 Manage versioned workflow definitions
 
-Usage: workflow <COMMAND>
+Usage: orc workflow <COMMAND>
 
 Commands:
   init
@@ -804,20 +970,21 @@ Options:
 ### `orc workflow init`
 
 ```text
-Usage: init [OPTIONS] <NAME>
+Usage: orc workflow init [OPTIONS] <NAME>
 
 Arguments:
   <NAME>
 
 Options:
-      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
-  -h, --help           Print help
+      --harness <HARNESS>
+      --scope <SCOPE>      [env: ORC_SCOPE=] [default: .]
+  -h, --help               Print help
 ```
 
 ### `orc workflow import`
 
 ```text
-Usage: import [OPTIONS] <PATH>
+Usage: orc workflow import [OPTIONS] <PATH>
 
 Arguments:
   <PATH>
@@ -830,7 +997,7 @@ Options:
 ### `orc workflow list`
 
 ```text
-Usage: list [OPTIONS]
+Usage: orc workflow list [OPTIONS]
 
 Options:
       --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
@@ -840,7 +1007,7 @@ Options:
 ### `orc workflow show`
 
 ```text
-Usage: show [OPTIONS] <NAME>
+Usage: orc workflow show [OPTIONS] <NAME>
 
 Arguments:
   <NAME>
@@ -853,7 +1020,7 @@ Options:
 ### `orc workflow edit`
 
 ```text
-Usage: edit [OPTIONS] <NAME>
+Usage: orc workflow edit [OPTIONS] <NAME>
 
 Arguments:
   <NAME>
@@ -866,7 +1033,7 @@ Options:
 ### `orc workflow validate`
 
 ```text
-Usage: validate <WORKFLOW>
+Usage: orc workflow validate <WORKFLOW>
 
 Arguments:
   <WORKFLOW>
@@ -878,7 +1045,7 @@ Options:
 ### `orc workflow plan`
 
 ```text
-Usage: plan [OPTIONS] <WORKFLOW>
+Usage: orc workflow plan [OPTIONS] <WORKFLOW>
 
 Arguments:
   <WORKFLOW>
@@ -892,7 +1059,7 @@ Options:
 ### `orc workflow start`
 
 ```text
-Usage: start [OPTIONS] <WORKFLOW>
+Usage: orc workflow start [OPTIONS] <WORKFLOW>
 
 Arguments:
   <WORKFLOW>
@@ -907,7 +1074,7 @@ Options:
 ### `orc workflow history`
 
 ```text
-Usage: history [OPTIONS] <NAME>
+Usage: orc workflow history [OPTIONS] <NAME>
 
 Arguments:
   <NAME>
@@ -920,7 +1087,7 @@ Options:
 ### `orc workflow search`
 
 ```text
-Usage: search <QUERY>
+Usage: orc workflow search <QUERY>
 
 Arguments:
   <QUERY>
@@ -932,7 +1099,7 @@ Options:
 ### `orc workflow path`
 
 ```text
-Usage: path [OPTIONS] <NAME>
+Usage: orc workflow path [OPTIONS] <NAME>
 
 Arguments:
   <NAME>
@@ -949,17 +1116,19 @@ Launch a managed harness
 ```text
 Launch a managed harness
 
-Usage: launch [OPTIONS] <HARNESS> [-- <ARGS>...]
+Usage: orc launch [OPTIONS] <HARNESS> [-- <ARGS>...]
 
 Arguments:
   <HARNESS>
   [ARGS]...
 
 Options:
-      --scope <SCOPE>      [env: ORC_SCOPE=] [default: .]
+      --scope <SCOPE>                              [env: ORC_SCOPE=] [default: .]
       --model <MODEL>
       --managed <MANAGED>
-  -h, --help               Print help
+      --runtime-timeout <RUNTIME_TIMEOUT_SECONDS>
+      --idle-timeout <IDLE_TIMEOUT_SECONDS>
+  -h, --help                                       Print help
 ```
 
 ### `orc attach`
@@ -969,7 +1138,7 @@ Attach through a provider chain
 ```text
 Attach through a provider chain
 
-Usage: attach [OPTIONS] <ID>
+Usage: orc attach [OPTIONS] <ID>
 
 Arguments:
   <ID>
@@ -987,7 +1156,7 @@ Inspect through a provider chain
 ```text
 Inspect through a provider chain
 
-Usage: inspect [OPTIONS] <ID>
+Usage: orc inspect [OPTIONS] <ID>
 
 Arguments:
   <ID>
@@ -1005,7 +1174,7 @@ Disconnect a registered session
 ```text
 Disconnect a registered session
 
-Usage: disconnect [OPTIONS] [ID]
+Usage: orc disconnect [OPTIONS] [ID]
 
 Arguments:
   [ID]
@@ -1022,7 +1191,7 @@ Send mid-run guidance
 ```text
 Send mid-run guidance
 
-Usage: guide [OPTIONS] --text <TEXT> <ID>
+Usage: orc guide [OPTIONS] --text <TEXT> <ID>
 
 Arguments:
   <ID>
@@ -1040,7 +1209,7 @@ Run the MCP server
 ```text
 Run the MCP server
 
-Usage: mcp
+Usage: orc mcp
 
 Options:
   -h, --help  Print help
@@ -1053,7 +1222,7 @@ Print the prompt session marker
 ```text
 Print the prompt session marker
 
-Usage: prompt [OPTIONS]
+Usage: orc prompt [OPTIONS]
 
 Options:
       --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
@@ -1067,13 +1236,13 @@ Generate shell completions
 ```text
 Generate shell completions
 
-Usage: completion <SHELL>
+Usage: orc completion <SHELL>
 
 Arguments:
-  <SHELL>  [possible values: bash, zsh, fish, nu]
+  <SHELL>  [possible values: bash, fish, nu, powershell, zsh]
 
 Options:
-  -h, --help  Print help
+  -h, --help  Print help (see more with '--help')
 ```
 
 ### `orc schema`
@@ -1083,7 +1252,7 @@ Print generated JSON schemas
 ```text
 Print generated JSON schemas
 
-Usage: schema <SCHEMA>
+Usage: orc schema <SCHEMA>
 
 Arguments:
   <SCHEMA>  [possible values: config, provider, workflow, state]
@@ -1091,20 +1260,16 @@ Arguments:
 Options:
   -h, --help  Print help
 ```
-
-
 <!-- END GENERATED:commands -->
 
 ## Develop Orc
 
 ```bash
 nix develop --accept-flake-config
-bun install --frozen-lockfile
-bun run check
-bun run generate
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+./hack/generate.sh --check
 nix build --accept-flake-config
 nix flake check --accept-flake-config
 ./hack/screenshots.sh
 ```
-
-Run `bun run nix:lock` after a dependency change.

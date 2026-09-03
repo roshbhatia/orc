@@ -304,6 +304,15 @@
           "default": "",
           "type": "string"
         },
+        "idleTimeoutSeconds": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "input_mapping": {
           "additionalProperties": {
             "type": "string"
@@ -315,7 +324,7 @@
           "$ref": "#/$defs/JudgePolicy",
           "default": "llm"
         },
-        "max_depth": {
+        "maxDepth": {
           "default": null,
           "format": "uint",
           "minimum": 0,
@@ -384,7 +393,7 @@
           },
           "type": "array"
         },
-        "timeout_seconds": {
+        "timeoutSeconds": {
           "default": null,
           "format": "uint64",
           "minimum": 0,

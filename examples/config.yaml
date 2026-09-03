@@ -1,6 +1,14 @@
 # yaml-language-server: $schema=../schema/orc.schema.json
 cache:
   providerTtlMs: 1000
+daemon:
+  autostart: true
+  scanIntervalMs: 5000
+  idleShutdownSeconds: 60
+  terminationRetrySeconds: 60
+lifecycle:
+  runtimeTimeoutSeconds: 28800
+  idleTimeoutSeconds: 1800
 providers:
   directory: ~/.config/orc/providers
   timeoutMs: 5000

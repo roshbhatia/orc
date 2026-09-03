@@ -806,20 +806,20 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "orc"
-version = "0.9.4"
+version = "0.10.0"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
  "chrono",
  "clap",
- "clap_complete",
- "clap_complete_nushell",
  "crossterm",
  "hex",
  "insta",
+ "libc",
  "minijinja",
  "rataflow",
  "ratatui",
+ "rs-utils",
  "schemars",
  "serde",
  "serde_json",
@@ -1050,6 +1050,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rs-utils"
+version = "0.1.0"
+source = "git+https://github.com/roshbhatia/rs-utils?rev=5418d8fbd3b4477095fe82a9db7e80b8377b5857#5418d8fbd3b4477095fe82a9db7e80b8377b5857"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "clap_complete_nushell",
+ "minijinja",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "rust-sugiyama"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1190,6 +1206,19 @@ name = "serde_yaml"
 version = "0.9.34+deprecated"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
+name = "serde_yaml_ng"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
 dependencies = [
  "indexmap",
  "itoa",

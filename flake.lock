@@ -1,5 +1,29 @@
 {
   "nodes": {
+    "changes": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "systems": [
+          "systems"
+        ]
+      },
+      "locked": {
+        "lastModified": 1788399997,
+        "narHash": "sha256-m/U+J9Uj/GZ9YBxcvWhNIXs5MbBGnUHg9YDNUJtemH0=",
+        "owner": "roshbhatia",
+        "repo": "changes",
+        "rev": "722dc437144a540ff22135285682c15e651b09f0",
+        "type": "github"
+      },
+      "original": {
+        "owner": "roshbhatia",
+        "ref": "main",
+        "repo": "changes",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1787964612,
@@ -18,8 +42,10 @@
     },
     "root": {
       "inputs": {
+        "changes": "changes",
         "nixpkgs": "nixpkgs",
-        "systems": "systems"
+        "systems": "systems",
+        "traces": "traces"
       }
     },
     "systems": {
@@ -34,6 +60,30 @@
       "original": {
         "owner": "nix-systems",
         "repo": "default",
+        "type": "github"
+      }
+    },
+    "traces": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ],
+        "systems": [
+          "systems"
+        ]
+      },
+      "locked": {
+        "lastModified": 1788404172,
+        "narHash": "sha256-DOHHKqc+XT/+pC+mvqqUsKNBwFA1joEIrGUGn61SHaE=",
+        "owner": "roshbhatia",
+        "repo": "traces",
+        "rev": "92a91c853ca27fdf00cd5e575ce0332fe10a7432",
+        "type": "github"
+      },
+      "original": {
+        "owner": "roshbhatia",
+        "ref": "main",
+        "repo": "traces",
         "type": "github"
       }
     }

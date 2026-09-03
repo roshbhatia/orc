@@ -7,13 +7,17 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
-use clap_complete::{Shell, generate};
-use clap_complete_nushell::Nushell;
+use rs_utils::{
+    artifact::{self, Mode},
+    completion::{CompletionShell as CompletionTargetShell, generate_completion},
+    help, readme,
+};
 
 use crate::{
     VERSION,
     config::{self, Config},
-    control::{self, Contract, SessionLink},
+    control::{self, Contract, SessionLease, SessionLink},
+    daemon,
     domain::{CompletionTarget, JudgePolicy, LifecycleStatus, RegistrationSource, SessionRole},
     mcp,
     preferences::{self, AutonomyMode},
@@ -34,6 +38,15 @@ enum Commands {
     Tui(TuiArgs),
     #[command(about = "Show workspace status")]
     Status(OutputArgs),
+    #[command(about = "Start the managed-session supervisor")]
+    Start,
+    #[command(about = "Stop the managed-session supervisor")]
+    Stop,
+    #[command(about = "Manage the managed-session supervisor")]
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
     #[command(about = "Show or change this workspace's autonomy mode")]
     Mode {
         mode: Option<AutonomyMode>,
@@ -97,6 +110,13 @@ enum Commands {
         root: PathBuf,
         #[arg(long)]
         check: bool,
+    },
+    #[command(hide = true)]
+    ProcessMonitor {
+        #[arg(long)]
+        tracker_fd: i32,
+        #[arg(long, default_value_t = -1)]
+        parent_fd: i32,
     },
 }
 
@@ -183,6 +203,10 @@ struct RegisterArgs {
     provider_ref: Option<String>,
     #[arg(long = "source", default_value = "connected")]
     source: RegistrationSource,
+    #[arg(long = "runtime-timeout")]
+    runtime_timeout_seconds: Option<u64>,
+    #[arg(long = "idle-timeout")]
+    idle_timeout_seconds: Option<u64>,
     #[arg(long = "hook-input")]
     hook_input: bool,
     #[arg(long)]
@@ -226,6 +250,28 @@ enum SessionCommand {
         #[arg(long)]
         status: LifecycleStatus,
     },
+    #[command(about = "Renew a managed session's idle lease")]
+    Keepalive {
+        id: Option<String>,
+        #[command(flatten)]
+        scope: ScopeArgs,
+    },
+}
+
+#[derive(Subcommand)]
+enum DaemonCommand {
+    Start,
+    Stop,
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    Sweep {
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(hide = true)]
+    Run,
 }
 
 #[derive(Subcommand)]
@@ -390,6 +436,8 @@ enum ProviderCommand {
 enum WorkflowCommand {
     Init {
         name: String,
+        #[arg(long)]
+        harness: Option<String>,
         #[command(flatten)]
         scope: ScopeArgs,
     },
@@ -455,6 +503,10 @@ struct LaunchArgs {
     model: Option<String>,
     #[arg(long)]
     managed: Option<String>,
+    #[arg(long = "runtime-timeout")]
+    runtime_timeout_seconds: Option<u64>,
+    #[arg(long = "idle-timeout")]
+    idle_timeout_seconds: Option<u64>,
     #[arg(last = true)]
     args: Vec<String>,
 }
@@ -493,14 +545,6 @@ struct GuideArgs {
     scope: ScopeArgs,
     #[arg(long)]
     text: String,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum CompletionTargetShell {
-    Bash,
-    Zsh,
-    Fish,
-    Nu,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -571,9 +615,14 @@ fn register(config: &Config, mut args: RegisterArgs) -> Result<Option<String>> {
             run_id: args.run_id,
             node_id: args.node_id,
             provider_ref: args.provider_ref,
+            runtime_timeout_seconds: args.runtime_timeout_seconds,
+            idle_timeout_seconds: args.idle_timeout_seconds,
             source: args.source,
         },
     )?;
+    if session.registration == RegistrationSource::Managed {
+        daemon::ensure_running(config)?;
+    }
     // Defer provider enrichment because harness hooks have strict latency budgets.
     if !invoked_by_hook {
         let _ = control::reconcile_with_current(config, &args.scope.scope, true);
@@ -586,22 +635,51 @@ fn print_json(value: &impl serde::Serialize) -> Result<()> {
     Ok(())
 }
 
+fn require_orchestrator_or_operator(scope: &std::path::Path) -> Result<()> {
+    control::require_supervisor_control(scope)
+}
+
+fn require_supervisor_control() -> Result<()> {
+    if env::var_os("ORC_SESSION_ID").is_none() {
+        return Ok(());
+    }
+    let scope = env::var_os("ORC_SCOPE").context("ORC_SCOPE is required inside an Orc session")?;
+    require_orchestrator_or_operator(std::path::Path::new(&scope))
+}
+
 pub fn run() -> Result<u8> {
     let cli = Cli::parse();
-    let config = config::load()?;
-    match cli.command.unwrap_or(Commands::Tui(TuiArgs {
+    let command = cli.command.unwrap_or(Commands::Tui(TuiArgs {
         scope: ScopeArgs {
             scope: env::current_dir()?,
         },
         loading_preview: false,
-    })) {
+    }));
+    let config = if matches!(
+        &command,
+        Commands::Stop
+            | Commands::Daemon {
+                command: DaemonCommand::Stop | DaemonCommand::Status { .. }
+            }
+            | Commands::ProcessMonitor { .. }
+    ) {
+        Config::default()
+    } else {
+        config::load()?
+    };
+    match command {
         Commands::Tui(args) => {
             if args.loading_preview {
                 tui::preview_loading()?;
             } else {
+                require_orchestrator_or_operator(&args.scope.scope)?;
                 tui::run(config, &args.scope.scope)?;
             }
         }
+        Commands::ProcessMonitor {
+            tracker_fd,
+            parent_fd,
+        } => provider::monitor_process(tracker_fd, parent_fd)?,
         Commands::Status(args) => {
             let state = control::read_workspace(&args.scope.scope)?;
             if args.json {
@@ -617,7 +695,70 @@ pub fn run() -> Result<u8> {
                 );
             }
         }
+        Commands::Start => {
+            let status = daemon::start()?;
+            println!("running · pid {}", status.pid);
+        }
+        Commands::Stop => {
+            require_supervisor_control()?;
+            println!(
+                "{}",
+                if daemon::stop()? {
+                    "stopping"
+                } else {
+                    "not running"
+                }
+            );
+        }
+        Commands::Daemon { command } => match command {
+            DaemonCommand::Start => {
+                let status = daemon::start()?;
+                println!("running · pid {}", status.pid);
+            }
+            DaemonCommand::Stop => {
+                require_supervisor_control()?;
+                println!(
+                    "{}",
+                    if daemon::stop()? {
+                        "stopping"
+                    } else {
+                        "not running"
+                    }
+                );
+            }
+            DaemonCommand::Status { json } => {
+                let status = daemon::status()?;
+                if json {
+                    print_json(&status)?;
+                } else if let Some(status) = status {
+                    println!(
+                        "running · pid {} · started {}",
+                        status.pid, status.started_at
+                    );
+                } else {
+                    println!("not running");
+                }
+            }
+            DaemonCommand::Sweep { json } => {
+                let report = daemon::sweep(&config)?;
+                if json {
+                    print_json(&report)?;
+                } else {
+                    println!(
+                        "{} monitored · {} terminated · {} failures",
+                        report.monitored,
+                        report.terminated.len(),
+                        report.failures.len()
+                    );
+                    for failure in report.failures {
+                        println!("error: {failure}");
+                    }
+                }
+            }
+            DaemonCommand::Run => daemon::run(&config)?,
+        },
         Commands::Mode { mode, scope } => {
+            require_orchestrator_or_operator(&scope.scope)?;
             let scope = state::resolve_scope(&scope.scope)?;
             let mut selected = preferences::read(&scope)?;
             if let Some(mode) = mode {
@@ -643,6 +784,7 @@ pub fn run() -> Result<u8> {
                 contract,
                 native_id,
             } => {
+                require_orchestrator_or_operator(&scope.scope)?;
                 let session = control::adopt(&scope.scope, contract.into(), native_id)?;
                 let _ = control::reconcile_with_current(&config, &scope.scope, true);
                 println!("{}", session.id);
@@ -664,6 +806,29 @@ pub fn run() -> Result<u8> {
                 if id.is_none() && native_id.is_none() {
                     return Ok(0);
                 }
+                if hook_input
+                    && let Ok((_, current)) = control::ensure_active_context(&scope.scope)
+                    && current.registration == RegistrationSource::Managed
+                    && current.role != SessionRole::Orchestrator
+                {
+                    let targets_current = id.as_deref().is_none_or(|id| id == current.id)
+                        && native_id
+                            .as_deref()
+                            .is_none_or(|native| native == current.native_id);
+                    if !targets_current {
+                        bail!("a managed child exit hook can only disconnect its own session");
+                    }
+                    let session = control::update_session(
+                        &scope.scope,
+                        &current.id,
+                        LifecycleStatus::Disconnected,
+                    )?;
+                    if !quiet {
+                        println!("{}", session.id);
+                    }
+                    return Ok(0);
+                }
+                require_orchestrator_or_operator(&scope.scope)?;
                 let session = control::archive(&scope.scope, id.as_deref(), native_id.as_deref())?;
                 if !quiet {
                     println!("{}", session.id);
@@ -679,11 +844,19 @@ pub fn run() -> Result<u8> {
                 }
             }
             SessionCommand::Prune { id, scope } => {
+                require_orchestrator_or_operator(&scope.scope)?;
                 println!("{}", control::prune(&config, &scope.scope, &id)?.id)
             }
             SessionCommand::List(args) => list_sessions(&args)?,
             SessionCommand::Update { id, scope, status } => {
+                require_orchestrator_or_operator(&scope.scope)?;
                 print_json(&control::update_session(&scope.scope, &id, status)?)?
+            }
+            SessionCommand::Keepalive { id, scope } => {
+                require_orchestrator_or_operator(&scope.scope)?;
+                let id = control::require_id(id)?;
+                print_json(&control::keepalive(&scope.scope, &id)?)?;
+                daemon::ensure_running(&config)?;
             }
         },
         Commands::Run { command } => match command {
@@ -697,6 +870,7 @@ pub fn run() -> Result<u8> {
                 model,
                 json,
             } => {
+                require_orchestrator_or_operator(&scope.scope)?;
                 let run = control::create_run(
                     &scope.scope,
                     name,
@@ -718,13 +892,16 @@ pub fn run() -> Result<u8> {
                 role,
                 harness,
                 model,
-            } => print_json(&control::set_run_agent(
-                &scope.scope,
-                &id,
-                role,
-                harness,
-                model,
-            )?)?,
+            } => {
+                require_orchestrator_or_operator(&scope.scope)?;
+                print_json(&control::set_run_agent(
+                    &scope.scope,
+                    &id,
+                    role,
+                    harness,
+                    model,
+                )?)?
+            }
             RunCommand::List(args) => {
                 let state = control::read_workspace(&args.scope.scope)?;
                 if args.json {
@@ -749,13 +926,15 @@ pub fn run() -> Result<u8> {
                 }
             }
             RunCommand::Update { id, scope, status } => {
+                require_orchestrator_or_operator(&scope.scope)?;
                 print_json(&control::update_run(&scope.scope, &id, status)?)?
             }
             RunCommand::Execute { id, scope } | RunCommand::Resume { id, scope } => {
+                require_orchestrator_or_operator(&scope.scope)?;
                 match workflow::execute(&config, &scope.scope, &id) {
                     Ok(run) => println!("{}\t{}", run.id, run.status),
                     Err(error) => {
-                        let _ = workflow::fail(&scope.scope, &id, &error);
+                        let _ = workflow::fail(&config, &scope.scope, &id, &error);
                         return Err(error);
                     }
                 }
@@ -765,14 +944,20 @@ pub fn run() -> Result<u8> {
                 scope,
                 gate,
                 no_resume,
-            } => print_json(&workflow::approve(
-                &config,
-                &scope.scope,
-                &id,
-                gate.as_deref(),
-                !no_resume,
-            )?)?,
-            RunCommand::Cancel { id, scope } => print_json(&workflow::cancel(&scope.scope, &id)?)?,
+            } => {
+                require_orchestrator_or_operator(&scope.scope)?;
+                print_json(&workflow::approve(
+                    &config,
+                    &scope.scope,
+                    &id,
+                    gate.as_deref(),
+                    !no_resume,
+                )?)?
+            }
+            RunCommand::Cancel { id, scope } => {
+                require_orchestrator_or_operator(&scope.scope)?;
+                print_json(&workflow::cancel(&config, &scope.scope, &id)?)?
+            }
         },
         Commands::Node { command } => match command {
             NodeCommand::Upsert {
@@ -786,26 +971,32 @@ pub fn run() -> Result<u8> {
                 depends_on,
                 execution,
                 judge_policy,
-            } => print_json(&control::upsert_node(
-                &scope.scope,
-                &run_id,
-                control::NodeSpec {
-                    id,
-                    contract: (*contract).into(),
-                    session_id,
-                    status,
-                    attempt,
-                    depends_on,
-                    execution,
-                    judge_policy,
-                },
-            )?)?,
+            } => {
+                require_orchestrator_or_operator(&scope.scope)?;
+                print_json(&control::upsert_node(
+                    &scope.scope,
+                    &run_id,
+                    control::NodeSpec {
+                        id,
+                        contract: (*contract).into(),
+                        session_id,
+                        status,
+                        attempt,
+                        depends_on,
+                        execution,
+                        judge_policy,
+                    },
+                )?)?
+            }
             NodeCommand::Update {
                 id,
                 scope,
                 run_id,
                 status,
-            } => print_json(&control::update_node(&scope.scope, &run_id, &id, status)?)?,
+            } => {
+                require_orchestrator_or_operator(&scope.scope)?;
+                print_json(&control::update_node(&scope.scope, &run_id, &id, status)?)?
+            }
             NodeCommand::Edit {
                 id,
                 scope,
@@ -817,22 +1008,26 @@ pub fn run() -> Result<u8> {
                 model,
                 execution,
                 judge_policy,
-            } => print_json(&workflow::edit_run_node(
-                &config,
-                &scope.scope,
-                &run_id,
-                &id,
-                workflow::NodeEdit {
-                    goal,
-                    expected_output,
-                    success_criteria,
-                    harness,
-                    model,
-                    execution,
-                    judge_policy,
-                },
-            )?)?,
+            } => {
+                require_orchestrator_or_operator(&scope.scope)?;
+                print_json(&workflow::edit_run_node(
+                    &config,
+                    &scope.scope,
+                    &run_id,
+                    &id,
+                    workflow::NodeEdit {
+                        goal,
+                        expected_output,
+                        success_criteria,
+                        harness,
+                        model,
+                        execution,
+                        judge_policy,
+                    },
+                )?)?
+            }
             NodeCommand::Delete { id, scope, run_id } => {
+                require_orchestrator_or_operator(&scope.scope)?;
                 workflow::delete_run_node(&config, &scope.scope, &run_id, &id)?;
             }
             NodeCommand::Dependency {
@@ -842,6 +1037,7 @@ pub fn run() -> Result<u8> {
                 on,
                 remove,
             } => {
+                require_orchestrator_or_operator(&scope.scope)?;
                 workflow::set_run_dependency(&config, &scope.scope, &run_id, &id, &on, !remove)?;
             }
         },
@@ -885,12 +1081,17 @@ pub fn run() -> Result<u8> {
         },
         Commands::Workflow { command } => workflow_command(&config, command)?,
         Commands::Launch(args) => {
+            require_orchestrator_or_operator(&args.scope.scope)?;
             return Ok(control::launch(
                 &config,
                 &args.scope.scope,
                 args.harness,
                 args.model,
                 args.managed,
+                SessionLease {
+                    runtime_timeout_seconds: args.runtime_timeout_seconds,
+                    idle_timeout_seconds: args.idle_timeout_seconds,
+                },
                 args.args,
             )?
             .clamp(0, 255) as u8);
@@ -918,13 +1119,17 @@ pub fn run() -> Result<u8> {
             .clamp(0, 255) as u8);
         }
         Commands::Disconnect { id, scope } => {
+            require_orchestrator_or_operator(&scope.scope)?;
             let id = control::require_id(id)?;
             println!(
                 "{}",
                 control::update_session(&scope.scope, &id, LifecycleStatus::Disconnected)?.id
             );
         }
-        Commands::Guide(args) => guide(&config, &args)?,
+        Commands::Guide(args) => {
+            require_orchestrator_or_operator(&args.scope.scope)?;
+            guide(&config, &args)?;
+        }
         Commands::Mcp => mcp::run(config)?,
         Commands::Prompt(scope) => {
             let state = control::read_workspace(&scope.scope)?;
@@ -971,13 +1176,24 @@ fn list_sessions(args: &OutputArgs) -> Result<()> {
 
 fn workflow_command(config: &Config, command: WorkflowCommand) -> Result<()> {
     match command {
-        WorkflowCommand::Init { name, scope } => {
-            println!("{}", workflow::init(config, &scope.scope, &name)?.display())
+        WorkflowCommand::Init {
+            name,
+            harness,
+            scope,
+        } => {
+            require_orchestrator_or_operator(&scope.scope)?;
+            println!(
+                "{}",
+                workflow::init(config, &scope.scope, &name, harness.as_deref())?.display()
+            )
         }
-        WorkflowCommand::Import { path, scope } => println!(
-            "{}",
-            workflow::import(config, &scope.scope, &path)?.display()
-        ),
+        WorkflowCommand::Import { path, scope } => {
+            require_orchestrator_or_operator(&scope.scope)?;
+            println!(
+                "{}",
+                workflow::import(config, &scope.scope, &path)?.display()
+            )
+        }
         WorkflowCommand::List { scope } => {
             for path in workflow::list(config, &scope.scope)? {
                 println!(
@@ -993,6 +1209,7 @@ fn workflow_command(config: &Config, command: WorkflowCommand) -> Result<()> {
             fs::read_to_string(workflow::path(config, &scope.scope, &name)?)?
         ),
         WorkflowCommand::Edit { name, scope } => {
+            require_orchestrator_or_operator(&scope.scope)?;
             let path = workflow::path(config, &scope.scope, &name)?;
             let editor = env::var("EDITOR").unwrap_or_else(|_| "vi".into());
             let status = Command::new(editor).arg(&path).status()?;
@@ -1040,6 +1257,7 @@ fn workflow_command(config: &Config, command: WorkflowCommand) -> Result<()> {
             background,
             json,
         } => {
+            require_orchestrator_or_operator(&scope.scope)?;
             let definition_path = if requested.exists() {
                 requested
             } else {
@@ -1057,7 +1275,7 @@ fn workflow_command(config: &Config, command: WorkflowCommand) -> Result<()> {
             let autonomy = preferences::read(&state::resolve_scope(&scope.scope)?)?.autonomy;
             let run = if autonomy == AutonomyMode::Autonomous {
                 if background {
-                    workflow::spawn(&scope.scope, &run.id)?
+                    workflow::spawn(config, &scope.scope, &run.id)?
                 } else {
                     workflow::execute(config, &scope.scope, &run.id)?
                 }
@@ -1096,76 +1314,11 @@ fn guide(config: &Config, args: &GuideArgs) -> Result<()> {
 }
 
 fn completion(shell: CompletionTargetShell) {
-    let mut command = Cli::command();
-    match shell {
-        CompletionTargetShell::Bash => {
-            generate(Shell::Bash, &mut command, "orc", &mut io::stdout())
-        }
-        CompletionTargetShell::Zsh => generate(Shell::Zsh, &mut command, "orc", &mut io::stdout()),
-        CompletionTargetShell::Fish => {
-            generate(Shell::Fish, &mut command, "orc", &mut io::stdout())
-        }
-        CompletionTargetShell::Nu => generate(Nushell, &mut command, "orc", &mut io::stdout()),
-    }
-}
-
-fn command_reference() -> String {
-    fn render(command: &clap::Command, path: &str, output: &mut String) {
-        if command.is_hide_set() {
-            return;
-        }
-        output.push_str(&format!("### `{path}`\n\n"));
-        if let Some(about) = command.get_about() {
-            output.push_str(&format!("{about}\n\n"));
-        }
-        let mut help = command.clone();
-        output.push_str("```text\n");
-        for line in help.render_help().to_string().lines() {
-            output.push_str(line.trim_end());
-            output.push('\n');
-        }
-        output.push_str("```\n\n");
-        for subcommand in command.get_subcommands() {
-            if subcommand.get_name() == "help" {
-                continue;
-            }
-            render(
-                subcommand,
-                &format!("{path} {}", subcommand.get_name()),
-                output,
-            );
-        }
-    }
-    let command = Cli::command();
-    let mut output = String::new();
-    for subcommand in command.get_subcommands() {
-        if subcommand.get_name() != "help" {
-            render(
-                subcommand,
-                &format!("orc {}", subcommand.get_name()),
-                &mut output,
-            );
-        }
-    }
-    output
+    generate_completion(&mut Cli::command(), "orc", shell, &mut io::stdout());
 }
 
 fn generate_artifacts(root: &std::path::Path, check: bool) -> Result<()> {
-    fn update(path: &std::path::Path, content: &str, check: bool) -> Result<()> {
-        if check {
-            let current = fs::read_to_string(path)
-                .with_context(|| format!("read generated artifact {}", path.display()))?;
-            if current != content {
-                bail!("generated artifact is stale: {}", path.display());
-            }
-        } else {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(path, content)?;
-        }
-        Ok(())
-    }
+    let mode = if check { Mode::Check } else { Mode::Write };
 
     let schemas = [
         ("orc.schema.json", config::schema()),
@@ -1179,27 +1332,15 @@ fn generate_artifacts(root: &std::path::Path, check: bool) -> Result<()> {
     for (name, schema) in schemas {
         let mut content = serde_json::to_string_pretty(&schema)?;
         content.push('\n');
-        update(&root.join("schema").join(name), &content, check)?;
+        artifact::update(root.join("schema").join(name), &content, mode)?;
     }
 
     let readme = root.join("README.md");
     let source = fs::read_to_string(&readme)?;
-    let start_marker = "<!-- BEGIN GENERATED:commands -->";
-    let end_marker = "<!-- END GENERATED:commands -->";
-    let start = source
-        .find(start_marker)
-        .context("README command marker is missing")?;
-    let end = source
-        .find(end_marker)
-        .context("README command end marker is missing")?;
-    let generated = format!("{}\n{}\n{}", start_marker, command_reference(), end_marker);
-    let next = format!(
-        "{}{}{}",
-        &source[..start],
-        generated,
-        &source[end + end_marker.len()..]
-    );
-    update(&readme, &next, check)
+    let commands = help::markdown_reference(&Cli::command(), "orc", false)?;
+    let next = readme::replace_generated_section(&source, "commands", &commands)?;
+    artifact::update(readme, &next, mode)?;
+    Ok(())
 }
 
 #[cfg(test)]

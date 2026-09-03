@@ -1,6 +1,12 @@
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+fn parse_enum<T: DeserializeOwned>(value: &str, name: &str) -> Result<T, String> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned()))
+        .map_err(|_| format!("unknown {name}: {value}"))
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -28,16 +34,18 @@ impl std::str::FromStr for SessionRole {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        serde_json::from_str(&format!("\"{value}\"")).map_err(|_| format!("unknown role: {value}"))
+        parse_enum(value, "role")
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LifecycleStatus {
+    Pending,
     Queued,
     #[default]
     Working,
+    Terminating,
     Waiting,
     Blocked,
     Failed,
@@ -45,13 +53,19 @@ pub enum LifecycleStatus {
     Cancelled,
     Disconnected,
     Archived,
+    Skipped,
 }
 
 impl LifecycleStatus {
     pub fn active(self) -> bool {
         !matches!(
             self,
-            Self::Done | Self::Failed | Self::Cancelled | Self::Disconnected | Self::Archived
+            Self::Done
+                | Self::Failed
+                | Self::Cancelled
+                | Self::Disconnected
+                | Self::Archived
+                | Self::Skipped
         )
     }
 }
@@ -66,8 +80,7 @@ impl std::str::FromStr for LifecycleStatus {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        serde_json::from_str(&format!("\"{value}\""))
-            .map_err(|_| format!("unknown status: {value}"))
+        parse_enum(value, "status")
     }
 }
 
@@ -105,8 +118,7 @@ impl std::str::FromStr for JudgePolicy {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        serde_json::from_str(&format!("\"{value}\""))
-            .map_err(|_| format!("unknown judge policy: {value}"))
+        parse_enum(value, "judge policy")
     }
 }
 
@@ -120,8 +132,7 @@ impl std::str::FromStr for CompletionTarget {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        serde_json::from_str(&format!("\"{value}\""))
-            .map_err(|_| format!("unknown completion target: {value}"))
+        parse_enum(value, "completion target")
     }
 }
 
@@ -195,6 +206,20 @@ pub struct Session {
     pub directory: String,
     pub registration: RegistrationSource,
     pub status: LifecycleStatus,
+    #[serde(default)]
+    pub runtime_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub idle_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub heartbeat_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub termination_reason: Option<String>,
+    #[serde(default)]
+    pub termination_cause: Option<String>,
+    #[serde(default)]
+    pub termination_attempt_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub termination_operation_id: Option<String>,
     pub connected_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -212,8 +237,7 @@ impl std::str::FromStr for RegistrationSource {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        serde_json::from_str(&format!("\"{value}\""))
-            .map_err(|_| format!("unknown registration source: {value}"))
+        parse_enum(value, "registration source")
     }
 }
 
@@ -237,8 +261,12 @@ pub struct WorkflowNode {
     pub completion: CompletionTarget,
     pub review_by: Option<String>,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub child_run_id: Option<String>,
     pub status: LifecycleStatus,
     pub attempt: u32,
+    #[serde(default)]
+    pub retry_after: Option<DateTime<Utc>>,
     #[serde(default)]
     pub prompt: Option<String>,
     #[serde(default)]
@@ -260,6 +288,46 @@ pub struct ActivityEvent {
     pub at: DateTime<Utc>,
     pub kind: String,
     pub message: String,
+}
+
+const MAX_ACTIVITY_EVENTS: usize = 256;
+const MAX_ACTIVITY_MESSAGE_BYTES: usize = 4096;
+
+impl WorkflowNode {
+    pub fn record_activity(&mut self, kind: impl Into<String>, message: impl Into<String>) {
+        let mut message = message.into();
+        if message.len() > MAX_ACTIVITY_MESSAGE_BYTES {
+            let mut end = MAX_ACTIVITY_MESSAGE_BYTES - 3;
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+            message.push_str("...");
+        }
+        self.activity.push(ActivityEvent {
+            at: Utc::now(),
+            kind: kind.into(),
+            message,
+        });
+        self.compact_activity();
+    }
+
+    pub fn compact_activity(&mut self) {
+        let excess = self.activity.len().saturating_sub(MAX_ACTIVITY_EVENTS);
+        if excess > 0 {
+            self.activity.drain(..excess);
+        }
+        for event in &mut self.activity {
+            if event.message.len() > MAX_ACTIVITY_MESSAGE_BYTES {
+                let mut end = MAX_ACTIVITY_MESSAGE_BYTES - 3;
+                while !event.message.is_char_boundary(end) {
+                    end -= 1;
+                }
+                event.message.truncate(end);
+                event.message.push_str("...");
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -298,6 +366,8 @@ pub struct WorkflowRun {
     pub status: LifecycleStatus,
     pub orchestrator_id: Option<String>,
     #[serde(default)]
+    pub parent_run_id: Option<String>,
+    #[serde(default)]
     pub definition: Option<String>,
     #[serde(default)]
     pub revision: Option<String>,
@@ -307,6 +377,10 @@ pub struct WorkflowRun {
     pub mode: RunMode,
     #[serde(default)]
     pub process_id: Option<u32>,
+    #[serde(default)]
+    pub execution_nonce: Option<String>,
+    #[serde(default)]
+    pub resume_requested: bool,
     #[serde(default)]
     pub log_path: Option<String>,
     #[serde(default)]
@@ -347,7 +421,7 @@ pub struct WorkspaceState {
 impl WorkspaceState {
     pub fn empty(scope: String) -> Self {
         Self {
-            schema_version: "orc.state/v3".into(),
+            schema_version: "orc.state/v4".into(),
             scope,
             active: false,
             updated_at: DateTime::UNIX_EPOCH,
@@ -368,20 +442,25 @@ impl WorkspaceState {
     }
 
     fn current_session_for(&self, requested: Option<&str>) -> Option<&Session> {
-        requested
-            .and_then(|id| {
-                self.sessions
-                    .iter()
-                    .find(|session| session.id == id && session.status.active())
+        if let Some(id) = requested {
+            return self.sessions.iter().find(|session| {
+                session.id == id
+                    && session.status.active()
+                    && session.status != LifecycleStatus::Terminating
+            });
+        }
+        self.active_sessions()
+            .filter(|session| {
+                session.role == SessionRole::Orchestrator
+                    && session.status != LifecycleStatus::Terminating
             })
+            .max_by_key(|session| session.updated_at)
             .or_else(|| {
                 self.active_sessions()
-                    .filter(|session| session.role == SessionRole::Orchestrator)
-                    .max_by_key(|session| session.updated_at)
-            })
-            .or_else(|| {
-                self.active_sessions()
-                    .filter(|session| session.parent_id.is_none())
+                    .filter(|session| {
+                        session.parent_id.is_none()
+                            && session.status != LifecycleStatus::Terminating
+                    })
                     .max_by_key(|session| session.updated_at)
             })
     }
@@ -415,13 +494,20 @@ mod tests {
             directory: "/tmp".into(),
             registration: RegistrationSource::Connected,
             status,
+            runtime_timeout_seconds: None,
+            idle_timeout_seconds: None,
+            heartbeat_at: Some(at),
+            termination_reason: None,
+            termination_cause: None,
+            termination_attempt_at: None,
+            termination_operation_id: None,
             connected_at: at,
             updated_at: at,
         }
     }
 
     #[test]
-    fn archived_environment_session_does_not_override_active_orchestrator() {
+    fn explicit_inactive_session_does_not_inherit_orchestrator_authority() {
         let mut workspace = WorkspaceState::empty("/tmp".into());
         workspace.sessions = vec![
             session(
@@ -442,7 +528,40 @@ mod tests {
             workspace
                 .current_session_for(Some("archived"))
                 .map(|session| session.id.as_str()),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_environment_session_does_not_inherit_orchestrator_authority() {
+        let mut workspace = WorkspaceState::empty("/tmp".into());
+        workspace.sessions = vec![session(
+            "active",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+            1,
+        )];
+
+        assert!(workspace.current_session_for(Some("missing")).is_none());
+        assert_eq!(
+            workspace
+                .current_session_for(None)
+                .map(|session| session.id.as_str()),
             Some("active")
         );
+    }
+
+    #[test]
+    fn terminating_session_does_not_accept_current_authority() {
+        let mut workspace = WorkspaceState::empty("/tmp".into());
+        workspace.sessions = vec![session(
+            "terminating",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Terminating,
+            1,
+        )];
+
+        assert!(workspace.current_session_for(Some("terminating")).is_none());
+        assert!(workspace.current_session_for(None).is_none());
     }
 }

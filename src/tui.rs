@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs, io,
+    io,
     path::{Path, PathBuf},
     sync::{
         OnceLock,
@@ -41,7 +41,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     config::Config,
-    control,
+    control, daemon,
     domain::{
         CompletionTarget, JudgePolicy, LifecycleStatus, Session, WorkflowNode, WorkflowRun,
         WorkspaceState,
@@ -384,8 +384,11 @@ enum BootState {
     Failed(String),
 }
 
+type RefreshPayload = (WorkspaceState, Option<daemon::Status>, Option<String>);
+
 enum BackgroundResult {
-    Refresh(Result<(WorkspaceState, Vec<Manifest>), String>),
+    Refresh(Result<RefreshPayload, String>),
+    Providers(Result<Vec<Manifest>, String>),
     Enrichment {
         generation: u64,
         result: Result<WorkspaceState, String>,
@@ -408,6 +411,7 @@ struct App {
     config: Config,
     state: WorkspaceState,
     providers: Vec<Manifest>,
+    supervisor: Option<daemon::Status>,
     flow: AgentFlow,
     graph_items: BTreeMap<String, ItemRef>,
     tree: Vec<TreeRow>,
@@ -440,6 +444,7 @@ struct App {
     last_refresh: Instant,
     refresh_inflight: bool,
     refresh_requested: bool,
+    provider_refresh_inflight: bool,
     enrichment_inflight: bool,
     enrichment_requested: bool,
     enrichment_due_at: Instant,
@@ -490,6 +495,7 @@ impl App {
             config,
             state,
             providers,
+            supervisor: daemon::status().ok().flatten(),
             flow: new_flow(),
             graph_items: BTreeMap::new(),
             tree: Vec::new(),
@@ -522,6 +528,7 @@ impl App {
             last_refresh: Instant::now(),
             refresh_inflight: false,
             refresh_requested: false,
+            provider_refresh_inflight: false,
             enrichment_inflight: false,
             enrichment_requested: false,
             enrichment_due_at,
@@ -626,20 +633,44 @@ impl App {
     }
 
     fn request_refresh(&mut self, tx: &Sender<BackgroundResult>) {
-        if self.refresh_inflight || self.enrichment_inflight {
+        self.request_provider_refresh(tx);
+        if self.refresh_inflight {
             self.refresh_requested = true;
             return;
         }
         self.refresh_inflight = true;
         self.refresh_requested = false;
-        let config = self.config.clone();
         let scope = self.scope.clone();
         let tx = tx.clone();
         thread::spawn(move || {
             let result = control::read_workspace(&scope)
-                .and_then(|state| provider::discover(&config).map(|providers| (state, providers)))
+                .map(|state| {
+                    let mut warnings = Vec::new();
+                    let supervisor = daemon::status().unwrap_or_else(|error| {
+                        warnings.push(format!("supervisor status failed: {error:#}"));
+                        None
+                    });
+                    (
+                        state,
+                        supervisor,
+                        (!warnings.is_empty()).then(|| warnings.join("; ")),
+                    )
+                })
                 .map_err(|error| format!("{error:#}"));
             let _ = tx.send(BackgroundResult::Refresh(result));
+        });
+    }
+
+    fn request_provider_refresh(&mut self, tx: &Sender<BackgroundResult>) {
+        if self.provider_refresh_inflight {
+            return;
+        }
+        self.provider_refresh_inflight = true;
+        let config = self.config.clone();
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let result = provider::discover(&config).map_err(|error| format!("{error:#}"));
+            let _ = tx.send(BackgroundResult::Providers(result));
         });
     }
 
@@ -671,11 +702,11 @@ impl App {
                 self.refresh_inflight = false;
                 self.last_refresh = Instant::now();
                 match result {
-                    Ok((state, providers)) => {
+                    Ok((state, supervisor, warning)) => {
                         let first_load = matches!(self.boot, BootState::Loading { .. });
                         self.state = state;
                         self.state_generation = self.state_generation.wrapping_add(1);
-                        self.providers = providers;
+                        self.supervisor = supervisor;
                         if first_load {
                             self.expanded = default_expansions(&self.state);
                         }
@@ -693,6 +724,9 @@ impl App {
                         }
                         self.boot = BootState::Ready;
                         self.rebuild(false);
+                        if let Some(warning) = warning {
+                            self.set_status(warning);
+                        }
                         if first_load
                             && let Some(selected) = self.preferences.selected_item.as_deref()
                             && let Some(index) = self.tree.iter().position(|row| row.id == selected)
@@ -714,6 +748,17 @@ impl App {
                             self.set_status(format!("refresh failed: {error}"));
                         }
                     }
+                }
+            }
+            BackgroundResult::Providers(result) => {
+                self.provider_refresh_inflight = false;
+                match result {
+                    Ok(providers) => {
+                        self.providers = providers;
+                        self.provider_at =
+                            self.provider_at.min(self.providers.len().saturating_sub(1));
+                    }
+                    Err(error) => self.set_status(format!("provider discovery failed: {error}")),
                 }
             }
             BackgroundResult::Enrichment { generation, result } => {
@@ -948,26 +993,29 @@ impl App {
         let scope = self.scope.clone();
         let tx = tx.clone();
         thread::spawn(move || {
-            let result: Result<(String, LifecycleStatus)> = match confirmation {
-                Confirmation::Approve { run_id, gate_id } => {
-                    workflow::approve(&config, &scope, &run_id, Some(&gate_id), false)
-                        .and_then(|_| workflow::spawn(&scope, &run_id))
-                        .map(|run| (run.name, run.status))
+            let result: Result<(String, LifecycleStatus)> = (|| {
+                control::require_supervisor_control(&scope)?;
+                match confirmation {
+                    Confirmation::Approve { run_id, gate_id } => {
+                        workflow::approve(&config, &scope, &run_id, Some(&gate_id), false)
+                            .and_then(|_| workflow::spawn(&config, &scope, &run_id))
+                            .map(|run| (run.name, run.status))
+                    }
+                    Confirmation::Cancel { run_id } => {
+                        workflow::cancel(&config, &scope, &run_id).map(|run| (run.name, run.status))
+                    }
+                    Confirmation::Prune { session_id, .. } => {
+                        control::prune(&config, &scope, &session_id)
+                            .map(|session| (session.title, session.status))
+                    }
+                    Confirmation::DeleteNode {
+                        run_id,
+                        node_id,
+                        title,
+                    } => workflow::delete_run_node(&config, &scope, &run_id, &node_id)
+                        .map(|_| (title, LifecycleStatus::Archived)),
                 }
-                Confirmation::Cancel { run_id } => {
-                    workflow::cancel(&scope, &run_id).map(|run| (run.name, run.status))
-                }
-                Confirmation::Prune { session_id, .. } => {
-                    control::prune(&config, &scope, &session_id)
-                        .map(|session| (session.title, session.status))
-                }
-                Confirmation::DeleteNode {
-                    run_id,
-                    node_id,
-                    title,
-                } => workflow::delete_run_node(&config, &scope, &run_id, &node_id)
-                    .map(|_| (title, LifecycleStatus::Archived)),
-            };
+            })();
             let result = result
                 .map(|(name, status)| format!("{name} is {status}"))
                 .map_err(|error| format!("{error:#}"));
@@ -1134,7 +1182,7 @@ impl App {
             criteria: node.success_criteria.join(", "),
             harness: node.harness.clone(),
             model: node.model.clone().unwrap_or_default(),
-            execution: node.execution.clone().unwrap_or_else(|| "local".into()),
+            execution: node.execution.clone().unwrap_or_default(),
             judge: node.judge_policy.to_string(),
             dependencies,
         });
@@ -1171,6 +1219,7 @@ impl App {
         self.set_status("saving versioned workflow edit…");
         thread::spawn(move || {
             let result = (|| -> Result<String> {
+                control::require_supervisor_control(&scope)?;
                 let judge_policy = judge.map_err(anyhow::Error::msg)?;
                 workflow::edit_run_node(
                     &config,
@@ -1190,8 +1239,8 @@ impl App {
                                 .collect(),
                         ),
                         harness: Some(editor.harness),
-                        model: (!editor.model.is_empty()).then_some(editor.model),
-                        execution: Some(editor.execution),
+                        model: non_empty(editor.model),
+                        execution: non_empty(editor.execution),
                         judge_policy: Some(judge_policy),
                     },
                 )?;
@@ -1610,6 +1659,10 @@ impl App {
         self.output_tab = tabs[((current + by).rem_euclid(tabs.len() as i32)) as usize].0;
         self.inspector_scroll = 0;
     }
+}
+
+fn non_empty(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then_some(value)
 }
 
 fn inspector_tabs(item: Option<&ItemRef>) -> &'static [(OutputTab, &'static str)] {
@@ -2910,7 +2963,7 @@ fn selected_log(app: &App) -> String {
                     .map(|session_id| session_activity(app, session_id))
                     .unwrap_or_default();
                 if let Some(path) = &run.log_path
-                    && let Ok(log) = fs::read_to_string(path)
+                    && let Ok(log) = workflow::read_log_tail(Path::new(path))
                     && !log.trim().is_empty()
                 {
                     return if provider.is_empty() {
@@ -3002,7 +3055,7 @@ fn details(app: &App) -> String {
             .sessions
             .iter()
             .find(|session| session.id == id)
-            .map_or_else(String::new, session_details),
+            .map_or_else(String::new, |session| session_details(app, session)),
         Some(ItemRef::Run(id)) => app
             .state
             .runs
@@ -3052,12 +3105,43 @@ fn render_detail_template(name: &str, context: minijinja::Value) -> String {
         .into()
 }
 
-fn session_details(session: &Session) -> String {
+fn session_details(app: &App, session: &Session) -> String {
     let placement = session_placement(session);
     let activity = RuntimeActivity::for_session(session)
         .map(|runtime| runtime.label())
         .unwrap_or("inactive");
-    render_detail_template("session", context! { session, placement, activity })
+    let daemon_runtime = app
+        .supervisor
+        .as_ref()
+        .map_or(app.config.lifecycle.runtime_timeout_seconds, |status| {
+            status.runtime_timeout_seconds
+        });
+    let daemon_idle = app
+        .supervisor
+        .as_ref()
+        .map_or(app.config.lifecycle.idle_timeout_seconds, |status| {
+            status.idle_timeout_seconds
+        });
+    let runtime_lease = lease_label(session.runtime_timeout_seconds, daemon_runtime);
+    let idle_lease = lease_label(session.idle_timeout_seconds, daemon_idle);
+    let supervisor = if app.supervisor.is_some() {
+        "running"
+    } else {
+        "stopped · leases are not enforced"
+    };
+    render_detail_template(
+        "session",
+        context! { session, placement, activity, runtime_lease, idle_lease, supervisor },
+    )
+}
+
+fn lease_label(seconds: Option<u64>, default: u64) -> String {
+    match seconds {
+        Some(0) => "disabled".into(),
+        Some(seconds) => format!("{seconds}s"),
+        None if default == 0 => "disabled (default)".into(),
+        None => format!("{default}s (default)"),
+    }
 }
 
 fn run_details(run: &WorkflowRun) -> String {
@@ -3469,14 +3553,17 @@ fn truncate(value: &str, width: usize) -> String {
 
 fn status_glyph(status: LifecycleStatus) -> char {
     match status {
+        LifecycleStatus::Pending => '·',
         LifecycleStatus::Working => '●',
+        LifecycleStatus::Terminating => '◌',
         LifecycleStatus::Done => '✓',
         LifecycleStatus::Failed => '×',
         LifecycleStatus::Blocked => '!',
         LifecycleStatus::Waiting | LifecycleStatus::Queued => '○',
-        LifecycleStatus::Archived | LifecycleStatus::Disconnected | LifecycleStatus::Cancelled => {
-            '·'
-        }
+        LifecycleStatus::Skipped
+        | LifecycleStatus::Archived
+        | LifecycleStatus::Disconnected
+        | LifecycleStatus::Cancelled => '·',
     }
 }
 
@@ -3660,6 +3747,13 @@ mod tests {
             directory: "/tmp/orc-test".into(),
             registration: crate::domain::RegistrationSource::Managed,
             status: LifecycleStatus::Working,
+            runtime_timeout_seconds: None,
+            idle_timeout_seconds: None,
+            heartbeat_at: Some(Utc::now()),
+            termination_reason: None,
+            termination_cause: None,
+            termination_attempt_at: None,
+            termination_operation_id: None,
             connected_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -3668,9 +3762,9 @@ mod tests {
     fn app() -> App {
         let mut state = WorkspaceState::empty("/tmp/orc-test".into());
         state.sessions = vec![
-            session("root", None, "codex"),
-            session("native-child", Some("root"), "codex"),
-            session("harness-child", Some("root"), "claude"),
+            session("root", None, "agent-a"),
+            session("native-child", Some("root"), "agent-a"),
+            session("harness-child", Some("root"), "agent-b"),
         ];
         App::new(
             Config::default(),
@@ -3688,11 +3782,14 @@ mod tests {
             expected_output: "A verified migration".into(),
             status: LifecycleStatus::Queued,
             orchestrator_id: Some("root".into()),
+            parent_run_id: None,
             definition: None,
             revision: None,
             checkpoint: None,
             mode: crate::domain::RunMode::default(),
             process_id: None,
+            execution_nonce: None,
+            resume_requested: false,
             log_path: None,
             current_node: None,
             tokens: 0,
@@ -3714,9 +3811,9 @@ mod tests {
             name: format!("{id} stage"),
             purpose: format!("Perform {id}"),
             role: crate::domain::SessionRole::Implementer,
-            harness: "codex".into(),
+            harness: "agent-a".into(),
             model: None,
-            execution: Some("local".into()),
+            execution: Some("executor-a".into()),
             judge_policy: JudgePolicy::Llm,
             goal: format!("Complete {id}"),
             expected_output: format!("Verified {id}"),
@@ -3724,8 +3821,10 @@ mod tests {
             completion: CompletionTarget::Orchestrator,
             review_by: None,
             session_id: None,
+            child_run_id: None,
             status,
             attempt,
+            retry_after: None,
             prompt: None,
             input: None,
             output: None,
@@ -3778,24 +3877,46 @@ mod tests {
         assert!(
             app.tree[1]
                 .subtitle
-                .contains("researcher · external · codex")
+                .contains("researcher · external · agent-a")
         );
         assert!(
             app.tree[2]
                 .subtitle
-                .contains("researcher · external · claude")
+                .contains("researcher · external · agent-b")
         );
     }
 
     #[test]
     fn detail_templates_render_typed_domain_data() {
-        let app = app();
-        let rendered = session_details(&app.state.sessions[0]);
-        assert!(rendered.contains("orchestrator · external · codex"));
+        let mut app = app();
+        app.supervisor = None;
+        let rendered = session_details(&app, &app.state.sessions[0]);
+        assert!(rendered.contains("orchestrator · external · agent-a"));
         assert!(rendered.contains("activity      active"));
         assert!(!rendered.contains("integrations"));
         assert!(rendered.contains("expected output Verified result"));
         assert!(rendered.contains("success criteria\n  - It passes"));
+        assert!(rendered.contains("runtime lease 28800s (default)"));
+        assert!(rendered.contains("supervisor    stopped · leases are not enforced"));
+    }
+
+    #[test]
+    fn session_details_use_the_running_supervisors_default_leases() {
+        let mut app = app();
+        app.supervisor = Some(daemon::Status {
+            pid: 1,
+            token: "test".into(),
+            started_at: Utc::now(),
+            last_sweep_at: Some(Utc::now()),
+            runtime_timeout_seconds: 600,
+            idle_timeout_seconds: 60,
+        });
+
+        let rendered = session_details(&app, &app.state.sessions[0]);
+
+        assert!(rendered.contains("runtime lease 600s (default)"));
+        assert!(rendered.contains("idle lease    60s (default)"));
+        assert!(rendered.contains("supervisor    running"));
     }
 
     #[test]
@@ -3881,6 +4002,8 @@ mod tests {
     #[test]
     fn lifecycle_status_is_static_while_runtime_activity_can_animate() {
         assert_eq!(status_glyph(LifecycleStatus::Working), '●');
+        assert_eq!(status_glyph(LifecycleStatus::Pending), '·');
+        assert_eq!(status_glyph(LifecycleStatus::Skipped), '·');
         assert_eq!(
             RuntimeActivity::for_session(&app().state.sessions[0]),
             Some(RuntimeActivity::Active)
@@ -3892,7 +4015,7 @@ mod tests {
         let mut state = app().state;
         state.runs.push(workflow_run());
         let mut app = App::loading(Config::default(), PathBuf::from("/tmp/orc-test"));
-        app.apply_background(BackgroundResult::Refresh(Ok((state, Vec::new()))));
+        app.apply_background(BackgroundResult::Refresh(Ok((state, None, None))));
 
         assert_eq!(app.active_run.as_deref(), Some("run"));
         assert_eq!(app.tree[0].title, "root");
@@ -3916,7 +4039,7 @@ mod tests {
         app.active_run = Some("run".into());
         app.explorer_view = ExplorerView::Graph;
 
-        app.apply_background(BackgroundResult::Refresh(Ok((state, Vec::new()))));
+        app.apply_background(BackgroundResult::Refresh(Ok((state, None, None))));
 
         assert_eq!(app.active_run.as_deref(), Some("run"));
         assert!(
@@ -3936,7 +4059,7 @@ mod tests {
             .expect("child row");
         app.state
             .sessions
-            .insert(0, session("another-root", None, "codex"));
+            .insert(0, session("another-root", None, "agent-a"));
         app.rebuild(false);
         assert_eq!(app.tree[app.tree_at].id, "session:native-child");
 
@@ -4007,6 +4130,18 @@ mod tests {
         });
         assert!(app.status.contains("provider unavailable"));
         assert!(app.enrichment_due_at > Instant::now());
+    }
+
+    #[test]
+    fn state_refresh_is_not_blocked_by_provider_work() {
+        let mut app = app();
+        app.enrichment_inflight = true;
+        app.provider_refresh_inflight = true;
+        let (tx, _rx) = mpsc::channel();
+
+        app.request_refresh(&tx);
+
+        assert!(app.refresh_inflight);
     }
 
     #[test]
@@ -4128,7 +4263,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            inspector_tabs(Some(&ItemRef::Provider("local".into()))),
+            inspector_tabs(Some(&ItemRef::Provider("executor-a".into()))),
             &[
                 (OutputTab::Summary, "Details"),
                 (OutputTab::Result, "Health"),
@@ -4142,6 +4277,13 @@ mod tests {
         assert_eq!(app.output_tab, OutputTab::Summary);
         app.next_inspector(-1);
         assert_eq!(app.output_tab, OutputTab::Changes);
+    }
+
+    #[test]
+    fn empty_editor_values_preserve_provider_inheritance() {
+        assert_eq!(non_empty(String::new()), None);
+        assert_eq!(non_empty("   ".into()), None);
+        assert_eq!(non_empty("remote".into()).as_deref(), Some("remote"));
     }
 
     #[test]

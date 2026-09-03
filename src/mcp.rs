@@ -5,45 +5,247 @@ use serde_json::{Value, json};
 
 use crate::{
     config::Config,
-    control,
+    control, daemon,
     domain::{CompletionTarget, LifecycleStatus, RegistrationSource, RunMode, SessionRole},
     preferences::{self, AutonomyMode},
     state, workflow,
 };
 
-fn schema(properties: Value, required: &[&str]) -> Value {
-    json!({ "type": "object", "properties": properties, "required": required, "additionalProperties": false })
+struct ToolDefinition {
+    name: &'static str,
+    description: &'static str,
+    properties: fn() -> Value,
+    required: &'static [&'static str],
+}
+
+impl ToolDefinition {
+    fn json(&self) -> Value {
+        json!({
+            "name": self.name,
+            "description": self.description,
+            "inputSchema": {
+                "type": "object",
+                "properties": (self.properties)(),
+                "required": self.required,
+                "additionalProperties": false,
+            },
+        })
+    }
+}
+
+fn no_properties() -> Value {
+    json!({})
+}
+
+fn id_property() -> Value {
+    json!({ "id": { "type": "string" } })
+}
+
+fn lifecycle_properties() -> Value {
+    json!({
+        "id": { "type": "string" },
+        "status": { "type": "string" },
+    })
+}
+
+fn session_registration_properties() -> Value {
+    json!({
+        "harness": { "type": "string" },
+        "model": { "type": "string" },
+        "role": { "type": "string" },
+        "title": { "type": "string" },
+        "purpose": { "type": "string" },
+        "goal": { "type": "string" },
+        "expectedOutput": { "type": "string" },
+        "successCriteria": { "type": "array", "items": { "type": "string" } },
+        "nativeId": { "type": "string" },
+        "parentId": { "type": "string" },
+        "runId": { "type": "string" },
+        "nodeId": { "type": "string" },
+        "runtimeTimeoutSeconds": { "type": "integer", "minimum": 0 },
+        "idleTimeoutSeconds": { "type": "integer", "minimum": 0 },
+    })
+}
+
+fn run_creation_properties() -> Value {
+    json!({
+        "name": { "type": "string" },
+        "goal": { "type": "string" },
+        "expectedOutput": { "type": "string" },
+        "harness": { "type": "string" },
+        "model": { "type": "string" },
+    })
+}
+
+fn run_approval_properties() -> Value {
+    json!({
+        "id": { "type": "string" },
+        "gateId": { "type": "string" },
+        "resume": { "type": "boolean" },
+    })
+}
+
+fn workflow_proposal_properties() -> Value {
+    json!({ "definition": { "type": "object" } })
+}
+
+fn workflow_start_properties() -> Value {
+    json!({
+        "name": { "type": "string" },
+        "background": { "type": "boolean" },
+    })
+}
+
+fn node_identity_properties() -> Value {
+    json!({
+        "runId": { "type": "string" },
+        "id": { "type": "string" },
+        "status": { "type": "string" },
+    })
+}
+
+fn node_upsert_properties() -> Value {
+    json!({
+        "runId": { "type": "string" },
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "purpose": { "type": "string" },
+        "role": { "type": "string" },
+        "harness": { "type": "string" },
+        "model": { "type": "string" },
+        "goal": { "type": "string" },
+        "expectedOutput": { "type": "string" },
+        "successCriteria": { "type": "array", "items": { "type": "string" } },
+        "completion": { "type": "string" },
+        "reviewBy": { "type": "string" },
+        "sessionId": { "type": "string" },
+        "status": { "type": "string" },
+        "attempt": { "type": "integer" },
+        "dependsOn": { "type": "array", "items": { "type": "string" } },
+        "execution": { "type": "string" },
+        "judgePolicy": { "type": "string", "enum": ["llm", "human", "llm+human"] },
+    })
+}
+
+fn node_report_properties() -> Value {
+    json!({
+        "runId": { "type": "string" },
+        "id": { "type": "string" },
+        "status": { "type": "string" },
+        "output": {},
+        "message": { "type": "string" },
+        "tokens": { "type": "integer" },
+        "costUsd": { "type": "number" },
+    })
 }
 
 fn tools() -> Value {
-    json!([
-        { "name": "orc_current_session", "description": "Return this harness process' Orc session.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "orc_session_list", "description": "List sessions in the active Orc scope.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "orc_session_register", "description": "Register an agent session and its contract.", "inputSchema": schema(json!({
-            "harness": {"type":"string"}, "model": {"type":"string"}, "role": {"type":"string"}, "title": {"type":"string"},
-            "purpose": {"type":"string"}, "goal": {"type":"string"}, "expectedOutput": {"type":"string"},
-            "successCriteria": {"type":"array", "items":{"type":"string"}}, "parentId": {"type":"string"}, "runId": {"type":"string"}, "nodeId": {"type":"string"}
-        }), &["harness", "role", "goal"]) },
-        { "name": "orc_session_update", "description": "Update a session lifecycle status.", "inputSchema": schema(json!({"id":{"type":"string"},"status":{"type":"string"}}), &["id","status"]) },
-        { "name": "orc_session_prune", "description": "Stop an active agent through an advertised provider, then archive it.", "inputSchema": schema(json!({"id":{"type":"string"}}), &["id"]) },
-        { "name": "orc_run_create", "description": "Create a workflow run owned by the orchestrator.", "inputSchema": schema(json!({"name":{"type":"string"},"goal":{"type":"string"},"expectedOutput":{"type":"string"},"harness":{"type":"string"},"model":{"type":"string"}}), &["name","goal","expectedOutput"]) },
-        { "name": "orc_run_list", "description": "List workflow runs by recency.", "inputSchema": schema(json!({}), &[]) },
-        { "name": "orc_run_get", "description": "Return one workflow run and graph.", "inputSchema": schema(json!({"id":{"type":"string"}}), &["id"]) },
-        { "name": "orc_run_update", "description": "Update a workflow run lifecycle status.", "inputSchema": schema(json!({"id":{"type":"string"},"status":{"type":"string"}}), &["id","status"]) },
-        { "name": "orc_run_approve", "description": "Approve one pending human gate and optionally resume the run.", "inputSchema": schema(json!({"id":{"type":"string"},"gateId":{"type":"string"},"resume":{"type":"boolean"}}), &["id"]) },
-        { "name": "orc_run_cancel", "description": "Cancel a workflow run and its local executor.", "inputSchema": schema(json!({"id":{"type":"string"}}), &["id"]) },
-        { "name": "orc_workflow_propose", "description": "Validate and version a proposed deterministic workflow without executing it.", "inputSchema": schema(json!({"definition":{"type":"object"}}), &["definition"]) },
-        { "name": "orc_workflow_start", "description": "Materialize a versioned workflow proposal and start it when workspace autonomy permits.", "inputSchema": schema(json!({"name":{"type":"string"},"background":{"type":"boolean"}}), &["name"]) },
-        { "name": "orc_node_upsert", "description": "Create or replace a workflow node and dependencies.", "inputSchema": schema(json!({
-            "runId":{"type":"string"},"id":{"type":"string"},"name":{"type":"string"},"purpose":{"type":"string"},"role":{"type":"string"},
-            "harness":{"type":"string"},"model":{"type":"string"},"goal":{"type":"string"},"expectedOutput":{"type":"string"},
-            "successCriteria":{"type":"array","items":{"type":"string"}},"completion":{"type":"string"},"reviewBy":{"type":"string"},
-            "sessionId":{"type":"string"},"status":{"type":"string"},"attempt":{"type":"integer"},"dependsOn":{"type":"array","items":{"type":"string"}},
-            "execution":{"type":"string"},"judgePolicy":{"type":"string","enum":["llm","human","llm+human"]}
-        }), &["runId","id","name","role","goal","expectedOutput"]) },
-        { "name": "orc_node_update", "description": "Update a workflow node lifecycle status.", "inputSchema": schema(json!({"runId":{"type":"string"},"id":{"type":"string"},"status":{"type":"string"}}), &["runId","id","status"]) }
-        ,{ "name": "orc_node_report", "description": "Report a node result, activity message, token count, and cost.", "inputSchema": schema(json!({"runId":{"type":"string"},"id":{"type":"string"},"status":{"type":"string"},"output":{},"message":{"type":"string"},"tokens":{"type":"integer"},"costUsd":{"type":"number"}}), &["runId","id","status"]) }
-    ])
+    const TOOLS: &[ToolDefinition] = &[
+        ToolDefinition {
+            name: "orc_current_session",
+            description: "Return this harness process' Orc session.",
+            properties: no_properties,
+            required: &[],
+        },
+        ToolDefinition {
+            name: "orc_session_list",
+            description: "List sessions in the active Orc scope.",
+            properties: no_properties,
+            required: &[],
+        },
+        ToolDefinition {
+            name: "orc_session_register",
+            description: "Register an agent session and its contract.",
+            properties: session_registration_properties,
+            required: &["harness", "role", "goal"],
+        },
+        ToolDefinition {
+            name: "orc_session_update",
+            description: "Update a session lifecycle status.",
+            properties: lifecycle_properties,
+            required: &["id", "status"],
+        },
+        ToolDefinition {
+            name: "orc_session_keepalive",
+            description: "Renew a managed session's idle lease after verifying that useful work continues.",
+            properties: id_property,
+            required: &["id"],
+        },
+        ToolDefinition {
+            name: "orc_session_prune",
+            description: "Stop an active agent through an advertised provider, then archive it.",
+            properties: id_property,
+            required: &["id"],
+        },
+        ToolDefinition {
+            name: "orc_run_create",
+            description: "Create a workflow run owned by the orchestrator.",
+            properties: run_creation_properties,
+            required: &["name", "goal", "expectedOutput"],
+        },
+        ToolDefinition {
+            name: "orc_run_list",
+            description: "List workflow runs by recency.",
+            properties: no_properties,
+            required: &[],
+        },
+        ToolDefinition {
+            name: "orc_run_get",
+            description: "Return one workflow run and graph.",
+            properties: id_property,
+            required: &["id"],
+        },
+        ToolDefinition {
+            name: "orc_run_update",
+            description: "Update a workflow run lifecycle status.",
+            properties: lifecycle_properties,
+            required: &["id", "status"],
+        },
+        ToolDefinition {
+            name: "orc_run_approve",
+            description: "Approve one pending human gate and optionally resume the run.",
+            properties: run_approval_properties,
+            required: &["id"],
+        },
+        ToolDefinition {
+            name: "orc_run_cancel",
+            description: "Cancel a workflow run and its local executor.",
+            properties: id_property,
+            required: &["id"],
+        },
+        ToolDefinition {
+            name: "orc_workflow_propose",
+            description: "Validate and version a proposed deterministic workflow without executing it.",
+            properties: workflow_proposal_properties,
+            required: &["definition"],
+        },
+        ToolDefinition {
+            name: "orc_workflow_start",
+            description: "Materialize a versioned workflow proposal and start it when workspace autonomy permits.",
+            properties: workflow_start_properties,
+            required: &["name"],
+        },
+        ToolDefinition {
+            name: "orc_node_upsert",
+            description: "Create or replace a workflow node and dependencies.",
+            properties: node_upsert_properties,
+            required: &["runId", "id", "name", "role", "goal", "expectedOutput"],
+        },
+        ToolDefinition {
+            name: "orc_node_update",
+            description: "Update a workflow node lifecycle status.",
+            properties: node_identity_properties,
+            required: &["runId", "id", "status"],
+        },
+        ToolDefinition {
+            name: "orc_node_report",
+            description: "Report a node result, activity message, token count, and cost.",
+            properties: node_report_properties,
+            required: &["runId", "id", "status"],
+        },
+    ];
+
+    Value::Array(TOOLS.iter().map(ToolDefinition::json).collect())
 }
 
 fn text_result(value: Value) -> Value {
@@ -75,10 +277,17 @@ fn strings(value: &Value, name: &str) -> Vec<String> {
         .collect()
 }
 
+fn optional_u64(value: &Value, name: &str) -> Option<u64> {
+    value.get(name).and_then(Value::as_u64)
+}
+
 fn call(name: &str, input: &Value, config: &Config) -> Result<Value> {
     let scope = std::env::var("ORC_SCOPE").context("ORC_SCOPE is required for Orc MCP tools")?;
     let scope = state::resolve_scope(scope)?;
     let (workspace, current) = control::ensure_active_context(&scope)?;
+    if orchestrator_only(name) && current.role != SessionRole::Orchestrator {
+        bail!("only the orchestrator can call {name}");
+    }
     let value = match name {
         "orc_current_session" => serde_json::to_value(current)?,
         "orc_session_list" => serde_json::to_value(workspace.sessions)?,
@@ -94,7 +303,10 @@ fn call(name: &str, input: &Value, config: &Config) -> Result<Value> {
             let role = string(input, "role")
                 .parse::<SessionRole>()
                 .map_err(anyhow::Error::msg)?;
-            serde_json::to_value(control::register(
+            if role == SessionRole::Orchestrator {
+                bail!("managed child sessions cannot have the orchestrator role");
+            }
+            let session = control::register(
                 &scope,
                 control::Contract {
                     harness: string(input, "harness"),
@@ -110,21 +322,37 @@ fn call(name: &str, input: &Value, config: &Config) -> Result<Value> {
                     review_by: optional(input, "reviewBy"),
                 },
                 control::SessionLink {
+                    native_id: Some(
+                        optional(input, "nativeId")
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    ),
                     parent_id: optional(input, "parentId"),
                     run_id: optional(input, "runId"),
                     node_id: optional(input, "nodeId"),
+                    runtime_timeout_seconds: optional_u64(input, "runtimeTimeoutSeconds"),
+                    idle_timeout_seconds: optional_u64(input, "idleTimeoutSeconds"),
                     source: RegistrationSource::Managed,
                     ..control::SessionLink::default()
                 },
+            )?;
+            daemon::ensure_running(config)?;
+            serde_json::to_value(session)?
+        }
+        "orc_session_update" => {
+            let id = string(input, "id");
+            serde_json::to_value(control::update_session(
+                &scope,
+                &id,
+                string(input, "status")
+                    .parse::<LifecycleStatus>()
+                    .map_err(anyhow::Error::msg)?,
             )?)?
         }
-        "orc_session_update" => serde_json::to_value(control::update_session(
-            &scope,
-            &string(input, "id"),
-            string(input, "status")
-                .parse::<LifecycleStatus>()
-                .map_err(anyhow::Error::msg)?,
-        )?)?,
+        "orc_session_keepalive" => {
+            let session = control::keepalive(&scope, &string(input, "id"))?;
+            daemon::ensure_running(config)?;
+            serde_json::to_value(session)?
+        }
         "orc_session_prune" => {
             serde_json::to_value(control::prune(config, &scope, &string(input, "id"))?)?
         }
@@ -151,7 +379,9 @@ fn call(name: &str, input: &Value, config: &Config) -> Result<Value> {
             optional(input, "gateId").as_deref(),
             input.get("resume").and_then(Value::as_bool).unwrap_or(true),
         )?)?,
-        "orc_run_cancel" => serde_json::to_value(workflow::cancel(&scope, &string(input, "id"))?)?,
+        "orc_run_cancel" => {
+            serde_json::to_value(workflow::cancel(config, &scope, &string(input, "id"))?)?
+        }
         "orc_workflow_propose" => {
             let definition: workflow::Definition = serde_json::from_value(
                 input
@@ -185,7 +415,7 @@ fn call(name: &str, input: &Value, config: &Config) -> Result<Value> {
             serde_json::to_value(if autonomy != AutonomyMode::Autonomous {
                 run
             } else if background {
-                workflow::spawn(&scope, &run.id)?
+                workflow::spawn(config, &scope, &run.id)?
             } else {
                 workflow::execute(config, &scope, &run.id)?
             })?
@@ -234,23 +464,46 @@ fn call(name: &str, input: &Value, config: &Config) -> Result<Value> {
                 .parse::<LifecycleStatus>()
                 .map_err(anyhow::Error::msg)?,
         )?)?,
-        "orc_node_report" => serde_json::to_value(control::report_node(
-            &scope,
-            &string(input, "runId"),
-            &string(input, "id"),
-            control::NodeReport {
-                status: string(input, "status")
-                    .parse::<LifecycleStatus>()
-                    .map_err(anyhow::Error::msg)?,
-                output: input.get("output").cloned(),
-                message: optional(input, "message"),
-                tokens: input.get("tokens").and_then(Value::as_u64),
-                cost_usd: input.get("costUsd").and_then(Value::as_f64),
-            },
-        )?)?,
+        "orc_node_report" => {
+            let run_id = string(input, "runId");
+            let node_id = string(input, "id");
+            serde_json::to_value(control::report_node(
+                &scope,
+                &run_id,
+                &node_id,
+                (current.role != SessionRole::Orchestrator).then_some(current.id.as_str()),
+                control::NodeReport {
+                    status: string(input, "status")
+                        .parse::<LifecycleStatus>()
+                        .map_err(anyhow::Error::msg)?,
+                    output: input.get("output").cloned(),
+                    message: optional(input, "message"),
+                    tokens: input.get("tokens").and_then(Value::as_u64),
+                    cost_usd: input.get("costUsd").and_then(Value::as_f64),
+                },
+            )?)?
+        }
         _ => bail!("unknown tool: {name}"),
     };
     Ok(text_result(value))
+}
+
+fn orchestrator_only(name: &str) -> bool {
+    matches!(
+        name,
+        "orc_session_register"
+            | "orc_session_update"
+            | "orc_session_keepalive"
+            | "orc_session_prune"
+            | "orc_run_create"
+            | "orc_run_update"
+            | "orc_run_approve"
+            | "orc_run_cancel"
+            | "orc_workflow_propose"
+            | "orc_workflow_start"
+            | "orc_node_upsert"
+            | "orc_node_update"
+    )
 }
 
 pub fn run(config: Config) -> Result<()> {
@@ -298,4 +551,26 @@ pub fn run(config: Config) -> Result<()> {
         stdout.flush()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    #[test]
+    fn tool_catalog_has_unique_named_definitions() {
+        let catalog = tools().as_array().expect("tool catalog").clone();
+        let names = catalog
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(catalog.len(), names.len());
+        assert_eq!(names.len(), 17);
+        assert!(catalog.iter().all(|tool| {
+            tool.pointer("/inputSchema/additionalProperties") == Some(&Value::Bool(false))
+        }));
+    }
 }

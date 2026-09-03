@@ -3,19 +3,42 @@
   installShellFiles,
   lib,
   makeWrapper,
+  procps,
   rustPlatform,
+  stdenv,
+  unixtools,
 }:
 rustPlatform.buildRustPackage {
   pname = "orc";
-  version = "0.9.4";
-  src = ./.;
+  version = "0.10.0";
+  src = lib.fileset.toSource {
+    root = ./.;
+    fileset = lib.fileset.unions [
+      ./Cargo.lock
+      ./Cargo.toml
+      ./src
+      ./templates
+      ./tests
+    ];
+  };
 
-  cargoLock.lockFile = ./Cargo.lock;
+  cargoLock = {
+    lockFile = ./Cargo.lock;
+    outputHashes = {
+      "rs-utils-0.1.0" = "sha256-Pqei1qMrnAmjWcxX75UpqeUqRTERBb+RkxW0cWFi/8Q=";
+    };
+  };
 
   nativeBuildInputs = [
     installShellFiles
     makeWrapper
   ];
+
+  nativeCheckInputs = [
+    git
+  ]
+  ++ lib.optionals stdenv.hostPlatform.isDarwin [ unixtools.ps ]
+  ++ lib.optionals stdenv.hostPlatform.isLinux [ procps ];
 
   postInstall = ''
     installShellCompletion --cmd orc \

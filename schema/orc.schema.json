@@ -11,10 +11,54 @@
       },
       "type": "object"
     },
+    "DaemonConfig": {
+      "properties": {
+        "autostart": {
+          "default": true,
+          "type": "boolean"
+        },
+        "idleShutdownSeconds": {
+          "default": 60,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "scanIntervalMs": {
+          "default": 5000,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "terminationRetrySeconds": {
+          "default": 60,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "LifecycleConfig": {
+      "properties": {
+        "idleTimeoutSeconds": {
+          "default": 1800,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "runtimeTimeoutSeconds": {
+          "default": 28800,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "ProviderConfig": {
       "properties": {
         "directory": {
-          "default": "/Users/roshan/.config/orc/providers",
+          "default": "~/.config/orc/providers",
           "type": "string"
         },
         "timeoutMs": {
@@ -63,7 +107,7 @@
           "type": "integer"
         },
         "repository": {
-          "default": "/Users/roshan/.local/share/orc/workflows",
+          "default": "~/.local/share/orc/workflows",
           "type": "string"
         }
       },
@@ -78,10 +122,26 @@
         "providerTtlMs": 30000
       }
     },
+    "daemon": {
+      "$ref": "#/$defs/DaemonConfig",
+      "default": {
+        "autostart": true,
+        "idleShutdownSeconds": 60,
+        "scanIntervalMs": 5000,
+        "terminationRetrySeconds": 60
+      }
+    },
+    "lifecycle": {
+      "$ref": "#/$defs/LifecycleConfig",
+      "default": {
+        "idleTimeoutSeconds": 1800,
+        "runtimeTimeoutSeconds": 28800
+      }
+    },
     "providers": {
       "$ref": "#/$defs/ProviderConfig",
       "default": {
-        "directory": "/Users/roshan/.config/orc/providers",
+        "directory": "~/.config/orc/providers",
         "timeoutMs": 15000
       }
     },
@@ -98,7 +158,7 @@
       "default": {
         "autoCommit": true,
         "maxDepth": 10,
-        "repository": "/Users/roshan/.local/share/orc/workflows"
+        "repository": "~/.local/share/orc/workflows"
       }
     }
   },

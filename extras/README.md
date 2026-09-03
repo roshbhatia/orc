@@ -11,12 +11,15 @@ contains optional adapters for common local tools.
 - `orc-provider-traces` adds session descriptions and activity.
 - `orc-provider-changes` adds repository changes.
 
-Each adapter discovers its external command through `PATH`. A missing command
-returns a provider decline instead of breaking Orc. Consumers install only the
-adapters they use and write YAML or JSON manifests under
-`~/.config/orc/providers/`. Use `orc provider validate` to test every adapter
-without opening the dashboard or launching a harness.
+Each provider directory owns three files: `default.nix`, `provider.yaml`, and
+`provider.sh`. The Nix file declares only that provider's runtime packages. The
+manifest declares its protocol capabilities and required commands. The script
+implements those capabilities. Shared protocol response helpers live under
+`lib/`; they do not select providers or external products.
 
-Each provider directory contains its ready-to-install `provider.yaml`. The
-combined extras package preserves that layout under `share/orc/providers` so a
-system manager can link selected providers into the user configuration.
+Each provider package contains its ready-to-install manifest under
+`share/orc/providers` and exposes any fixed command dependency. A missing
+dynamic harness command returns a provider decline instead of breaking Orc.
+Consumers can install one `provider-*` output, the `extras` bundle with every
+provider, or `full` with core and every provider. Use `orc provider validate`
+to test adapters without opening the dashboard or launching a harness.

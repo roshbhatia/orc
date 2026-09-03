@@ -1,6 +1,6 @@
 [package]
 name = "orc"
-version = "0.9.4"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Local control plane for agent harnesses"
@@ -12,13 +12,13 @@ anyhow = "1"
 ansi-to-tui = "8.0.1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
-clap_complete = "4.5"
-clap_complete_nushell = "4.5"
 crossterm = "0.29"
 hex = "0.4"
+libc = "0.2"
 minijinja = "2.21"
 rataflow = { version = "0.1.0", default-features = false, features = ["crossterm", "sugiyama"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+rs-utils = { git = "https://github.com/roshbhatia/rs-utils", rev = "5418d8fbd3b4477095fe82a9db7e80b8377b5857" }
 schemars = { version = "1", features = ["chrono04"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
