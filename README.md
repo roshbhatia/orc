@@ -39,10 +39,10 @@ agents, and their workflow runs in one ownership hierarchy. Press `Tab` to
 switch between the tree and the selected run's workflow graph. Press `p` to
 inspect integrations, then `Esc` to return to work.
 
-The graph keeps the orchestrator in a fixed rail above its left-to-right stage
-ranks. Dependency and review arrows stay inside the stage graph. Press `g` on a
-run to open its graph. Press `Enter` on any run, stage, or agent to focus its
-active display or launch a display for a dormant session.
+The graph places the orchestrator above its stage ranks. Delegation, dependency,
+review, and report arrows show the planned contracts and their live state.
+Press `g` on a run to open its graph. Press `Enter` on any run, stage, or agent
+to focus its active display or launch a display for a dormant session.
 
 Use `hjkl` inside the focused pane. Use `Ctrl-h/j/k/l` to move between work and
 the inspector. `Tab` and `Shift-Tab` cycle the selected run, stage, agent, or

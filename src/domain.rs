@@ -364,9 +364,16 @@ impl WorkspaceState {
 
     pub fn current_session(&self) -> Option<&Session> {
         let requested = std::env::var("ORC_SESSION_ID").ok();
+        self.current_session_for(requested.as_deref())
+    }
+
+    fn current_session_for(&self, requested: Option<&str>) -> Option<&Session> {
         requested
-            .as_deref()
-            .and_then(|id| self.sessions.iter().find(|session| session.id == id))
+            .and_then(|id| {
+                self.sessions
+                    .iter()
+                    .find(|session| session.id == id && session.status.active())
+            })
             .or_else(|| {
                 self.active_sessions()
                     .filter(|session| session.role == SessionRole::Orchestrator)
@@ -377,5 +384,65 @@ impl WorkspaceState {
                     .filter(|session| session.parent_id.is_none())
                     .max_by_key(|session| session.updated_at)
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(id: &str, role: SessionRole, status: LifecycleStatus, updated: i64) -> Session {
+        let at = DateTime::from_timestamp(updated, 0).expect("valid timestamp");
+        Session {
+            id: id.into(),
+            native_id: id.into(),
+            trace_id: None,
+            harness: "test".into(),
+            model: None,
+            role,
+            title: id.into(),
+            purpose: "test".into(),
+            goal: "test".into(),
+            expected_output: "test".into(),
+            success_criteria: Vec::new(),
+            completion: CompletionTarget::Orchestrator,
+            review_by: None,
+            parent_id: None,
+            run_id: None,
+            node_id: None,
+            provider_ref: None,
+            providers: Vec::new(),
+            directory: "/tmp".into(),
+            registration: RegistrationSource::Connected,
+            status,
+            connected_at: at,
+            updated_at: at,
+        }
+    }
+
+    #[test]
+    fn archived_environment_session_does_not_override_active_orchestrator() {
+        let mut workspace = WorkspaceState::empty("/tmp".into());
+        workspace.sessions = vec![
+            session(
+                "archived",
+                SessionRole::Orchestrator,
+                LifecycleStatus::Archived,
+                2,
+            ),
+            session(
+                "active",
+                SessionRole::Orchestrator,
+                LifecycleStatus::Working,
+                1,
+            ),
+        ];
+
+        assert_eq!(
+            workspace
+                .current_session_for(Some("archived"))
+                .map(|session| session.id.as_str()),
+            Some("active")
+        );
     }
 }

@@ -1,11 +1,15 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::Duration,
 };
+
+#[cfg(unix)]
+use std::os::{fd::AsRawFd, unix::process::CommandExt};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -1044,6 +1048,212 @@ struct StepOutcome {
     summary: String,
 }
 
+const EXECUTION_LEASE_ENV: &str = "ORC_EXECUTION_LEASE";
+
+struct ExecutionLease {
+    path: PathBuf,
+    nonce: String,
+    armed: bool,
+}
+
+struct ExecutionLeaseGuard {
+    #[cfg(unix)]
+    file: fs::File,
+}
+
+impl ExecutionLeaseGuard {
+    fn try_acquire(path: &Path) -> Result<Option<Self>> {
+        #[cfg(unix)]
+        {
+            let guard_path = path.with_file_name(format!(
+                ".{}.guard",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(guard_path)
+                .context("open execution lease guard")?;
+            unsafe extern "C" {
+                fn flock(fd: i32, operation: i32) -> i32;
+            }
+            const LOCK_EX: i32 = 2;
+            const LOCK_NB: i32 = 4;
+            if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+                return Ok(Some(Self { file }));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            Err(error).context("acquire execution lease guard")
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Ok(Some(Self {}))
+        }
+    }
+}
+
+impl Drop for ExecutionLeaseGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn flock(fd: i32, operation: i32) -> i32;
+            }
+            const LOCK_UN: i32 = 8;
+            let _ = unsafe { flock(self.file.as_raw_fd(), LOCK_UN) };
+        }
+    }
+}
+
+impl ExecutionLease {
+    fn acquire(scope: &Path, run_id: &str) -> Result<Option<Self>> {
+        Self::acquire_at(&execution_lease_path(scope, run_id))
+    }
+
+    fn acquire_at(path: &Path) -> Result<Option<Self>> {
+        let directory = path.parent().context("execution lease has no directory")?;
+        fs::create_dir_all(directory).context("create execution lease directory")?;
+        let inherited = std::env::var(EXECUTION_LEASE_ENV).ok();
+
+        for _ in 0..3 {
+            let Some(_guard) = ExecutionLeaseGuard::try_acquire(path)? else {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            };
+            if let Some(record) = read_execution_lease(path)? {
+                if inherited.as_deref() == Some(record.nonce.as_str()) {
+                    let lease = Self {
+                        path: path.to_owned(),
+                        nonce: record.nonce,
+                        armed: true,
+                    };
+                    lease.write_owner(std::process::id())?;
+                    return Ok(Some(lease));
+                }
+                if process_is_live(record.process_id) {
+                    return Ok(None);
+                }
+                remove_execution_lease(path, &record.nonce)?;
+                continue;
+            }
+
+            let lease = Self {
+                path: path.to_owned(),
+                nonce: Uuid::new_v4().to_string(),
+                armed: true,
+            };
+            if lease.install(std::process::id())? {
+                return Ok(Some(lease));
+            }
+        }
+        Ok(None)
+    }
+
+    fn install(&self, process_id: u32) -> Result<bool> {
+        let temporary = self
+            .path
+            .with_file_name(format!(".{}.lease", Uuid::new_v4()));
+        let result = (|| {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)
+                .context("create execution lease candidate")?;
+            writeln!(file, "{process_id} {}", self.nonce).context("write execution lease")?;
+            file.sync_all().context("flush execution lease")?;
+            match fs::hard_link(&temporary, &self.path) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+                Err(error) => Err(error).context("install execution lease"),
+            }
+        })();
+        let _ = fs::remove_file(temporary);
+        result
+    }
+
+    fn write_owner(&self, process_id: u32) -> Result<()> {
+        let current = read_execution_lease(&self.path)?
+            .context("execution lease disappeared during ownership transfer")?;
+        if current.nonce != self.nonce {
+            bail!("execution lease changed during ownership transfer");
+        }
+        let temporary = self
+            .path
+            .with_file_name(format!(".{}.lease", Uuid::new_v4()));
+        fs::write(&temporary, format!("{process_id} {}\n", self.nonce))
+            .context("write transferred execution lease")?;
+        fs::rename(&temporary, &self.path).context("transfer execution lease ownership")
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ExecutionLease {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = remove_execution_lease(&self.path, &self.nonce);
+        }
+    }
+}
+
+struct ExecutionLeaseRecord {
+    process_id: u32,
+    nonce: String,
+}
+
+fn execution_lease_path(scope: &Path, run_id: &str) -> PathBuf {
+    crate::config::state_home()
+        .join("orc/leases")
+        .join(state::scope_key(scope))
+        .join(format!("{}.lease", state::scope_key(Path::new(run_id))))
+}
+
+fn read_execution_lease(path: &Path) -> Result<Option<ExecutionLeaseRecord>> {
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("read execution lease"),
+    };
+    let mut fields = source.split_whitespace();
+    let process_id = fields.next().and_then(|value| value.parse().ok());
+    let nonce = fields.next().map(str::to_owned);
+    match (process_id, nonce, fields.next()) {
+        (Some(process_id), Some(nonce), None) => {
+            Ok(Some(ExecutionLeaseRecord { process_id, nonce }))
+        }
+        _ => bail!("invalid execution lease: {}", path.display()),
+    }
+}
+
+fn remove_execution_lease(path: &Path, nonce: &str) -> Result<()> {
+    let Some(current) = read_execution_lease(path)? else {
+        return Ok(());
+    };
+    if current.nonce != nonce {
+        return Ok(());
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("remove execution lease"),
+    }
+}
+
+fn process_is_live(process_id: u32) -> bool {
+    if process_id == std::process::id() {
+        return true;
+    }
+    signal_process(process_id, 0).is_ok()
+}
+
 fn execute_step(
     config: &Config,
     providers: &[provider::Manifest],
@@ -1229,6 +1439,19 @@ fn execute_step(
 
 pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRun> {
     let scope = state::resolve_scope(scope)?;
+    let initial = find_run(&scope, run_id)?;
+    if !initial.status.active() {
+        return Ok(initial);
+    }
+    if initial
+        .process_id
+        .is_some_and(|process_id| process_id != std::process::id() && process_is_live(process_id))
+    {
+        return Ok(initial);
+    }
+    let Some(_lease) = ExecutionLease::acquire(&scope, run_id)? else {
+        return find_run(&scope, run_id);
+    };
     let autonomy = preferences::read(&scope)?.autonomy;
     state::update(&scope, |workspace| {
         let run = workspace
@@ -1236,6 +1459,9 @@ pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRu
             .iter_mut()
             .find(|run| run.id == run_id)
             .with_context(|| format!("unknown run: {run_id}"))?;
+        if !run.status.active() {
+            return Ok(());
+        }
         run.process_id = Some(std::process::id());
         run.status = LifecycleStatus::Working;
         run.updated_at = Utc::now();
@@ -1250,6 +1476,9 @@ pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRu
             .find(|run| run.id == run_id)
             .cloned()
             .with_context(|| format!("unknown run: {run_id}"))?;
+        if !run.status.active() {
+            return Ok(run);
+        }
         let definition_path = PathBuf::from(
             run.definition
                 .as_deref()
@@ -1335,6 +1564,9 @@ pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRu
                 .iter_mut()
                 .find(|run| run.id == run_id)
                 .context("run disappeared")?;
+            if !run.status.active() {
+                return Ok(());
+            }
             run.status = LifecycleStatus::Working;
             run.current_node = names.first().cloned();
             for node in run.nodes.iter_mut().filter(|node| names.contains(&node.id)) {
@@ -1381,6 +1613,9 @@ pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRu
                 .iter_mut()
                 .find(|run| run.id == run_id)
                 .context("run disappeared")?;
+            if !run.status.active() {
+                return Ok(());
+            }
             for (name, result) in &results {
                 let step = definition
                     .steps
@@ -1426,6 +1661,14 @@ pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRu
             Ok(())
         })?;
     }
+}
+
+fn find_run(scope: &Path, run_id: &str) -> Result<WorkflowRun> {
+    state::read(scope)?
+        .runs
+        .into_iter()
+        .find(|run| run.id == run_id)
+        .with_context(|| format!("unknown run: {run_id}"))
 }
 
 fn finish_run(scope: &Path, run_id: &str, status: LifecycleStatus) -> Result<WorkflowRun> {
@@ -1485,23 +1728,95 @@ pub fn approve(
 
 pub fn cancel(scope: &Path, run_id: &str) -> Result<WorkflowRun> {
     let scope = state::resolve_scope(scope)?;
-    let snapshot = state::read(&scope)?;
-    let process_id = snapshot
-        .runs
-        .iter()
-        .find(|run| run.id == run_id)
-        .with_context(|| format!("unknown run: {run_id}"))?
-        .process_id;
+    let process_id = find_run(&scope, run_id)?.process_id;
     if let Some(process_id) = process_id.filter(|id| *id != std::process::id()) {
-        let status = Command::new("kill")
-            .args(["-TERM", &process_id.to_string()])
-            .status()
-            .context("stop workflow executor")?;
-        if !status.success() {
-            bail!("could not stop workflow executor {process_id}");
-        }
+        terminate_executor(process_id)?;
     }
-    finish_run(&scope, run_id, LifecycleStatus::Cancelled)
+    state::update(&scope, |workspace| {
+        for session in workspace
+            .sessions
+            .iter_mut()
+            .filter(|session| session.run_id.as_deref() == Some(run_id) && session.status.active())
+        {
+            session.status = LifecycleStatus::Cancelled;
+            session.updated_at = Utc::now();
+        }
+        let run = workspace
+            .runs
+            .iter_mut()
+            .find(|run| run.id == run_id)
+            .with_context(|| format!("unknown run: {run_id}"))?;
+        for node in run.nodes.iter_mut().filter(|node| node.status.active()) {
+            node.status = LifecycleStatus::Cancelled;
+            node.updated_at = Utc::now();
+            node.activity.push(ActivityEvent {
+                at: Utc::now(),
+                kind: "cancelled".into(),
+                message: "run cancelled".into(),
+            });
+        }
+        run.status = LifecycleStatus::Cancelled;
+        run.current_node = None;
+        run.process_id = None;
+        run.pending_gates.clear();
+        run.updated_at = Utc::now();
+        Ok(run.clone())
+    })
+}
+
+fn terminate_executor(process_id: u32) -> Result<()> {
+    let target = process_group_target(process_id).unwrap_or(process_id as i32);
+    if signal_target(target, 15).is_err() && process_is_live(process_id) {
+        bail!("could not stop workflow executor {process_id}");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_group_target(process_id: u32) -> Option<i32> {
+    if process_id > i32::MAX as u32 {
+        return None;
+    }
+    unsafe extern "C" {
+        fn getpgid(pid: i32) -> i32;
+    }
+    let process_group = unsafe { getpgid(process_id as i32) };
+    (process_group == process_id as i32).then_some(-process_group)
+}
+
+#[cfg(not(unix))]
+fn process_group_target(_process_id: u32) -> Option<i32> {
+    None
+}
+
+#[cfg(unix)]
+fn signal_process(process_id: u32, signal: i32) -> Result<()> {
+    if process_id == 0 || process_id > i32::MAX as u32 {
+        bail!("invalid process id {process_id}");
+    }
+    signal_target(process_id as i32, signal)
+}
+
+#[cfg(not(unix))]
+fn signal_process(_process_id: u32, _signal: i32) -> Result<()> {
+    bail!("process signals are unavailable on this platform")
+}
+
+#[cfg(unix)]
+fn signal_target(target: i32, signal: i32) -> Result<()> {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    if unsafe { kill(target, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error()).context("signal workflow executor")
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_target(_target: i32, _signal: i32) -> Result<()> {
+    bail!("process signals are unavailable on this platform")
 }
 
 pub fn set_process(
@@ -1517,6 +1832,9 @@ pub fn set_process(
             .iter_mut()
             .find(|run| run.id == run_id)
             .with_context(|| format!("unknown run: {run_id}"))?;
+        if !run.status.active() {
+            return Ok(run.clone());
+        }
         run.process_id = Some(process_id);
         run.log_path = log_path.map(|path| path.display().to_string());
         run.status = LifecycleStatus::Working;
@@ -1554,6 +1872,16 @@ pub fn fail(scope: &Path, run_id: &str, error: &anyhow::Error) -> Result<Workflo
 
 pub fn spawn(scope: &Path, run_id: &str) -> Result<WorkflowRun> {
     let scope = state::resolve_scope(scope)?;
+    let initial = find_run(&scope, run_id)?;
+    if !initial.status.active() {
+        return Ok(initial);
+    }
+    if initial.process_id.is_some_and(process_is_live) {
+        return Ok(initial);
+    }
+    let Some(mut lease) = ExecutionLease::acquire(&scope, run_id)? else {
+        return find_run(&scope, run_id);
+    };
     let log_directory = crate::config::state_home()
         .join("orc/logs")
         .join(state::scope_key(&scope));
@@ -1564,7 +1892,8 @@ pub fn spawn(scope: &Path, run_id: &str) -> Result<WorkflowRun> {
         .append(true)
         .open(&log_path)?;
     let stderr = stdout.try_clone()?;
-    let child = Command::new(std::env::current_exe()?)
+    let mut command = Command::new(std::env::current_exe()?);
+    command
         .args([
             "run",
             "execute",
@@ -1575,14 +1904,100 @@ pub fn spawn(scope: &Path, run_id: &str) -> Result<WorkflowRun> {
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(stderr)
+        .env(EXECUTION_LEASE_ENV, &lease.nonce);
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command
         .spawn()
         .context("start background workflow executor")?;
-    set_process(&scope, run_id, child.id(), Some(&log_path))
+    if let Err(error) = lease.write_owner(child.id()) {
+        let _ = terminate_executor(child.id());
+        return Err(error);
+    }
+    let run = set_process(&scope, run_id, child.id(), Some(&log_path));
+    if run.is_err() {
+        let _ = terminate_executor(child.id());
+    } else {
+        lease.disarm();
+    }
+    run
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier, atomic::AtomicUsize, atomic::Ordering};
+
+    fn workflow_fixture(duration: &str) -> (tempfile::TempDir, Config, PathBuf, WorkflowRun) {
+        let directory = tempfile::tempdir().expect("workflow fixture directory");
+        let scope_directory = directory.path().join("scope");
+        fs::create_dir_all(&scope_directory).expect("scope directory");
+        let scope = fs::canonicalize(scope_directory).expect("canonical scope");
+        let provider_directory = directory.path().join("providers");
+        fs::create_dir_all(&provider_directory).expect("provider directory");
+        let config = Config {
+            providers: crate::config::ProviderConfig {
+                directory: provider_directory,
+                ..crate::config::ProviderConfig::default()
+            },
+            workflows: crate::config::WorkflowConfig {
+                repository: directory.path().join("workflows"),
+                auto_commit: false,
+                ..crate::config::WorkflowConfig::default()
+            },
+            ..Config::default()
+        };
+        control::register(
+            &scope,
+            Contract {
+                harness: "test".into(),
+                role: SessionRole::Orchestrator,
+                title: "test orchestrator".into(),
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some(format!("orchestrator-{}", Uuid::new_v4())),
+                native_id: Some(Uuid::new_v4().to_string()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("register orchestrator");
+        preferences::write(
+            &scope,
+            &preferences::WorkspacePreferences {
+                autonomy: AutonomyMode::Autonomous,
+                ..preferences::WorkspacePreferences::default()
+            },
+        )
+        .expect("write autonomous preferences");
+        let definition = Definition {
+            name: "concurrent".into(),
+            goal: "execute one wave once".into(),
+            entry_point: "wait".into(),
+            steps: vec![Step {
+                name: "wait".into(),
+                r#type: StepKind::Wait,
+                duration: Some(duration.into()),
+                ..Step::default()
+            }],
+            ..Definition::default()
+        };
+        let definition_path = directory.path().join("workflow.yaml");
+        fs::write(
+            &definition_path,
+            serde_yaml::to_string(&definition).expect("serialize workflow"),
+        )
+        .expect("write workflow");
+        let run = materialize(&config, &scope, &definition_path, RunMode::Foreground)
+            .expect("materialize workflow");
+        (directory, config, scope, run)
+    }
+
+    fn remove_fixture_state(scope: &Path, run_id: &str) {
+        let _ = fs::remove_file(state::path(scope));
+        let _ = fs::remove_file(preferences::path(scope));
+        let _ = fs::remove_file(execution_lease_path(scope, run_id));
+    }
 
     #[test]
     fn plan_groups_independent_steps() {
@@ -1652,5 +2067,190 @@ mod tests {
 
         let error = plan(&Config::default(), Path::new("."), &definition).unwrap_err();
         assert!(error.to_string().contains("dependency cycle"));
+    }
+
+    #[test]
+    fn concurrent_lease_claims_have_one_owner() {
+        let directory = tempfile::tempdir().expect("lease directory");
+        let path = Arc::new(directory.path().join("run.lease"));
+        let start = Arc::new(Barrier::new(8));
+        let release = Arc::new(Barrier::new(9));
+        let owners = Arc::new(AtomicUsize::new(0));
+        let workers = (0..8)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let start = Arc::clone(&start);
+                let release = Arc::clone(&release);
+                let owners = Arc::clone(&owners);
+                thread::spawn(move || {
+                    start.wait();
+                    let lease = ExecutionLease::acquire_at(&path).expect("claim lease");
+                    if lease.is_some() {
+                        owners.fetch_add(1, Ordering::SeqCst);
+                    }
+                    release.wait();
+                    lease
+                })
+            })
+            .collect::<Vec<_>>();
+        release.wait();
+        assert_eq!(owners.load(Ordering::SeqCst), 1);
+        for worker in workers {
+            worker.join().expect("lease worker");
+        }
+    }
+
+    #[test]
+    fn stale_execution_lease_is_reclaimed() {
+        let directory = tempfile::tempdir().expect("lease directory");
+        let path = directory.path().join("run.lease");
+        fs::write(&path, format!("{} stale\n", u32::MAX)).expect("write stale lease");
+
+        let lease = ExecutionLease::acquire_at(&path)
+            .expect("reclaim stale lease")
+            .expect("lease owner");
+
+        assert_ne!(lease.nonce, "stale");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_stale_lease_reclaim_has_one_owner() {
+        let directory = tempfile::tempdir().expect("lease directory");
+        let path = Arc::new(directory.path().join("run.lease"));
+        fs::write(path.as_ref(), format!("{} stale\n", u32::MAX)).expect("write stale lease");
+        let start = Arc::new(Barrier::new(8));
+        let release = Arc::new(Barrier::new(9));
+        let owners = Arc::new(AtomicUsize::new(0));
+        let workers = (0..8)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let start = Arc::clone(&start);
+                let release = Arc::clone(&release);
+                let owners = Arc::clone(&owners);
+                thread::spawn(move || {
+                    start.wait();
+                    let lease = ExecutionLease::acquire_at(path.as_ref()).expect("claim lease");
+                    if lease.is_some() {
+                        owners.fetch_add(1, Ordering::SeqCst);
+                    }
+                    release.wait();
+                    lease
+                })
+            })
+            .collect::<Vec<_>>();
+        release.wait();
+        assert_eq!(owners.load(Ordering::SeqCst), 1);
+        for worker in workers {
+            worker.join().expect("lease worker");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_executor_targets_a_dedicated_process_group() {
+        let mut command = Command::new("sleep");
+        command.arg("30").process_group(0);
+        let mut child = command.spawn().expect("spawn process group leader");
+        let target = process_group_target(child.id()).expect("dedicated process group");
+        assert_eq!(target, -(child.id() as i32));
+
+        terminate_executor(child.id()).expect("terminate process group");
+        let exited = (0..100).any(|_| {
+            if child.try_wait().expect("read child status").is_some() {
+                true
+            } else {
+                thread::sleep(Duration::from_millis(10));
+                false
+            }
+        });
+        if !exited {
+            let _ = child.kill();
+        }
+        assert!(exited, "process group leader ignored termination");
+    }
+
+    #[test]
+    fn concurrent_execute_runs_a_wave_once() {
+        let (_directory, config, scope, run) = workflow_fixture("150ms");
+        let start = Arc::new(Barrier::new(2));
+        let workers = (0..2)
+            .map(|_| {
+                let config = config.clone();
+                let scope = scope.clone();
+                let run_id = run.id.clone();
+                let start = Arc::clone(&start);
+                thread::spawn(move || {
+                    start.wait();
+                    execute(&config, &scope, &run_id)
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker
+                .join()
+                .expect("execution worker")
+                .expect("execute workflow");
+        }
+
+        let completed = find_run(&scope, &run.id).expect("completed run");
+        assert_eq!(completed.status, LifecycleStatus::Done);
+        assert_eq!(completed.nodes[0].status, LifecycleStatus::Done);
+        assert_eq!(completed.nodes[0].attempt, 1);
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn cancel_reconciles_nodes_and_linked_sessions() {
+        let (_directory, _config, scope, run) = workflow_fixture("1s");
+        let linked = control::register(
+            &scope,
+            Contract {
+                harness: "test".into(),
+                role: SessionRole::Worker,
+                title: "linked worker".into(),
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some(format!("worker-{}", Uuid::new_v4())),
+                native_id: Some(Uuid::new_v4().to_string()),
+                run_id: Some(run.id.clone()),
+                node_id: Some("wait".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("register linked session");
+        state::update(&scope, |workspace| {
+            let run = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            run.status = LifecycleStatus::Working;
+            run.current_node = Some("wait".into());
+            run.nodes[0].status = LifecycleStatus::Working;
+            run.pending_gates.push(PendingGate {
+                id: "approval".into(),
+                before: "wait".into(),
+                reason: "test".into(),
+                recommendation: None,
+                created_at: Utc::now(),
+            });
+            Ok(())
+        })
+        .expect("mark work active");
+
+        let cancelled = cancel(&scope, &run.id).expect("cancel workflow");
+        let workspace = state::read(&scope).expect("read cancelled workflow");
+        let linked = workspace
+            .sessions
+            .iter()
+            .find(|session| session.id == linked.id)
+            .expect("linked session");
+        assert_eq!(cancelled.status, LifecycleStatus::Cancelled);
+        assert_eq!(cancelled.nodes[0].status, LifecycleStatus::Cancelled);
+        assert!(cancelled.pending_gates.is_empty());
+        assert_eq!(linked.status, LifecycleStatus::Cancelled);
+        remove_fixture_state(&scope, &run.id);
     }
 }

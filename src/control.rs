@@ -108,11 +108,16 @@ pub fn read_workspace(scope: &Path) -> Result<WorkspaceState> {
 pub fn register(scope: &Path, mut contract: Contract, link: SessionLink) -> Result<Session> {
     let scope = state::resolve_scope(scope)?;
     let native_id = link.native_id.unwrap_or_else(inferred_native_id);
-    let base_id = link
-        .id
-        .or_else(|| env::var("ORC_SESSION_ID").ok())
-        .unwrap_or_else(|| inferred_session_id(&contract.harness, &native_id));
+    let explicit_id = link.id;
+    let environment_id = env::var("ORC_SESSION_ID").ok();
     state::update(&scope, |workspace| {
+        let inferred_id = inferred_session_id(&contract.harness, &native_id);
+        let base_id = registration_base_id(
+            workspace,
+            explicit_id.as_deref(),
+            environment_id.as_deref(),
+            &inferred_id,
+        );
         let current = workspace
             .sessions
             .iter()
@@ -204,13 +209,44 @@ pub fn register(scope: &Path, mut contract: Contract, link: SessionLink) -> Resu
     })
 }
 
+fn registration_base_id(
+    workspace: &WorkspaceState,
+    explicit_id: Option<&str>,
+    environment_id: Option<&str>,
+    inferred_id: &str,
+) -> String {
+    explicit_id
+        .map(str::to_owned)
+        .or_else(|| {
+            environment_id
+                .filter(|id| {
+                    !workspace.sessions.iter().any(|session| {
+                        session.id == *id && session.status == LifecycleStatus::Archived
+                    })
+                })
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| inferred_id.to_owned())
+}
+
 pub fn adopt(scope: &Path, mut contract: Contract, native_id: Option<String>) -> Result<Session> {
     contract.role = SessionRole::Orchestrator;
     let scope = state::resolve_scope(scope)?;
     let now = Utc::now();
     state::update(&scope, |workspace| {
+        let replaced_orchestrators = workspace
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.role == SessionRole::Orchestrator
+                    && session.status != LifecycleStatus::Archived
+            })
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
         for session in &mut workspace.sessions {
-            if session.role == SessionRole::Orchestrator && session.status.active() {
+            if session.role == SessionRole::Orchestrator
+                && session.status != LifecycleStatus::Archived
+            {
                 session.status = LifecycleStatus::Archived;
                 session.updated_at = now;
             }
@@ -245,9 +281,39 @@ pub fn adopt(scope: &Path, mut contract: Contract, native_id: Option<String>) ->
             connected_at: now,
             updated_at: now,
         };
+        reparent_active_descendants(workspace, &replaced_orchestrators, &session.id);
+        for run in &mut workspace.runs {
+            if run.status.active()
+                && run
+                    .orchestrator_id
+                    .as_ref()
+                    .is_some_and(|id| replaced_orchestrators.contains(id))
+            {
+                run.orchestrator_id = Some(session.id.clone());
+                run.updated_at = now;
+            }
+        }
         workspace.sessions.insert(0, session.clone());
         Ok(session)
     })
+}
+
+fn reparent_active_descendants(
+    workspace: &mut WorkspaceState,
+    replaced_orchestrators: &[String],
+    new_orchestrator: &str,
+) {
+    for session in &mut workspace.sessions {
+        if session.status.active()
+            && session
+                .parent_id
+                .as_ref()
+                .is_some_and(|id| replaced_orchestrators.contains(id))
+        {
+            session.parent_id = Some(new_orchestrator.to_owned());
+            session.updated_at = Utc::now();
+        }
+    }
 }
 
 pub fn update_session(scope: &Path, id: &str, status: LifecycleStatus) -> Result<Session> {
@@ -317,16 +383,28 @@ pub fn reconcile_with_current(
     let scope = state::resolve_scope(scope)?;
     let providers = provider::discover(config)?;
     let snapshot = state::read(&scope)?;
+    let current_id = if rebind_current {
+        snapshot
+            .active_sessions()
+            .next()
+            .map(|session| session.id.clone())
+    } else {
+        None
+    };
     let enrichments = snapshot
         .sessions
         .iter()
         .filter(|session| session.status != LifecycleStatus::Archived)
-        .filter_map(|session| {
+        .filter(|session| {
+            current_id
+                .as_ref()
+                .is_none_or(|current_id| session.id == *current_id)
+        })
+        .map(|session| {
             let bindings =
                 provider::discover_bindings(config, &providers, &scope, session, rebind_current);
             let (title, goal) = provider::describe(config, &providers, &scope, session);
-            (!bindings.is_empty() || title.is_some() || goal.is_some())
-                .then(|| (session.id.clone(), bindings, title, goal))
+            (session.id.clone(), bindings, title, goal)
         })
         .collect::<Vec<_>>();
     if enrichments.is_empty() {
@@ -339,25 +417,83 @@ pub fn reconcile_with_current(
                 .iter_mut()
                 .find(|candidate| candidate.id == *id)
                 .context("session disappeared")?;
-            for binding in bindings {
-                selected.providers.retain(|candidate| {
-                    candidate.provider != binding.provider || candidate.kind != binding.kind
-                });
-                selected.providers.push(binding.clone());
-            }
-            if let Some(title) = title
-                && (selected.title == "Agent session" || selected.title == selected.id)
-            {
-                selected.title.clone_from(title);
-            }
-            if let Some(goal) = goal
-                && selected.goal == "Complete the assigned work"
-            {
-                selected.goal.clone_from(goal);
-            }
+            apply_enrichment(selected, bindings, title.as_deref(), goal.as_deref());
         }
         Ok(workspace.clone())
     })
+}
+
+fn apply_enrichment(
+    session: &mut Session,
+    bindings: &[crate::domain::ProviderBinding],
+    title: Option<&str>,
+    goal: Option<&str>,
+) {
+    let liveness = reconciled_liveness(&session.providers, bindings);
+    session.providers = bindings.to_vec();
+    if let Some(is_live) = liveness {
+        if is_live && session.status == LifecycleStatus::Disconnected {
+            session.status = LifecycleStatus::Working;
+        } else if !is_live && session.status.active() {
+            session.status = LifecycleStatus::Disconnected;
+        }
+        session.updated_at = Utc::now();
+    }
+    if let Some(title) = title
+        && (session.title == "Agent session" || session.title == session.id)
+    {
+        session.title = title.to_owned();
+    }
+    if let Some(goal) = goal
+        && session.goal == "Complete the assigned work"
+    {
+        session.goal = goal.to_owned();
+    }
+}
+
+fn reconciled_liveness(
+    previous: &[crate::domain::ProviderBinding],
+    current: &[crate::domain::ProviderBinding],
+) -> Option<bool> {
+    for kind in [
+        crate::domain::ProviderKind::Persistence,
+        crate::domain::ProviderKind::Display,
+    ] {
+        let previously_live = previous
+            .iter()
+            .filter(|binding| binding.kind == kind && is_live_binding(binding))
+            .collect::<Vec<_>>();
+        if !previously_live.is_empty() {
+            let matching = current
+                .iter()
+                .filter(|binding| {
+                    binding.kind == kind
+                        && previously_live
+                            .iter()
+                            .any(|previous| previous.provider == binding.provider)
+                })
+                .collect::<Vec<_>>();
+            return (!matching.is_empty()).then(|| matching.into_iter().any(is_live_binding));
+        }
+        if current
+            .iter()
+            .any(|binding| binding.kind == kind && is_live_binding(binding))
+        {
+            return Some(true);
+        }
+    }
+    None
+}
+
+fn is_live_binding(binding: &crate::domain::ProviderBinding) -> bool {
+    matches!(
+        binding.kind,
+        crate::domain::ProviderKind::Persistence | crate::domain::ProviderKind::Display
+    ) && binding.status == crate::domain::BindingStatus::Active
+        && binding
+            .r#ref
+            .as_deref()
+            .is_some_and(|reference| !reference.is_empty())
 }
 
 pub fn create_run(
@@ -607,11 +743,33 @@ pub fn attach(
     action: provider::Action,
     direction: &str,
 ) -> Result<AttachOutcome> {
+    attach_with_output(config, scope, id, action, direction, true)
+}
+
+pub fn attach_quiet(
+    config: &Config,
+    scope: &Path,
+    id: &str,
+    action: provider::Action,
+    direction: &str,
+) -> Result<AttachOutcome> {
+    attach_with_output(config, scope, id, action, direction, false)
+}
+
+fn attach_with_output(
+    config: &Config,
+    scope: &Path,
+    id: &str,
+    action: provider::Action,
+    direction: &str,
+    print_output: bool,
+) -> Result<AttachOutcome> {
     let scope = state::resolve_scope(scope)?;
     let workspace = state::read(&scope)?;
     let session = selected_session(&workspace, id)?;
     let providers = provider::discover(config)?;
-    let (action, disposition) = if action == provider::Action::Attach
+    let prefer_focus = action == provider::Action::Attach
+        && session.status.active()
         && session.providers.iter().any(|binding| {
             binding.kind == crate::domain::ProviderKind::Display
                 && binding.status == crate::domain::BindingStatus::Active
@@ -619,11 +777,7 @@ pub fn attach(
                     .r#ref
                     .as_ref()
                     .is_some_and(|value| !value.is_empty())
-        }) {
-        (provider::Action::Focus, AttachDisposition::Focused)
-    } else {
-        (action, AttachDisposition::Launched)
-    };
+        });
     let has_persistent_process = session.providers.iter().any(|binding| {
         binding.kind == crate::domain::ProviderKind::Persistence
             && binding.status == crate::domain::BindingStatus::Active
@@ -632,16 +786,78 @@ pub fn attach(
                 .as_ref()
                 .is_some_and(|value| !value.is_empty())
     });
-    if action == provider::Action::Attach && session.status.active() && !has_persistent_process {
-        anyhow::bail!(
-            "{} is active, but no display can focus it and no persistent process can reattach it; inspect it or stop it before resuming",
-            session.title
+    execute_attach_with(
+        action,
+        prefer_focus,
+        session.status.active(),
+        has_persistent_process,
+        &session.title,
+        |selected_action| {
+            let request =
+                provider::action_request(selected_action, &scope, Some(session), direction);
+            let plan = provider::resolve_plan(config, &providers, selected_action, request)?;
+            let code = if print_output {
+                provider::execute_plan(&plan, &scope, false)?
+            } else {
+                provider::run_plan(&plan, &scope)?.code
+            };
+            Ok((code, plan.accepts(code)))
+        },
+    )
+}
+
+fn execute_attach_with(
+    action: provider::Action,
+    prefer_focus: bool,
+    session_active: bool,
+    has_persistent_process: bool,
+    session_title: &str,
+    mut execute: impl FnMut(provider::Action) -> Result<(i32, bool)>,
+) -> Result<AttachOutcome> {
+    if action != provider::Action::Attach {
+        let (code, _) = execute(action)?;
+        return Ok(AttachOutcome {
+            code,
+            disposition: AttachDisposition::Launched,
+        });
+    }
+
+    let focus_failure = if prefer_focus {
+        match execute(provider::Action::Focus) {
+            Ok((code, true)) => {
+                return Ok(AttachOutcome {
+                    code,
+                    disposition: AttachDisposition::Focused,
+                });
+            }
+            Ok((code, false)) => Some(format!("focus exited with {code}")),
+            Err(error) => Some(format!("focus failed: {error:#}")),
+        }
+    } else {
+        None
+    };
+
+    if session_active && !has_persistent_process {
+        let suffix = focus_failure
+            .as_deref()
+            .map(|failure| format!(" ({failure})"))
+            .unwrap_or_default();
+        bail!(
+            "{session_title} is active, but no display can focus it and no persistent process can reattach it; inspect it or stop it before resuming{suffix}"
         );
     }
-    let request = provider::action_request(action, &scope, Some(session), direction);
-    let plan = provider::resolve_plan(config, &providers, action, request)?;
-    let code = provider::execute_plan(&plan, &scope, false)?;
-    Ok(AttachOutcome { code, disposition })
+
+    execute(provider::Action::Attach)
+        .map(|(code, _)| AttachOutcome {
+            code,
+            disposition: AttachDisposition::Launched,
+        })
+        .with_context(|| {
+            focus_failure.map_or_else(
+                || "attach failed".to_owned(),
+                |failure| format!("attach fallback failed after {failure}"),
+            )
+        })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -751,10 +967,376 @@ pub fn ensure_active_context(scope: &Path) -> Result<(WorkspaceState, Session)> 
 mod tests {
     use super::*;
 
+    use crate::domain::{BindingStatus, ProviderBinding, ProviderKind};
+
+    fn session(id: &str, role: SessionRole, status: LifecycleStatus) -> Session {
+        Session {
+            id: id.into(),
+            native_id: id.into(),
+            trace_id: None,
+            harness: "test".into(),
+            model: None,
+            role,
+            title: "Agent session".into(),
+            purpose: "test".into(),
+            goal: "Complete the assigned work".into(),
+            expected_output: "test".into(),
+            success_criteria: Vec::new(),
+            completion: CompletionTarget::Orchestrator,
+            review_by: None,
+            parent_id: None,
+            run_id: None,
+            node_id: None,
+            provider_ref: None,
+            providers: Vec::new(),
+            directory: "/tmp".into(),
+            registration: RegistrationSource::Connected,
+            status,
+            connected_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn binding(provider: &str, kind: ProviderKind, status: BindingStatus) -> ProviderBinding {
+        ProviderBinding {
+            provider: provider.into(),
+            kind,
+            r#ref: Some(format!("{provider}-ref")),
+            status,
+            label: provider.into(),
+        }
+    }
+
     #[test]
     fn inferred_id_is_short_and_stable() {
         let id = inferred_session_id("codex", "abc");
         assert_eq!(id, inferred_session_id("codex", "abc"));
         assert_eq!(id.len(), 18);
+    }
+
+    #[test]
+    fn archived_environment_id_is_not_reused_for_registration() {
+        let mut workspace = WorkspaceState::empty("/tmp".into());
+        workspace.sessions.push(session(
+            "stale",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Archived,
+        ));
+
+        assert_eq!(
+            registration_base_id(&workspace, None, Some("stale"), "inferred"),
+            "inferred"
+        );
+        assert_eq!(
+            registration_base_id(&workspace, Some("stale"), Some("stale"), "inferred"),
+            "stale"
+        );
+    }
+
+    #[test]
+    fn adoption_reparents_active_children_of_replaced_orchestrator() {
+        let mut workspace = WorkspaceState::empty("/tmp".into());
+        let root = session(
+            "old-root",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+        );
+        let mut active_child = session(
+            "active-child",
+            SessionRole::Implementer,
+            LifecycleStatus::Working,
+        );
+        active_child.parent_id = Some(root.id.clone());
+        let mut finished_child = session(
+            "finished-child",
+            SessionRole::Verifier,
+            LifecycleStatus::Done,
+        );
+        finished_child.parent_id = Some(root.id.clone());
+        workspace.sessions = vec![root, active_child, finished_child];
+
+        reparent_active_descendants(&mut workspace, &["old-root".into()], "new-root");
+
+        assert_eq!(workspace.sessions[1].parent_id.as_deref(), Some("new-root"));
+        assert_eq!(workspace.sessions[2].parent_id.as_deref(), Some("old-root"));
+    }
+
+    #[test]
+    fn adoption_replaces_a_disconnected_orchestrator() {
+        let directory = tempfile::tempdir().unwrap();
+        let scope_directory = directory.path().join("scope");
+        std::fs::create_dir(&scope_directory).unwrap();
+        let scope = std::fs::canonicalize(scope_directory).unwrap();
+        let old = register(
+            &scope,
+            Contract {
+                role: SessionRole::Orchestrator,
+                title: "old root".into(),
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some("old-root".into()),
+                native_id: Some("old-native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .unwrap();
+        update_session(&scope, &old.id, LifecycleStatus::Disconnected).unwrap();
+        let child = register(
+            &scope,
+            Contract {
+                role: SessionRole::Worker,
+                title: "child".into(),
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some("child".into()),
+                native_id: Some("child-native".into()),
+                parent_id: Some(old.id.clone()),
+                ..SessionLink::default()
+            },
+        )
+        .unwrap();
+
+        let new = adopt(
+            &scope,
+            Contract {
+                title: "new root".into(),
+                ..Contract::default()
+            },
+            Some("new-native".into()),
+        )
+        .unwrap();
+        let workspace = state::read(&scope).unwrap();
+
+        assert_eq!(
+            workspace
+                .sessions
+                .iter()
+                .find(|session| session.id == old.id)
+                .unwrap()
+                .status,
+            LifecycleStatus::Archived
+        );
+        assert_eq!(
+            workspace
+                .sessions
+                .iter()
+                .find(|session| session.id == child.id)
+                .unwrap()
+                .parent_id
+                .as_deref(),
+            Some(new.id.as_str())
+        );
+        assert_eq!(
+            workspace
+                .sessions
+                .iter()
+                .filter(|session| {
+                    session.role == SessionRole::Orchestrator
+                        && session.status != LifecycleStatus::Archived
+                })
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn reconciliation_replaces_stale_bindings() {
+        let mut selected = session(
+            "session",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+        );
+        selected.providers = vec![binding(
+            "stale",
+            ProviderKind::Display,
+            BindingStatus::Active,
+        )];
+        let current = binding("current", ProviderKind::Persistence, BindingStatus::Active);
+
+        apply_enrichment(
+            &mut selected,
+            std::slice::from_ref(&current),
+            Some("described"),
+            Some("specific goal"),
+        );
+
+        assert_eq!(selected.providers, vec![current]);
+        assert_eq!(selected.title, "described");
+        assert_eq!(selected.goal, "specific goal");
+    }
+
+    #[test]
+    fn reconciliation_disconnects_a_session_that_loses_its_live_binding() {
+        let mut selected = session(
+            "session",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+        );
+        selected.providers = vec![binding(
+            "zmx",
+            ProviderKind::Persistence,
+            BindingStatus::Active,
+        )];
+        let unavailable = binding("zmx", ProviderKind::Persistence, BindingStatus::Unavailable);
+
+        apply_enrichment(&mut selected, &[unavailable], None, None);
+
+        assert_eq!(selected.status, LifecycleStatus::Disconnected);
+    }
+
+    #[test]
+    fn reconciliation_treats_a_missing_live_binding_as_unknown() {
+        let mut selected = session(
+            "session",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+        );
+        selected.providers = vec![binding(
+            "wezterm",
+            ProviderKind::Display,
+            BindingStatus::Active,
+        )];
+
+        apply_enrichment(&mut selected, &[], None, None);
+
+        assert_eq!(selected.status, LifecycleStatus::Working);
+    }
+
+    #[test]
+    fn a_display_does_not_override_missing_persistence_evidence() {
+        let mut selected = session(
+            "session",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+        );
+        selected.providers = vec![
+            binding("zmx", ProviderKind::Persistence, BindingStatus::Active),
+            binding("wezterm", ProviderKind::Display, BindingStatus::Active),
+        ];
+        let remaining_display = binding("wezterm", ProviderKind::Display, BindingStatus::Active);
+
+        apply_enrichment(&mut selected, &[remaining_display], None, None);
+
+        assert_eq!(selected.status, LifecycleStatus::Working);
+    }
+
+    #[test]
+    fn reconciliation_revives_a_disconnected_session_with_live_evidence() {
+        let mut selected = session(
+            "session",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Disconnected,
+        );
+        selected.providers = vec![binding(
+            "zmx",
+            ProviderKind::Persistence,
+            BindingStatus::Unavailable,
+        )];
+        let live = binding("zmx", ProviderKind::Persistence, BindingStatus::Active);
+
+        apply_enrichment(&mut selected, &[live], None, None);
+
+        assert_eq!(selected.status, LifecycleStatus::Working);
+    }
+
+    #[test]
+    fn reconciliation_refreshes_a_session_with_a_live_binding() {
+        let mut selected = session(
+            "session",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+        );
+        selected.updated_at = chrono::DateTime::UNIX_EPOCH;
+        let live = binding("zmx", ProviderKind::Persistence, BindingStatus::Active);
+        selected.providers = vec![live.clone()];
+
+        apply_enrichment(&mut selected, &[live], None, None);
+
+        assert_eq!(selected.status, LifecycleStatus::Working);
+        assert!(selected.updated_at > chrono::DateTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn reconciliation_does_not_infer_liveness_without_prior_evidence() {
+        let mut selected = session(
+            "session",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+        );
+        selected.updated_at = chrono::DateTime::UNIX_EPOCH;
+
+        apply_enrichment(&mut selected, &[], None, None);
+
+        assert_eq!(selected.status, LifecycleStatus::Working);
+        assert_eq!(selected.updated_at, chrono::DateTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn reconciliation_preserves_terminal_lifecycle_states() {
+        let mut selected = session("session", SessionRole::Verifier, LifecycleStatus::Done);
+        selected.updated_at = chrono::DateTime::UNIX_EPOCH;
+        selected.providers = vec![binding(
+            "wezterm",
+            ProviderKind::Display,
+            BindingStatus::Active,
+        )];
+
+        apply_enrichment(&mut selected, &[], None, None);
+
+        assert_eq!(selected.status, LifecycleStatus::Done);
+        assert_eq!(selected.updated_at, chrono::DateTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn attach_falls_back_after_focus_provider_fails() {
+        let mut calls = Vec::new();
+
+        let outcome = execute_attach_with(
+            provider::Action::Attach,
+            true,
+            true,
+            true,
+            "agent",
+            |action| {
+                calls.push(action);
+                match action {
+                    provider::Action::Focus => Ok((1, false)),
+                    provider::Action::Attach => Ok((0, true)),
+                    _ => unreachable!("unexpected action"),
+                }
+            },
+        )
+        .expect("attach fallback succeeds");
+
+        assert_eq!(
+            calls,
+            vec![provider::Action::Focus, provider::Action::Attach]
+        );
+        assert_eq!(outcome.disposition, AttachDisposition::Launched);
+        assert_eq!(outcome.code, 0);
+    }
+
+    #[test]
+    fn attach_does_not_fallback_after_successful_focus() {
+        let mut calls = Vec::new();
+
+        let outcome = execute_attach_with(
+            provider::Action::Attach,
+            true,
+            true,
+            true,
+            "agent",
+            |action| {
+                calls.push(action);
+                Ok((0, true))
+            },
+        )
+        .expect("focus succeeds");
+
+        assert_eq!(calls, vec![provider::Action::Focus]);
+        assert_eq!(outcome.disposition, AttachDisposition::Focused);
     }
 }

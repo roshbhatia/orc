@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, OpenOptions},
-    io::Write,
+    fs::{self, File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Instant,
@@ -18,6 +18,11 @@ use crate::{
     config::Config,
     domain::{BindingStatus, ProviderBinding, ProviderKind, Session},
 };
+
+const MAX_ACTIVITY_BYTES: u64 = 256 * 1024;
+const MAX_ACTIVITY_LINES: usize = 100;
+const MAX_PROVIDER_CACHE_ENTRIES: usize = 256;
+const MAX_PROVIDER_CACHE_ENTRY_BYTES: u64 = 1024 * 1024;
 
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
@@ -406,6 +411,14 @@ fn record_invocation(
         return;
     }
     let path = directory.join(format!("{}.jsonl", provider.name));
+    compact_activity_log(&path);
+    let message: String = stderr
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(512)
+        .collect();
     let record = json!({
         "at": chrono::Utc::now(),
         "provider": provider.name,
@@ -413,7 +426,8 @@ fn record_invocation(
         "capability": request.get("capability").and_then(Value::as_str),
         "status": if success { "ok" } else { "failed" },
         "durationMs": duration_ms.min(u64::MAX as u128) as u64,
-        "message": stderr.lines().next().unwrap_or_default(),
+        "message": message,
+        "scope": request.get("scope").and_then(Value::as_str),
     });
     let Ok(line) = serde_json::to_string(&record) else {
         return;
@@ -424,14 +438,43 @@ fn record_invocation(
     let _ = writeln!(file, "{line}");
 }
 
+fn compact_activity_log(path: &Path) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    if metadata.len() <= MAX_ACTIVITY_BYTES {
+        return;
+    }
+    let Ok(tail) = read_file_tail(path, MAX_ACTIVITY_BYTES / 2) else {
+        return;
+    };
+    let _ = fs::write(path, tail);
+}
+
+fn read_file_tail(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity((length - start) as usize);
+    file.read_to_end(&mut bytes)?;
+    if start > 0
+        && let Some(line_start) = bytes.iter().position(|byte| *byte == b'\n')
+    {
+        bytes.drain(..=line_start);
+    }
+    Ok(bytes)
+}
+
 pub fn recent_activity(name: &str) -> String {
     let path = crate::config::state_home()
         .join("orc/providers")
         .join(format!("{name}.jsonl"));
-    let Ok(source) = fs::read_to_string(path) else {
+    let Ok(source) = read_file_tail(&path, MAX_ACTIVITY_BYTES) else {
         return "No provider calls yet.".into();
     };
-    let lines: Vec<_> = source.lines().rev().take(100).collect();
+    let source = String::from_utf8_lossy(&source);
+    let lines: Vec<_> = source.lines().rev().take(MAX_ACTIVITY_LINES).collect();
     let rendered = lines
         .into_iter()
         .rev()
@@ -495,7 +538,8 @@ fn invoke_cached(provider: &Manifest, request: &Value, config: &Config) -> Resul
     }
     let path = cache_path(provider, request)?;
     let now = chrono::Utc::now().timestamp_millis();
-    if let Ok(source) = fs::read_to_string(&path)
+    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() <= MAX_PROVIDER_CACHE_ENTRY_BYTES)
+        && let Ok(source) = fs::read_to_string(&path)
         && let Ok(cached) = serde_json::from_str::<CachedValue>(&source)
         && now.saturating_sub(cached.created_at_ms) <= config.cache.provider_ttl_ms as i64
     {
@@ -509,8 +553,42 @@ fn invoke_cached(provider: &Manifest, request: &Value, config: &Config) -> Resul
         created_at_ms: now,
         value: value.clone(),
     };
-    fs::write(path, serde_json::to_vec(&cached)?)?;
+    let directory = path
+        .parent()
+        .context("provider cache path has no parent")?
+        .to_path_buf();
+    let encoded = serde_json::to_vec(&cached)?;
+    if encoded.len() as u64 > MAX_PROVIDER_CACHE_ENTRY_BYTES {
+        return Ok(value);
+    }
+    fs::write(path, encoded)?;
+    prune_provider_cache(&directory);
     Ok(value)
+}
+
+fn prune_provider_cache(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let mut entries: Vec<_> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                return None;
+            }
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            path.is_file().then_some((modified, path))
+        })
+        .collect();
+    if entries.len() <= MAX_PROVIDER_CACHE_ENTRIES {
+        return;
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    let remove_count = entries.len() - MAX_PROVIDER_CACHE_ENTRIES;
+    for (_, path) in entries.into_iter().take(remove_count) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 trait EmptyFallback {
@@ -574,20 +652,192 @@ fn requirements_checks(provider: &Manifest) -> Vec<ValidationCheck> {
     checks
 }
 
+fn failed_check(name: impl Into<String>, message: impl Into<String>) -> ValidationCheck {
+    ValidationCheck {
+        name: name.into(),
+        status: CheckStatus::Failed,
+        message: message.into(),
+    }
+}
+
 fn provider_checks(result: Result<Value>) -> Vec<ValidationCheck> {
     match result {
-        Ok(value) => value
-            .get("checks")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|item| serde_json::from_value(item.clone()).ok())
-            .collect(),
-        Err(error) => vec![ValidationCheck {
-            name: "provider".into(),
-            status: CheckStatus::Failed,
-            message: format!("{error:#}"),
-        }],
+        Ok(value) => parse_provider_checks(&value)
+            .unwrap_or_else(|error| vec![failed_check("provider", format!("{error:#}"))]),
+        Err(error) => vec![failed_check("provider", format!("{error:#}"))],
+    }
+}
+
+fn parse_provider_checks(value: &Value) -> Result<Vec<ValidationCheck>> {
+    if value.get("version").and_then(Value::as_str) != Some("orc.provider/v1") {
+        bail!("validation response has an invalid or missing version");
+    }
+    let items = value
+        .get("checks")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+        .context("validation response must contain at least one check")?;
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let check: ValidationCheck = serde_json::from_value(item.clone())
+                .with_context(|| format!("validation check {} is malformed", index + 1))?;
+            if check.name.trim().is_empty() || check.message.trim().is_empty() {
+                bail!(
+                    "validation check {} has an empty name or message",
+                    index + 1
+                );
+            }
+            Ok(check)
+        })
+        .collect()
+}
+
+fn capability_action(capability: Capability) -> &'static str {
+    match capability {
+        Capability::ActivityRead => "activity",
+        Capability::ChangesInspect => "changes",
+        Capability::SessionAttach => "attach",
+        Capability::SessionBind => "bind",
+        Capability::SessionDescribe => "describe",
+        Capability::SessionInspect => "inspect",
+        Capability::SessionLaunch => "launch",
+        Capability::SessionPersist => "persist",
+        Capability::SessionStop => "stop",
+        Capability::TerminalOpen => "open",
+        Capability::TerminalFocus => "focus",
+        Capability::ExecutionRun => "execute",
+        Capability::ExecutionCancel => "cancel",
+        Capability::ExecutionStatus => "status",
+        Capability::ExecutionLogs => "logs",
+        Capability::SessionGuide => "guide",
+    }
+}
+
+fn validation_action_request(provider: &Manifest, capability: Capability, scope: &Path) -> Value {
+    json!({
+        "version": "orc.provider/v1",
+        "action": capability_action(capability),
+        "capability": capability,
+        "scope": scope,
+        "direction": "right",
+        "command": ["true"],
+        "environment": {},
+        "plan": {
+            "version": "orc.provider/v1",
+            "command": ["true"],
+            "cwd": scope,
+            "environment": {},
+            "successCodes": [0]
+        },
+        "rebindCurrent": false,
+        "session": {
+            "id": "orc-provider-validation",
+            "nativeId": "orc-provider-validation",
+            "traceId": null,
+            "harness": "orc-provider-validation",
+            "model": null,
+            "role": "worker",
+            "title": "Provider validation",
+            "purpose": "Validate an advertised provider action",
+            "goal": "Return a protocol-valid response without executing its command plan",
+            "expectedOutput": "A declined response or a valid binding, description, or command plan",
+            "successCriteria": [],
+            "completion": "orchestrator",
+            "reviewBy": null,
+            "parentId": null,
+            "runId": null,
+            "nodeId": null,
+            "providerRef": null,
+            "providers": [{
+                "provider": provider.name,
+                "kind": provider.kind,
+                "ref": "orc-provider-validation",
+                "status": "active",
+                "label": "Provider validation"
+            }],
+            "directory": scope,
+            "registration": "managed",
+            "status": "working",
+            "connectedAt": "1970-01-01T00:00:00Z",
+            "updatedAt": "1970-01-01T00:00:00Z"
+        },
+        "manifest": {
+            "name": provider.name,
+            "kind": provider.kind,
+            "actions": provider.actions,
+        },
+    })
+}
+
+fn validate_action_response(
+    provider: &Manifest,
+    capability: Capability,
+    result: Result<Value>,
+) -> ValidationCheck {
+    let name = format!("action:{capability}");
+    let result = result.and_then(|value| {
+        if value.get("version").and_then(Value::as_str) != Some("orc.provider/v1") {
+            bail!("response has an invalid or missing version");
+        }
+        if value.get("status").and_then(Value::as_str) == Some("declined") {
+            value
+                .get("reason")
+                .and_then(Value::as_str)
+                .filter(|reason| !reason.trim().is_empty())
+                .context("declined response is missing a reason")?;
+            return Ok("declined the deterministic validation fixture".to_owned());
+        }
+        match capability {
+            Capability::SessionBind => {
+                let binding = value
+                    .get("binding")
+                    .context("response is missing binding")?;
+                serde_json::from_value::<BindingStatus>(
+                    binding
+                        .get("status")
+                        .context("binding is missing status")?
+                        .clone(),
+                )?;
+                serde_json::from_value::<ProviderKind>(
+                    binding
+                        .get("kind")
+                        .context("binding is missing kind")?
+                        .clone(),
+                )?;
+                binding
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .filter(|label| !label.trim().is_empty())
+                    .context("binding is missing label")?;
+            }
+            Capability::SessionDescribe => {
+                let description = value
+                    .get("description")
+                    .and_then(Value::as_object)
+                    .context("response is missing description")?;
+                if !description
+                    .values()
+                    .filter_map(Value::as_str)
+                    .any(|text| !text.trim().is_empty())
+                {
+                    bail!("description has no text fields");
+                }
+            }
+            _ => {
+                parse_plan(provider, value)?.context("provider declined without a status")?;
+            }
+        }
+        Ok("returned a protocol-valid response".to_owned())
+    });
+    match result {
+        Ok(message) => ValidationCheck {
+            name,
+            status: CheckStatus::Ok,
+            message,
+        },
+        Err(error) => failed_check(name, format!("{error:#}")),
     }
 }
 
@@ -621,6 +871,14 @@ pub fn validate_all(config: &Config, scope: &Path, name: Option<&str>) -> Result
             }];
             checks.extend(requirements_checks(&provider));
             checks.extend(provider_checks(invoke_raw(&provider, &request, config)));
+            checks.extend(provider.all_capabilities().into_iter().map(|capability| {
+                let request = validation_action_request(&provider, capability, scope);
+                validate_action_response(
+                    &provider,
+                    capability,
+                    invoke_raw(&provider, &request, config),
+                )
+            }));
             let status = if checks.iter().all(|check| check.status == CheckStatus::Ok) {
                 CheckStatus::Ok
             } else {
@@ -676,18 +934,27 @@ pub fn resolve_plan_from(
             bail!("no provider advertises capability {capability}");
         }
         let mut accepted = None;
+        let mut failures = Vec::new();
         for provider in stage {
             request["capability"] = Value::String(capability.to_string());
             request["plan"] = serde_json::to_value(&plan)?;
-            if let Some(candidate) = parse_plan(provider, invoke_raw(provider, &request, config)?)?
+            match invoke_raw(provider, &request, config)
+                .and_then(|value| parse_plan(provider, value))
             {
-                accepted = Some(candidate);
-                break;
+                Ok(Some(candidate)) => {
+                    accepted = Some(candidate);
+                    break;
+                }
+                Ok(None) => failures.push(format!("{} declined", provider.name)),
+                Err(error) => failures.push(format!("{}: {error:#}", provider.name)),
             }
         }
-        plan = Some(
-            accepted.ok_or_else(|| anyhow!("all providers declined capability {capability}"))?,
-        );
+        plan = Some(accepted.ok_or_else(|| {
+            anyhow!(
+                "no provider accepted capability {capability}: {}",
+                failures.join("; ")
+            )
+        })?);
     }
     plan.ok_or_else(|| anyhow!("provider chain for {} produced no command", action.name()))
 }
@@ -856,6 +1123,32 @@ pub fn describe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn provider_manifest(name: &str, command: &Path, priority: i64) -> Manifest {
+        Manifest {
+            version: "orc.provider/v1".into(),
+            name: name.into(),
+            description: name.into(),
+            kind: ProviderKind::Integration,
+            command: command.display().to_string(),
+            actions: BTreeMap::from([(Capability::ChangesInspect, "Inspect changes".into())]),
+            capabilities: Vec::new(),
+            requires: Requirements::default(),
+            priority,
+        }
+    }
+
+    fn write_provider(directory: &Path, name: &str, source: &str) -> PathBuf {
+        let path = directory.join(name);
+        fs::write(&path, source).expect("provider script");
+        let mut permissions = fs::metadata(&path)
+            .expect("provider metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("executable provider");
+        path
+    }
 
     #[test]
     fn discovers_nested_provider_manifests() {
@@ -936,5 +1229,120 @@ actions:
 
         assert!(plan.accepts(2));
         assert!(!plan.accepts(1));
+    }
+
+    #[test]
+    fn plan_resolution_continues_after_a_provider_error() {
+        let directory = tempfile::tempdir().expect("provider directory");
+        let broken = write_provider(directory.path(), "broken", "#!/bin/sh\nexit 7\n");
+        let working = write_provider(
+            directory.path(),
+            "working",
+            "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"version\":\"orc.provider/v1\",\"command\":[\"true\"],\"successCodes\":[0]}'\n",
+        );
+        let providers = vec![
+            provider_manifest("broken", &broken, 100),
+            provider_manifest("working", &working, 0),
+        ];
+
+        let plan = resolve_plan(
+            &Config::default(),
+            &providers,
+            Action::Changes,
+            action_request(Action::Changes, directory.path(), None, "right"),
+        )
+        .expect("lower-priority provider should handle the action");
+
+        assert_eq!(plan.command, ["true"]);
+    }
+
+    #[test]
+    fn provider_validation_rejects_missing_and_malformed_checks() {
+        for value in [
+            json!({"version": "orc.provider/v1", "status": "ok"}),
+            json!({"version": "orc.provider/v1", "checks": []}),
+            json!({
+                "version": "orc.provider/v1",
+                "checks": [{"name": 1, "status": "ok", "message": "invalid"}]
+            }),
+        ] {
+            let checks = provider_checks(Ok(value));
+            assert_eq!(checks.len(), 1);
+            assert_eq!(checks[0].status, CheckStatus::Failed);
+            assert_eq!(checks[0].name, "provider");
+        }
+    }
+
+    #[test]
+    fn validation_exercises_each_advertised_action() {
+        let directory = tempfile::tempdir().expect("provider directory");
+        let calls = directory.path().join("calls.jsonl");
+        let provider = write_provider(
+            directory.path(),
+            "provider",
+            &format!(
+                r#"#!/bin/sh
+request=$(cat)
+printf '%s\n' "$request" >> '{}'
+case "$request" in
+  *provider.validate*) printf '%s\n' '{{"version":"orc.provider/v1","checks":[{{"name":"protocol","status":"ok","message":"ready"}}]}}' ;;
+  *) printf '%s\n' '{{"version":"orc.provider/v1","command":["true"],"successCodes":[0]}}' ;;
+esac
+"#,
+                calls.display()
+            ),
+        );
+        fs::write(
+            directory.path().join("provider.yaml"),
+            format!(
+                "version: orc.provider/v1\nname: test\ncommand: {}\nactions:\n  changes.inspect: Inspect changes\n",
+                provider.display()
+            ),
+        )
+        .expect("provider manifest");
+        let mut config = Config::default();
+        config.providers.directory = directory.path().to_path_buf();
+
+        let validations = validate_all(&config, directory.path(), None).expect("validation");
+
+        assert_eq!(validations.len(), 1);
+        assert_eq!(validations[0].status, CheckStatus::Ok);
+        assert!(
+            validations[0]
+                .checks
+                .iter()
+                .any(|check| check.name == "action:changes.inspect")
+        );
+        let calls = fs::read_to_string(calls).expect("provider calls");
+        assert!(calls.contains("provider.validate"));
+        assert!(calls.contains("changes.inspect"));
+    }
+
+    #[test]
+    fn activity_tail_discards_partial_first_line() {
+        let directory = tempfile::tempdir().expect("activity directory");
+        let path = directory.path().join("activity.jsonl");
+        fs::write(&path, b"first line\nsecond line\nthird line\n").expect("activity log");
+
+        let tail = read_file_tail(&path, 20).expect("activity tail");
+
+        assert_eq!(String::from_utf8(tail).expect("utf-8 tail"), "third line\n");
+    }
+
+    #[test]
+    fn provider_cache_pruning_keeps_a_bounded_number_of_entries() {
+        let directory = tempfile::tempdir().expect("cache directory");
+        for index in 0..=MAX_PROVIDER_CACHE_ENTRIES {
+            fs::write(directory.path().join(format!("{index:03}.json")), b"{}").expect("cache");
+        }
+
+        prune_provider_cache(directory.path());
+
+        assert_eq!(
+            fs::read_dir(directory.path())
+                .expect("cache entries")
+                .count(),
+            MAX_PROVIDER_CACHE_ENTRIES
+        );
     }
 }

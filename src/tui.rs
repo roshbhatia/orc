@@ -386,7 +386,10 @@ enum BootState {
 
 enum BackgroundResult {
     Refresh(Result<(WorkspaceState, Vec<Manifest>), String>),
-    Enrichment(Result<WorkspaceState, String>),
+    Enrichment {
+        generation: u64,
+        result: Result<WorkspaceState, String>,
+    },
     Activity {
         session_id: String,
         result: Result<String, String>,
@@ -439,6 +442,8 @@ struct App {
     refresh_requested: bool,
     enrichment_inflight: bool,
     enrichment_requested: bool,
+    enrichment_due_at: Instant,
+    state_generation: u64,
     resize_at: Option<Instant>,
     hit: HitAreas,
     graph_signature: String,
@@ -473,6 +478,7 @@ impl App {
         state: WorkspaceState,
         providers: Vec<Manifest>,
     ) -> Self {
+        let enrichment_due_at = Instant::now() + enrichment_interval(&config);
         let active_run = state
             .runs
             .iter()
@@ -518,6 +524,8 @@ impl App {
             refresh_requested: false,
             enrichment_inflight: false,
             enrichment_requested: false,
+            enrichment_due_at,
+            state_generation: 0,
             resize_at: None,
             hit: HitAreas::default(),
             graph_signature: String::new(),
@@ -592,8 +600,12 @@ impl App {
     }
 
     fn rebuild(&mut self, force_layout: bool) {
+        let selected_tree_id = self.tree.get(self.tree_at).map(|row| row.id.clone());
         self.tree = tree_rows(&self.state, &self.expanded);
-        self.tree_at = self.tree_at.min(self.tree.len().saturating_sub(1));
+        self.tree_at = selected_tree_id
+            .as_deref()
+            .and_then(|id| self.tree.iter().position(|row| row.id == id))
+            .unwrap_or_else(|| self.tree_at.min(self.tree.len().saturating_sub(1)));
         self.provider_at = self.provider_at.min(self.providers.len().saturating_sub(1));
         let signature = graph_signature(&self.state, self.active_run.as_deref());
         if signature != self.graph_signature || force_layout {
@@ -609,12 +621,12 @@ impl App {
             self.graph_items = items;
             self.graph_signature = signature;
         } else {
-            refresh_flow_content(&mut self.flow, &self.state);
+            refresh_flow_content(&mut self.flow, &self.state, self.active_run.as_deref());
         }
     }
 
     fn request_refresh(&mut self, tx: &Sender<BackgroundResult>) {
-        if self.refresh_inflight {
+        if self.refresh_inflight || self.enrichment_inflight {
             self.refresh_requested = true;
             return;
         }
@@ -632,7 +644,7 @@ impl App {
     }
 
     fn request_enrichment(&mut self, tx: &Sender<BackgroundResult>) {
-        if self.enrichment_inflight || !self.enrichment_requested {
+        if !self.enrichment_ready(Instant::now()) {
             return;
         }
         self.enrichment_inflight = true;
@@ -640,10 +652,17 @@ impl App {
         let config = self.config.clone();
         let scope = self.scope.clone();
         let tx = tx.clone();
+        let generation = self.state_generation;
         thread::spawn(move || {
             let result = control::reconcile(&config, &scope).map_err(|error| format!("{error:#}"));
-            let _ = tx.send(BackgroundResult::Enrichment(result));
+            let _ = tx.send(BackgroundResult::Enrichment { generation, result });
         });
+    }
+
+    fn enrichment_ready(&self, now: Instant) -> bool {
+        !self.enrichment_inflight
+            && !self.refresh_inflight
+            && (self.enrichment_requested || now >= self.enrichment_due_at)
     }
 
     fn apply_background(&mut self, result: BackgroundResult) {
@@ -655,6 +674,7 @@ impl App {
                     Ok((state, providers)) => {
                         let first_load = matches!(self.boot, BootState::Loading { .. });
                         self.state = state;
+                        self.state_generation = self.state_generation.wrapping_add(1);
                         self.providers = providers;
                         if first_load {
                             self.expanded = default_expansions(&self.state);
@@ -696,14 +716,25 @@ impl App {
                     }
                 }
             }
-            BackgroundResult::Enrichment(result) => {
+            BackgroundResult::Enrichment { generation, result } => {
                 self.enrichment_inflight = false;
+                if generation != self.state_generation {
+                    self.enrichment_due_at =
+                        Instant::now() + enrichment_retry_interval(&self.config);
+                    return;
+                }
                 match result {
                     Ok(state) => {
                         self.state = state;
+                        self.state_generation = self.state_generation.wrapping_add(1);
+                        self.enrichment_due_at = Instant::now() + enrichment_interval(&self.config);
                         self.rebuild(false);
                     }
-                    Err(error) => self.set_status(format!("session discovery failed: {error}")),
+                    Err(error) => {
+                        self.enrichment_due_at =
+                            Instant::now() + enrichment_retry_interval(&self.config);
+                        self.set_status(format!("session discovery failed: {error}"));
+                    }
                 }
             }
             BackgroundResult::Activity { session_id, result } => {
@@ -989,19 +1020,20 @@ impl App {
             let scope = self.scope.clone();
             let tx = tx.clone();
             thread::spawn(move || {
-                let result = control::attach(&config, &scope, &session.id, Action::Attach, "right")
-                    .and_then(|outcome| {
-                        if outcome.code == 0 {
-                            let verb = match outcome.disposition {
-                                control::AttachDisposition::Focused => "focused",
-                                control::AttachDisposition::Launched => "launch requested for",
-                            };
-                            Ok(format!("{verb} {}", session.title))
-                        } else {
-                            anyhow::bail!("attach exited with {}", outcome.code)
-                        }
-                    })
-                    .map_err(|error| format!("{error:#}"));
+                let result =
+                    control::attach_quiet(&config, &scope, &session.id, Action::Attach, "right")
+                        .and_then(|outcome| {
+                            if outcome.code == 0 {
+                                let verb = match outcome.disposition {
+                                    control::AttachDisposition::Focused => "focused",
+                                    control::AttachDisposition::Launched => "launch requested for",
+                                };
+                                Ok(format!("{verb} {}", session.title))
+                            } else {
+                                anyhow::bail!("attach exited with {}", outcome.code)
+                            }
+                        })
+                        .map_err(|error| format!("{error:#}"));
                 let _ = tx.send(BackgroundResult::Action(result));
             });
         } else if self.main_tab == MainTab::Integrations {
@@ -1422,6 +1454,16 @@ impl App {
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         let x = mouse.column;
         let y = mouse.row;
+        if self.main_tab == MainTab::Work
+            && self.explorer_view == ExplorerView::Graph
+            && matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+            && self.flow.is_dragging()
+        {
+            let _ = self.flow.handle_mouse_event(mouse);
+            clamp_flow_viewport(&mut self.flow);
+            self.inspector_scroll = 0;
+            return;
+        }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && contains(self.hit.tabs, x, y)
         {
@@ -1601,6 +1643,19 @@ fn inspector_tabs(item: Option<&ItemRef>) -> &'static [(OutputTab, &'static str)
     }
 }
 
+fn enrichment_interval(config: &Config) -> Duration {
+    Duration::from_millis(
+        config
+            .cache
+            .provider_ttl_ms
+            .max(config.ui.activity_refresh_ms),
+    )
+}
+
+fn enrichment_retry_interval(config: &Config) -> Duration {
+    Duration::from_millis(config.ui.refresh_ms.clamp(500, 5_000))
+}
+
 fn default_expansions(state: &WorkspaceState) -> BTreeSet<String> {
     state
         .sessions
@@ -1757,8 +1812,17 @@ fn add_session_card(
     items.insert(id, ItemRef::Session(session.id.clone()));
 }
 
-fn refresh_flow_content(flow: &mut AgentFlow, state: &WorkspaceState) {
+fn refresh_flow_content(flow: &mut AgentFlow, state: &WorkspaceState, active_run: Option<&str>) {
+    let active_run = active_run.and_then(|id| state.runs.iter().find(|run| run.id == id));
+    let active_orchestrator = active_run
+        .and_then(|run| run.orchestrator_id.as_deref())
+        .and_then(|id| state.sessions.iter().find(|session| session.id == id))
+        .or_else(|| state.current_session());
+    let orchestrator_id = active_orchestrator.map(|session| session.id.as_str());
     for session in &state.sessions {
+        if orchestrator_id == Some(session.id.as_str()) {
+            continue;
+        }
         if let Some(card) = flow.node_content_mut(&format!("session:{}", session.id)) {
             card.title.clone_from(&session.title);
             card.kind = session.role.to_string();
@@ -1769,7 +1833,25 @@ fn refresh_flow_content(flow: &mut AgentFlow, state: &WorkspaceState) {
         }
     }
     for run in &state.runs {
-        if let Some(card) = flow.node_content_mut(&format!("run:{}", run.id)) {
+        if active_run.is_some_and(|active| active.id == run.id) {
+            let orchestrator = active_orchestrator;
+            let root_id = orchestrator
+                .map(|session| format!("session:{}", session.id))
+                .unwrap_or_else(|| format!("run:{}", run.id));
+            if let Some(card) = flow.node_content_mut(&root_id) {
+                card.kind = "orchestrator".into();
+                card.title = orchestrator
+                    .map_or_else(|| "Orchestrator".into(), |session| session.title.clone());
+                card.subtitle = format!("{} · {} stages", run_phase(run), run.nodes.len());
+                card.goal.clone_from(&run.goal);
+                card.status = orchestrator.map_or(run.status, |session| session.status);
+                card.active = orchestrator.and_then(RuntimeActivity::for_session)
+                    == Some(RuntimeActivity::Active);
+            }
+        }
+        if !active_run.is_some_and(|active| active.id == run.id)
+            && let Some(card) = flow.node_content_mut(&format!("run:{}", run.id))
+        {
             card.title.clone_from(&run.name);
             card.subtitle = format!("{} stages · {}", run.nodes.len(), run_phase(run));
             card.goal.clone_from(&run.goal);
@@ -1969,21 +2051,13 @@ fn build_flow(
         orchestration_edges.extend(
             run.nodes
                 .iter()
-                .filter(|node| {
-                    node.status == LifecycleStatus::Done
-                        && node.completion == CompletionTarget::Orchestrator
-                        && !run.edges.iter().any(|edge| {
-                            edge.from == node.id
-                                && edge.relationship != "feedback"
-                                && edge.relationship != "reports"
-                        })
-                })
+                .filter(|node| node.completion == CompletionTarget::Orchestrator)
                 .map(|node| {
                     (
                         format!("node:{}:{}", run.id, node.id),
                         root_id.clone(),
                         "reports".into(),
-                        true,
+                        node.status == LifecycleStatus::Done,
                     )
                 }),
         );
@@ -3853,6 +3927,89 @@ mod tests {
     }
 
     #[test]
+    fn refresh_preserves_tree_and_graph_selection_by_stable_id() {
+        let mut app = app();
+        app.tree_at = app
+            .tree
+            .iter()
+            .position(|row| row.id == "session:native-child")
+            .expect("child row");
+        app.state
+            .sessions
+            .insert(0, session("another-root", None, "codex"));
+        app.rebuild(false);
+        assert_eq!(app.tree[app.tree_at].id, "session:native-child");
+
+        let mut run = workflow_run();
+        run.nodes
+            .push(workflow_node("implement", LifecycleStatus::Working, 1));
+        app.state.runs.push(run);
+        app.active_run = Some("run".into());
+        app.explorer_view = ExplorerView::Graph;
+        app.rebuild(true);
+        app.flow.select_node("node:run:implement");
+        app.state.sessions[0].status = LifecycleStatus::Done;
+        app.rebuild(false);
+        assert!(
+            matches!(app.selected(), Some(ItemRef::Node(run, node)) if run == "run" && node == "implement")
+        );
+    }
+
+    #[test]
+    fn refresh_preserves_workflow_data_on_the_orchestrator_card() {
+        let mut app = app();
+        let mut run = workflow_run();
+        run.orchestrator_id = None;
+        run.nodes
+            .push(workflow_node("implement", LifecycleStatus::Queued, 1));
+        app.state.runs.push(run);
+        app.active_run = Some("run".into());
+        app.rebuild(true);
+
+        app.state.sessions[0].goal = "Raw session goal".into();
+        app.state.runs[0].goal = "Current workflow goal".into();
+        app.rebuild(false);
+
+        let root = app
+            .flow
+            .nodes()
+            .find(|node| node.id == "session:root")
+            .expect("orchestrator card");
+        assert_eq!(root.content.goal, "Current workflow goal");
+        assert_eq!(root.content.subtitle, "proposed · 1 stages");
+    }
+
+    #[test]
+    fn enrichment_retries_and_rejects_stale_results() {
+        let mut app = app();
+        let now = Instant::now();
+        app.enrichment_requested = false;
+        app.enrichment_due_at = now + Duration::from_secs(30);
+        assert!(!app.enrichment_ready(now));
+        assert!(app.enrichment_ready(now + Duration::from_secs(31)));
+
+        app.state_generation = 2;
+        app.enrichment_inflight = true;
+        let mut stale = app.state.clone();
+        stale.sessions[0].title = "stale title".into();
+        app.apply_background(BackgroundResult::Enrichment {
+            generation: 1,
+            result: Ok(stale),
+        });
+        assert_eq!(app.state.sessions[0].title, "root");
+        assert!(!app.enrichment_inflight);
+        assert!(app.enrichment_due_at > Instant::now());
+
+        app.enrichment_inflight = true;
+        app.apply_background(BackgroundResult::Enrichment {
+            generation: 2,
+            result: Err("provider unavailable".into()),
+        });
+        assert!(app.status.contains("provider unavailable"));
+        assert!(app.enrichment_due_at > Instant::now());
+    }
+
+    #[test]
     fn graph_signature_tracks_runtime_edge_state() {
         let mut state = WorkspaceState::empty("/tmp/orc-test".into());
         let mut run = workflow_run();
@@ -4022,6 +4179,75 @@ mod tests {
         assert_eq!(plain().fg, Some(Color::Reset));
         assert_eq!(dim().fg, Some(Color::Reset));
         assert!(dim().add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn planned_report_edge_activates_only_after_completion() {
+        let mut state = app().state;
+        let mut run = workflow_run();
+        run.nodes
+            .push(workflow_node("implement", LifecycleStatus::Queued, 1));
+        let mut verifier = workflow_node("verify", LifecycleStatus::Queued, 1);
+        verifier.completion = CompletionTarget::Judge;
+        run.nodes.push(verifier);
+        run.edges.push(crate::domain::WorkflowEdge {
+            from: "implement".into(),
+            to: "verify".into(),
+            relationship: "reviewed_by".into(),
+        });
+        state.runs.push(run);
+
+        let (flow, _) = build_flow(&state, Some("run"));
+        let reports = flow
+            .edges()
+            .iter()
+            .find(|edge| edge.content.relation == "reports")
+            .expect("planned report edge");
+        assert_eq!(reports.source, "node:run:implement");
+        assert_eq!(reports.target, "session:root");
+        assert!(!reports.content.active);
+
+        state.runs[0].nodes[0].status = LifecycleStatus::Done;
+        let (flow, _) = build_flow(&state, Some("run"));
+        let reports = flow
+            .edges()
+            .iter()
+            .find(|edge| edge.content.relation == "reports")
+            .expect("completed report edge");
+        assert!(reports.content.active);
+    }
+
+    #[test]
+    fn mouse_release_outside_graph_ends_pan_and_clamps() {
+        let mut app = app();
+        let mut run = workflow_run();
+        run.nodes
+            .push(workflow_node("implement", LifecycleStatus::Queued, 1));
+        app.state.runs.push(run);
+        app.active_run = Some("run".into());
+        app.explorer_view = ExplorerView::Graph;
+        app.rebuild(true);
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("graph renders");
+        let graph = app.hit.graph;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: graph.right().saturating_sub(2),
+            row: graph.bottom().saturating_sub(2),
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.flow.is_dragging());
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!app.flow.is_dragging());
     }
 
     #[test]

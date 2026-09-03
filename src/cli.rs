@@ -525,6 +525,7 @@ fn hook_context(input: bool) -> Result<serde_json::Value> {
 }
 
 fn register(config: &Config, mut args: RegisterArgs) -> Result<Option<String>> {
+    let invoked_by_hook = args.hook_input;
     let hook = hook_context(args.hook_input)?;
     if let Some(directory) = hook
         .get("cwd")
@@ -573,7 +574,10 @@ fn register(config: &Config, mut args: RegisterArgs) -> Result<Option<String>> {
             source: args.source,
         },
     )?;
-    let _ = control::reconcile_with_current(config, &args.scope.scope, true);
+    // Defer provider enrichment because harness hooks have strict latency budgets.
+    if !invoked_by_hook {
+        let _ = control::reconcile_with_current(config, &args.scope.scope, true);
+    }
     Ok((!args.quiet).then_some(session.id))
 }
 

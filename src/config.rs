@@ -1,5 +1,8 @@
 use std::{env, fs, path::PathBuf, time::Duration};
 
+#[cfg(test)]
+use std::sync::OnceLock;
+
 use anyhow::{Context, Result, bail};
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
@@ -94,10 +97,20 @@ pub fn data_home() -> PathBuf {
 }
 
 pub fn state_home() -> PathBuf {
-    env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from(".local/state"))
+    #[cfg(test)]
+    {
+        static TEST_STATE_HOME: OnceLock<PathBuf> = OnceLock::new();
+        TEST_STATE_HOME
+            .get_or_init(|| env::temp_dir().join(format!("orc-tests-{}", std::process::id())))
+            .clone()
+    }
+    #[cfg(not(test))]
+    {
+        env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+            .unwrap_or_else(|| PathBuf::from(".local/state"))
+    }
 }
 
 pub fn path() -> PathBuf {
