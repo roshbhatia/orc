@@ -35,7 +35,7 @@
           "type": "integer"
         },
         "inspectorPercent": {
-          "default": 38,
+          "default": 28,
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0,
@@ -89,7 +89,7 @@
       "$ref": "#/$defs/UiConfig",
       "default": {
         "activityRefreshMs": 10000,
-        "inspectorPercent": 38,
+        "inspectorPercent": 28,
         "refreshMs": 5000
       }
     },

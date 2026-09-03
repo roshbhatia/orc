@@ -4,6 +4,7 @@ status          {{ run.status }}
 goal            {{ run.goal }}
 expected output {{ run.expectedOutput }}
 stages          {{ run.nodes | length }}
-definition      {% if run.definition %}{{ run.definition }}{% else %}dynamic{% endif %}
-revision        {% if run.revision %}{{ run.revision }}{% else %}uncommitted{% endif %}
-run             {{ run.id }}
+{% if run.currentNode %}current stage   {{ run.currentNode }}
+{% endif %}{% if run.pendingGates %}needs attention
+{% for gate in run.pendingGates %}  - {{ gate.reason }}
+{% endfor %}{% endif %}

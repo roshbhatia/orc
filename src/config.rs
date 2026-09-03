@@ -74,7 +74,7 @@ impl Default for UiConfig {
         Self {
             refresh_ms: 5_000,
             activity_refresh_ms: 10_000,
-            inspector_percent: 38,
+            inspector_percent: 28,
         }
     }
 }

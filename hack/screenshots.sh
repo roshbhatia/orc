@@ -8,12 +8,25 @@ fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
 
 mkdir -p "$repo_dir/docs"
-mkdir -p "$fixture/config/providers" "$fixture/repo" "$fixture/state"
+mkdir -p "$fixture/state"
 
-package=$(nix build --accept-flake-config --no-link --print-out-paths .#full)
-export ORC_PROVIDER_DIR="$package/share/orc/providers"
-export ORC_SCREENSHOT_BIN="$package/bin/orc"
-export ORC_SCREENSHOT_SCOPE="$fixture/repo"
+if [[ -z ${ORC_SCREENSHOT_BIN:-} ]]; then
+  package=$(
+    nix build \
+      --accept-flake-config \
+      --option eval-cache false \
+      --no-link \
+      --print-out-paths \
+      .#full
+  )
+  export ORC_PROVIDER_DIR="$package/share/orc/providers"
+  export ORC_SCREENSHOT_BIN="$package/bin/orc"
+fi
+if [[ -z ${ORC_PROVIDER_DIR:-} ]]; then
+  printf 'ORC_PROVIDER_DIR is required when ORC_SCREENSHOT_BIN is set\n' >&2
+  exit 2
+fi
+export ORC_SCREENSHOT_SCOPE="$repo_dir/examples/provider-migration"
 export XDG_STATE_HOME="$fixture/state"
 
 orchestrator=$(
@@ -99,6 +112,7 @@ critic=$(
   --expected-output "Passing tests and typed providers" \
   --success "All direct imports are removed" \
   --session "$implementer" \
+  --review-by review \
   --depends-on research \
   --status working > /dev/null
 
@@ -117,5 +131,13 @@ critic=$(
   --status queued > /dev/null
 
 vhs hack/orc.tape --output "$repo_dir/docs/orc.gif"
-ffmpeg -y -loglevel error -sseof -1 -i "$repo_dir/docs/orc.gif" -frames:v 1 -update 1 "$repo_dir/docs/orc.png"
 vhs hack/orc-noninteractive.tape --output "$repo_dir/docs/orc-noninteractive.gif"
+vhs hack/orc-loading.tape --output "$fixture/orc-loading.gif"
+ffmpeg -y \
+  -ss 0.2 \
+  -i "$fixture/orc-loading.gif" \
+  -filter_complex \
+  "fps=25,split[frames][palette_source];[palette_source]palettegen=max_colors=256[palette];[frames][palette]paletteuse=dither=bayer:bayer_scale=3" \
+  -loop 0 \
+  "$repo_dir/docs/orc-loading.gif" \
+  > /dev/null 2>&1

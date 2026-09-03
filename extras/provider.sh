@@ -292,11 +292,46 @@ case "$provider_kind:$capability" in
     emit_plan_with_codes '[0, 2]' "$scope" '{}' "$executable" "${traces_args[@]}"
     ;;
   wezterm:session.bind)
-    if current_session_matches && [[ -n ${WEZTERM_PANE:-} ]]; then
+    require_command wezterm || {
+      emit_declined "wezterm is unavailable"
+      exit 0
+    }
+    executable=$provider_command
+    existing_ref=$(jq -r '
+      first(
+        .session.providers[]?
+        | select(.provider == "wezterm" and .kind == "display" and .status == "active")
+        | .ref
+      ) // empty
+    ' <<< "$request")
+    rebind_current=$(jq -r '.rebindCurrent // false' <<< "$request")
+    existing_pane=false
+    if [[ $existing_ref =~ ^[0-9]+$ ]] && "$executable" cli --no-auto-start list --format json 2> /dev/null |
+      jq -e --argjson pane "$existing_ref" 'any(.[]; .pane_id == $pane)' > /dev/null; then
+      existing_pane=true
+    fi
+    if [[ $rebind_current == true ]] && current_session_matches && [[ -n ${WEZTERM_PANE:-} ]]; then
       emit_binding "display" "active" "$WEZTERM_PANE" "WezTerm pane $WEZTERM_PANE"
+    elif [[ $existing_pane == true ]]; then
+      emit_binding "display" "active" "$existing_ref" "WezTerm pane $existing_ref"
     else
       emit_binding "display" "available" "" "WezTerm split"
     fi
+    ;;
+  wezterm:terminal.focus)
+    require_command wezterm || {
+      emit_declined "wezterm is unavailable"
+      exit 0
+    }
+    executable=$provider_command
+    pane_id=$(jq -er '
+      first(
+        .session.providers[]?
+        | select(.provider == "wezterm" and .kind == "display" and .status == "active")
+        | .ref
+      ) | select(type == "string" and length > 0)
+    ' <<< "$request")
+    emit_plan "$scope" '{}' "$executable" cli --no-auto-start activate-pane --pane-id "$pane_id"
     ;;
   wezterm:terminal.open)
     require_command wezterm || {
@@ -315,17 +350,41 @@ case "$provider_kind:$capability" in
     prior_cwd=$(jq -er '.plan.cwd // .scope' <<< "$request")
     prior_environment=$(jq -ce '.plan.environment // {} | objects' <<< "$request")
     read_command '.plan.command'
-    split_command=("$executable" cli --no-auto-start split-pane "--$direction" --cwd "$prior_cwd")
+    columns=0
     if [[ -n ${WEZTERM_PANE:-} ]]; then
-      split_command+=(--pane-id "$WEZTERM_PANE")
+      columns=$("$executable" cli --no-auto-start list --format json 2> /dev/null |
+        jq -r --argjson pane "$WEZTERM_PANE" 'first(.[] | select(.pane_id == $pane) | .size.cols) // 0')
+    fi
+    if ((columns > 0 && columns < 160)); then
+      split_command=("$executable" cli --no-auto-start spawn --cwd "$prior_cwd")
+    else
+      split_command=("$executable" cli --no-auto-start split-pane "--$direction" --cwd "$prior_cwd")
+      if [[ -n ${WEZTERM_PANE:-} ]]; then
+        split_command+=(--pane-id "$WEZTERM_PANE")
+      fi
     fi
     split_command+=(-- "${ORC_PROVIDER_HOLD:?}" "${command[@]}")
     emit_plan "$scope" "$prior_environment" "${split_command[@]}"
     ;;
   zmx:session.bind)
-    if current_session_matches && [[ -n ${ZMX_SESSION:-} ]]; then
+    existing_ref=$(jq -r '
+      first(
+        .session.providers[]?
+        | select(.provider == "zmx" and .kind == "persistence" and .status == "active")
+        | .ref
+      ) // empty
+    ' <<< "$request")
+    rebind_current=$(jq -r '.rebindCurrent // false' <<< "$request")
+    existing_session=false
+    if [[ -n $existing_ref ]] && command -v zmx > /dev/null &&
+      zmx list --short 2> /dev/null | grep -Fx -- "$existing_ref" > /dev/null; then
+      existing_session=true
+    fi
+    if [[ $rebind_current == true ]] && current_session_matches && [[ -n ${ZMX_SESSION:-} ]]; then
       zmx_session=${ZMX_SESSION#"${ZMX_SESSION_PREFIX:-}"}
       emit_binding "persistence" "active" "$zmx_session" "Zmx session $zmx_session"
+    elif [[ $existing_session == true ]]; then
+      emit_binding "persistence" "active" "$existing_ref" "Zmx session $existing_ref"
     else
       emit_binding "persistence" "available" "" "Zmx on next launch"
     fi

@@ -1,13 +1,12 @@
 {{ node.name }}
 
-role            {{ node.role }}
-harness         {{ node.harness }}
-model           {% if node.model %}{{ node.model }}{% else %}default{% endif %}
-status          {{ node.status }}
 purpose         {{ node.purpose }}
 goal            {{ node.goal }}
 expected output {{ node.expectedOutput }}
-success         {% if node.successCriteria %}{{ node.successCriteria | join("; ") }}{% else %}unspecified{% endif %}
-completion      {{ node.completion }}
-review by       {% if node.reviewBy %}{{ node.reviewBy }}{% else %}orchestrator{% endif %}
-session         {% if node.sessionId %}{{ node.sessionId }}{% else %}unassigned{% endif %}
+{% if node.successCriteria %}success criteria
+{% for criterion in node.successCriteria %}  - {{ criterion }}
+{% endfor %}{% endif %}
+execution
+  {{ node.role }} · {{ node.harness }}{% if node.model %}/{{ node.model }}{% endif %} · {{ node.status }}
+  attempt       {{ node.attempt }}
+  reports to    {% if node.reviewBy %}{{ node.reviewBy }}{% else %}{{ node.completion }}{% endif %}

@@ -337,5 +337,10 @@ impl WorkspaceState {
                     .filter(|session| session.role == SessionRole::Orchestrator)
                     .max_by_key(|session| session.updated_at)
             })
+            .or_else(|| {
+                self.active_sessions()
+                    .filter(|session| session.parent_id.is_none())
+                    .max_by_key(|session| session.updated_at)
+            })
     }
 }

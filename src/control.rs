@@ -102,7 +102,7 @@ pub fn read_workspace(scope: &Path) -> Result<WorkspaceState> {
     state::read(&scope)
 }
 
-pub fn register(scope: &Path, contract: Contract, link: SessionLink) -> Result<Session> {
+pub fn register(scope: &Path, mut contract: Contract, link: SessionLink) -> Result<Session> {
     let scope = state::resolve_scope(scope)?;
     let native_id = link.native_id.unwrap_or_else(inferred_native_id);
     let base_id = link
@@ -133,20 +133,32 @@ pub fn register(scope: &Path, contract: Contract, link: SessionLink) -> Result<S
                     base_id.clone()
                 }
             });
-        let parent_id = link
+        let explicit_parent = link
             .parent_id
             .clone()
-            .or_else(|| env::var("ORC_PARENT_SESSION_ID").ok())
-            .or_else(|| {
-                (contract.role != SessionRole::Orchestrator)
-                    .then(|| {
-                        workspace
-                            .active_sessions()
-                            .find(|session| session.role == SessionRole::Orchestrator)
-                            .map(|session| session.id.clone())
-                    })
-                    .flatten()
-            });
+            .or_else(|| env::var("ORC_PARENT_SESSION_ID").ok());
+        let active_orchestrator = workspace
+            .active_sessions()
+            .find(|session| {
+                session.role == SessionRole::Orchestrator
+                    && current
+                        .as_ref()
+                        .is_none_or(|current| session.id != current.id)
+            })
+            .map(|session| session.id.clone());
+        if contract.role == SessionRole::Worker
+            && explicit_parent.is_none()
+            && link.run_id.is_none()
+            && link.node_id.is_none()
+            && active_orchestrator.is_none()
+        {
+            contract.role = SessionRole::Orchestrator;
+        }
+        let parent_id = explicit_parent.or_else(|| {
+            (contract.role != SessionRole::Orchestrator)
+                .then_some(active_orchestrator)
+                .flatten()
+        });
         let now = Utc::now();
         let session = Session {
             id,
@@ -291,46 +303,58 @@ pub fn prune(config: &Config, scope: &Path, id: &str) -> Result<Session> {
 }
 
 pub fn reconcile(config: &Config, scope: &Path) -> Result<WorkspaceState> {
+    reconcile_with_current(config, scope, false)
+}
+
+pub fn reconcile_with_current(
+    config: &Config,
+    scope: &Path,
+    rebind_current: bool,
+) -> Result<WorkspaceState> {
     let scope = state::resolve_scope(scope)?;
     let providers = provider::discover(config)?;
     let snapshot = state::read(&scope)?;
-    for session in snapshot
+    let enrichments = snapshot
         .sessions
         .iter()
         .filter(|session| session.status != LifecycleStatus::Archived)
-    {
-        let bindings = provider::discover_bindings(config, &providers, &scope, session);
-        let (title, goal) = provider::describe(config, &providers, &scope, session);
-        if bindings.is_empty() && title.is_none() && goal.is_none() {
-            continue;
-        }
-        let id = session.id.clone();
-        state::update(&scope, |workspace| {
+        .filter_map(|session| {
+            let bindings =
+                provider::discover_bindings(config, &providers, &scope, session, rebind_current);
+            let (title, goal) = provider::describe(config, &providers, &scope, session);
+            (!bindings.is_empty() || title.is_some() || goal.is_some())
+                .then(|| (session.id.clone(), bindings, title, goal))
+        })
+        .collect::<Vec<_>>();
+    if enrichments.is_empty() {
+        return Ok(snapshot);
+    }
+    state::update(&scope, |workspace| {
+        for (id, bindings, title, goal) in &enrichments {
             let selected = workspace
                 .sessions
                 .iter_mut()
-                .find(|candidate| candidate.id == id)
+                .find(|candidate| candidate.id == *id)
                 .context("session disappeared")?;
-            for binding in bindings.clone() {
+            for binding in bindings {
                 selected.providers.retain(|candidate| {
                     candidate.provider != binding.provider || candidate.kind != binding.kind
                 });
-                selected.providers.push(binding);
+                selected.providers.push(binding.clone());
             }
-            if let Some(title) = &title
+            if let Some(title) = title
                 && (selected.title == "Agent session" || selected.title == selected.id)
             {
                 selected.title.clone_from(title);
             }
-            if let Some(goal) = &goal
+            if let Some(goal) = goal
                 && selected.goal == "Complete the assigned work"
             {
                 selected.goal.clone_from(goal);
             }
-            Ok(())
-        })?;
-    }
-    state::read(&scope)
+        }
+        Ok(workspace.clone())
+    })
 }
 
 pub fn create_run(
@@ -575,14 +599,54 @@ pub fn attach(
     id: &str,
     action: provider::Action,
     direction: &str,
-) -> Result<i32> {
+) -> Result<AttachOutcome> {
     let scope = state::resolve_scope(scope)?;
     let workspace = state::read(&scope)?;
     let session = selected_session(&workspace, id)?;
     let providers = provider::discover(config)?;
+    let (action, disposition) = if action == provider::Action::Attach
+        && session.providers.iter().any(|binding| {
+            binding.kind == crate::domain::ProviderKind::Display
+                && binding.status == crate::domain::BindingStatus::Active
+                && binding
+                    .r#ref
+                    .as_ref()
+                    .is_some_and(|value| !value.is_empty())
+        }) {
+        (provider::Action::Focus, AttachDisposition::Focused)
+    } else {
+        (action, AttachDisposition::Launched)
+    };
+    let has_persistent_process = session.providers.iter().any(|binding| {
+        binding.kind == crate::domain::ProviderKind::Persistence
+            && binding.status == crate::domain::BindingStatus::Active
+            && binding
+                .r#ref
+                .as_ref()
+                .is_some_and(|value| !value.is_empty())
+    });
+    if action == provider::Action::Attach && session.status.active() && !has_persistent_process {
+        anyhow::bail!(
+            "{} is active, but no display can focus it and no persistent process can reattach it; inspect it or stop it before resuming",
+            session.title
+        );
+    }
     let request = provider::action_request(action, &scope, Some(session), direction);
     let plan = provider::resolve_plan(config, &providers, action, request)?;
-    provider::execute_plan(&plan, &scope, true)
+    let code = provider::execute_plan(&plan, &scope, false)?;
+    Ok(AttachOutcome { code, disposition })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachDisposition {
+    Focused,
+    Launched,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttachOutcome {
+    pub code: i32,
+    pub disposition: AttachDisposition,
 }
 
 pub fn launch(

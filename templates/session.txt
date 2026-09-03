@@ -1,19 +1,15 @@
 {{ session.title }}
 
-role            {{ session.role }}
-harness         {{ session.harness }}
-model           {% if session.model %}{{ session.model }}{% else %}default{% endif %}
-status          {{ session.status }}
 purpose         {{ session.purpose }}
 goal            {{ session.goal }}
 expected output {{ session.expectedOutput }}
-success         {% if session.successCriteria %}{{ session.successCriteria | join("; ") }}{% else %}unspecified{% endif %}
-completion      {{ session.completion }}
-native session  {{ session.nativeId }}
-orc session     {{ session.id }}
-parent          {% if session.parentId %}{{ session.parentId }}{% else %}root{% endif %}
+{% if session.successCriteria %}success criteria
+{% for criterion in session.successCriteria %}  - {{ criterion }}
+{% endfor %}{% endif %}
+runtime
+  {{ session.role }} · {{ session.harness }}{% if session.model %}/{{ session.model }}{% endif %} · {{ session.status }}
+  reports to    {% if session.reviewBy %}{{ session.reviewBy }}{% else %}{{ session.completion }}{% endif %}
 
-providers
+integrations
 {% for binding in session.providers %}  {{ binding.kind }}  {{ binding.provider }} · {{ binding.status }} · {{ binding.label }}
-{% else %}  none
 {% endfor %}

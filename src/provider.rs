@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Instant,
@@ -41,6 +41,8 @@ pub enum Capability {
     SessionStop,
     #[serde(rename = "terminal.open")]
     TerminalOpen,
+    #[serde(rename = "terminal.focus")]
+    TerminalFocus,
     #[serde(rename = "execution.run")]
     ExecutionRun,
     #[serde(rename = "execution.cancel")]
@@ -152,12 +154,13 @@ pub struct Validation {
     pub checks: Vec<ValidationCheck>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
     Activity,
     Attach,
     Changes,
     Execute,
+    Focus,
     Inspect,
     Launch,
     Guide,
@@ -175,6 +178,7 @@ impl Action {
             ],
             Self::Changes => &[(Capability::ChangesInspect, false)],
             Self::Execute => &[(Capability::ExecutionRun, false)],
+            Self::Focus => &[(Capability::TerminalFocus, false)],
             Self::Inspect => &[
                 (Capability::SessionInspect, false),
                 (Capability::TerminalOpen, false),
@@ -195,6 +199,7 @@ impl Action {
             Self::Attach => "attach",
             Self::Changes => "changes",
             Self::Execute => "execute",
+            Self::Focus => "focus",
             Self::Inspect => "inspect",
             Self::Launch => "launch",
             Self::Guide => "guide",
@@ -273,11 +278,13 @@ fn candidates(providers: &[Manifest], capability: Capability) -> Vec<&Manifest> 
 
 fn invoke_raw(provider: &Manifest, request: &Value, config: &Config) -> Result<Value> {
     let started = Instant::now();
+    let stdout = tempfile::NamedTempFile::new().context("create provider stdout buffer")?;
+    let stderr = tempfile::NamedTempFile::new().context("create provider stderr buffer")?;
     let child = Command::new(&provider.command)
         .current_dir(request.get("scope").and_then(Value::as_str).unwrap_or("."))
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout.reopen()?))
+        .stderr(Stdio::from(stderr.reopen()?))
         .spawn();
     let mut child = match child {
         Ok(child) => child,
@@ -312,18 +319,8 @@ fn invoke_raw(provider: &Manifest, request: &Value, config: &Config) -> Result<V
             bail!("{} timed out", provider.name);
         }
     };
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    child
-        .stdout
-        .take()
-        .context("provider stdout")?
-        .read_to_string(&mut stdout)?;
-    child
-        .stderr
-        .take()
-        .context("provider stderr")?
-        .read_to_string(&mut stderr)?;
+    let stdout = String::from_utf8_lossy(&fs::read(stdout.path())?).into_owned();
+    let stderr = String::from_utf8_lossy(&fs::read(stderr.path())?).into_owned();
     record_invocation(
         provider,
         request,
@@ -751,11 +748,13 @@ pub fn discover_bindings(
     providers: &[Manifest],
     scope: &Path,
     session: &Session,
+    rebind_current: bool,
 ) -> Vec<ProviderBinding> {
     candidates(providers, Capability::SessionBind).into_iter().filter_map(|provider| {
         let request = json!({
             "version": "orc.provider/v1", "action": "bind", "capability": Capability::SessionBind,
             "scope": scope, "session": session, "plan": null,
+            "rebindCurrent": rebind_current,
         });
         let value = invoke_raw(provider, &request, config).ok()?;
         if value.get("status").and_then(Value::as_str) == Some("declined") { return None; }
@@ -809,6 +808,14 @@ mod tests {
     fn attach_chain_composes_three_capabilities() {
         assert_eq!(Action::Attach.stages().len(), 3);
         assert!(Action::Attach.stages()[1].1);
+    }
+
+    #[test]
+    fn focus_uses_only_the_display_integration() {
+        assert_eq!(
+            Action::Focus.stages(),
+            &[(Capability::TerminalFocus, false)]
+        );
     }
 
     #[test]

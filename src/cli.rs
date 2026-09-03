@@ -30,7 +30,7 @@ pub struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     #[command(about = "Open the control plane")]
-    Tui(ScopeArgs),
+    Tui(TuiArgs),
     #[command(about = "Show workspace status")]
     Status(OutputArgs),
     #[command(about = "List registered sessions")]
@@ -91,6 +91,14 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
+}
+
+#[derive(Args)]
+struct TuiArgs {
+    #[command(flatten)]
+    scope: ScopeArgs,
+    #[arg(long, hide = true)]
+    loading_preview: bool,
 }
 
 #[derive(Clone, Args)]
@@ -401,7 +409,7 @@ struct LaunchArgs {
     args: Vec<String>,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum SplitDirection {
     Right,
     Left,
@@ -410,12 +418,12 @@ enum SplitDirection {
 }
 impl std::fmt::Display for SplitDirection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", format!("{self:?}").to_lowercase())
-    }
-}
-impl std::fmt::Debug for SplitDirection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self, f)
+        f.write_str(match self {
+            Self::Right => "right",
+            Self::Left => "left",
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+        })
     }
 }
 
@@ -515,7 +523,7 @@ fn register(config: &Config, mut args: RegisterArgs) -> Result<Option<String>> {
             source: args.source,
         },
     )?;
-    let _ = control::reconcile(config, &args.scope.scope);
+    let _ = control::reconcile_with_current(config, &args.scope.scope, true);
     Ok((!args.quiet).then_some(session.id))
 }
 
@@ -527,10 +535,19 @@ fn print_json(value: &impl serde::Serialize) -> Result<()> {
 pub fn run() -> Result<u8> {
     let cli = Cli::parse();
     let config = config::load()?;
-    match cli.command.unwrap_or(Commands::Tui(ScopeArgs {
-        scope: env::current_dir()?,
+    match cli.command.unwrap_or(Commands::Tui(TuiArgs {
+        scope: ScopeArgs {
+            scope: env::current_dir()?,
+        },
+        loading_preview: false,
     })) {
-        Commands::Tui(args) => tui::run(config, &args.scope)?,
+        Commands::Tui(args) => {
+            if args.loading_preview {
+                tui::preview_loading()?;
+            } else {
+                tui::run(config, &args.scope.scope)?;
+            }
+        }
         Commands::Status(args) => {
             let state = control::read_workspace(&args.scope.scope)?;
             if args.json {
@@ -780,6 +797,7 @@ pub fn run() -> Result<u8> {
                 Action::Attach,
                 &args.direction.to_string(),
             )?
+            .code
             .clamp(0, 255) as u8);
         }
         Commands::Inspect(args) => {
@@ -790,6 +808,7 @@ pub fn run() -> Result<u8> {
                 Action::Inspect,
                 &args.direction.to_string(),
             )?
+            .code
             .clamp(0, 255) as u8);
         }
         Commands::Disconnect { id, scope } => {
@@ -1070,4 +1089,17 @@ fn generate_artifacts(root: &std::path::Path, check: bool) -> Result<()> {
         &source[end + end_marker.len()..]
     );
     update(&readme, &next, check)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SplitDirection;
+
+    #[test]
+    fn split_directions_render_without_recursive_formatting() {
+        assert_eq!(SplitDirection::Right.to_string(), "right");
+        assert_eq!(SplitDirection::Left.to_string(), "left");
+        assert_eq!(SplitDirection::Top.to_string(), "top");
+        assert_eq!(SplitDirection::Bottom.to_string(), "bottom");
+    }
 }

@@ -34,21 +34,20 @@ Open the dashboard for the current repository:
 orc
 ```
 
-The dashboard has two main tabs:
-
-- Explorer shows the active run as a graph. It also includes tree and fleet
-  views.
-- Providers shows the discovered provider manifests.
+The dashboard opens on the workspace tree. It shows the orchestrator, its
+agents, and their workflow runs in one ownership hierarchy. Press `Tab` to
+switch between the tree and the selected run's workflow graph. Press `0` to
+inspect integrations, then `Esc` to return to work.
 
 The graph always places the orchestrator above its stages. Dependency arrows
-flow down. Review feedback and report-back arrows remain visible without
-changing the layout. Press `Enter` on a run to open its graph. Press `Enter` on
-a session to attach through providers.
+flow from the orchestrator through each stage. Review feedback and report-back
+arrows remain visible without changing the layout. Press `Enter` on a run to
+open its graph. Press `Enter` on an agent to focus its active display or launch
+a new display for a dormant session.
 
-Use `g`, `t`, and `f` for graph, tree, and fleet views. Use `hjkl` inside the
-focused pane. Use `Ctrl-h/j/k/l` to move between the graph, details, and output
-panes. `Tab` and `Shift-Tab` change the Log, Activity, Output, and Changes
-views. Press `?` for generated key help.
+Use `hjkl` inside the focused pane. Use `Ctrl-h/j/k/l` to move between work and
+the inspector. Use `[` and `]` for Summary, Timeline, Result, and Changes.
+Changes load when the dashboard opens. Press `?` for generated key help.
 
 Register an orchestrator session:
 
@@ -129,6 +128,7 @@ command: /path/to/orc-provider-wezterm
 actions:
   session.bind: Detect the current WezTerm pane
   terminal.open: Open a command in a split pane
+  terminal.focus: Focus an existing pane
 priority: 100
 ```
 

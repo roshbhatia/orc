@@ -11,6 +11,7 @@
         "session.persist",
         "session.stop",
         "terminal.open",
+        "terminal.focus",
         "execution.run",
         "execution.cancel",
         "execution.status",
@@ -101,6 +102,9 @@
           "type": "string"
         },
         "session.stop": {
+          "type": "string"
+        },
+        "terminal.focus": {
           "type": "string"
         },
         "terminal.open": {
