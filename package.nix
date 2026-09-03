@@ -7,7 +7,7 @@
 }:
 rustPlatform.buildRustPackage {
   pname = "orc";
-  version = "0.9.2";
+  version = "0.9.3";
   src = ./.;
 
   cargoLock.lockFile = ./Cargo.lock;

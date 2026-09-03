@@ -386,6 +386,7 @@ enum BootState {
 
 enum BackgroundResult {
     Refresh(Result<(WorkspaceState, Vec<Manifest>), String>),
+    Enrichment(Result<WorkspaceState, String>),
     Activity {
         session_id: String,
         result: Result<String, String>,
@@ -436,6 +437,8 @@ struct App {
     last_refresh: Instant,
     refresh_inflight: bool,
     refresh_requested: bool,
+    enrichment_inflight: bool,
+    enrichment_requested: bool,
     resize_at: Option<Instant>,
     hit: HitAreas,
     graph_signature: String,
@@ -459,6 +462,7 @@ impl App {
             started_at: Instant::now(),
         };
         app.refresh_inflight = false;
+        app.enrichment_requested = true;
         app.apply_preferences(preferences);
         app
     }
@@ -512,6 +516,8 @@ impl App {
             last_refresh: Instant::now(),
             refresh_inflight: false,
             refresh_requested: false,
+            enrichment_inflight: false,
+            enrichment_requested: false,
             resize_at: None,
             hit: HitAreas::default(),
             graph_signature: String::new(),
@@ -618,10 +624,25 @@ impl App {
         let scope = self.scope.clone();
         let tx = tx.clone();
         thread::spawn(move || {
-            let result = control::reconcile(&config, &scope)
+            let result = control::read_workspace(&scope)
                 .and_then(|state| provider::discover(&config).map(|providers| (state, providers)))
                 .map_err(|error| format!("{error:#}"));
             let _ = tx.send(BackgroundResult::Refresh(result));
+        });
+    }
+
+    fn request_enrichment(&mut self, tx: &Sender<BackgroundResult>) {
+        if self.enrichment_inflight || !self.enrichment_requested {
+            return;
+        }
+        self.enrichment_inflight = true;
+        self.enrichment_requested = false;
+        let config = self.config.clone();
+        let scope = self.scope.clone();
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let result = control::reconcile(&config, &scope).map_err(|error| format!("{error:#}"));
+            let _ = tx.send(BackgroundResult::Enrichment(result));
         });
     }
 
@@ -673,6 +694,16 @@ impl App {
                             self.set_status(format!("refresh failed: {error}"));
                         }
                     }
+                }
+            }
+            BackgroundResult::Enrichment(result) => {
+                self.enrichment_inflight = false;
+                match result {
+                    Ok(state) => {
+                        self.state = state;
+                        self.rebuild(false);
+                    }
+                    Err(error) => self.set_status(format!("session discovery failed: {error}")),
                 }
             }
             BackgroundResult::Activity { session_id, result } => {
@@ -1345,7 +1376,10 @@ impl App {
             (KeyCode::Char('g'), _) if self.focus == Focus::Main => self.drill_down(),
             (KeyCode::Char('e'), _) if self.focus == Focus::Main => self.open_node_editor(),
             (KeyCode::Char('D'), _) if self.focus == Focus::Main => self.request_delete_node(),
-            (KeyCode::Char('r'), _) => self.request_refresh(tx),
+            (KeyCode::Char('r'), _) => {
+                self.enrichment_requested = true;
+                self.request_refresh(tx);
+            }
             (KeyCode::Char('R'), _) => {
                 self.rebuild(true);
                 self.flow.request_fit_view();
@@ -2413,7 +2447,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &mut App) {
         .iter()
         .filter(|session| RuntimeActivity::for_session(session) == Some(RuntimeActivity::Stalled))
         .count();
-    let status = if app.refresh_inflight {
+    let status = if app.refresh_inflight || app.enrichment_inflight {
         format!("{} syncing", spinner_glyph())
     } else {
         format!(
@@ -3459,6 +3493,7 @@ pub fn run(config: Config, scope: &Path) -> Result<()> {
             app.request_refresh(&tx);
         }
         if matches!(app.boot, BootState::Ready) {
+            app.request_enrichment(&tx);
             app.request_activity(&tx, false);
             app.request_provider_activity(&tx, false);
             app.request_changes(&tx, false);
@@ -3788,6 +3823,8 @@ mod tests {
         assert_eq!(app.active_run.as_deref(), Some("run"));
         assert_eq!(app.tree[0].title, "root");
         assert_eq!(app.tree[1].title, "Provider migration");
+        assert!(app.enrichment_requested);
+        assert!(!app.enrichment_inflight);
     }
 
     #[test]
