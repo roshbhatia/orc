@@ -579,10 +579,11 @@ pub fn run() -> Result<u8> {
                 scope,
                 contract,
                 native_id,
-            } => println!(
-                "{}",
-                control::adopt(&scope.scope, contract.into(), native_id)?.id
-            ),
+            } => {
+                let session = control::adopt(&scope.scope, contract.into(), native_id)?;
+                let _ = control::reconcile_with_current(&config, &scope.scope, true);
+                println!("{}", session.id);
+            }
             SessionCommand::Archive {
                 id,
                 scope,
