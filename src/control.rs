@@ -8,8 +8,9 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     domain::{
-        ActivityEvent, AgentConfig, CompletionTarget, LifecycleStatus, RegistrationSource, Session,
-        SessionRole, WorkflowEdge, WorkflowNode, WorkflowRun, WorkspaceState,
+        ActivityEvent, AgentConfig, CompletionTarget, JudgePolicy, LifecycleStatus,
+        RegistrationSource, Session, SessionRole, WorkflowEdge, WorkflowNode, WorkflowRun,
+        WorkspaceState,
     },
     provider, state,
 };
@@ -64,6 +65,8 @@ pub struct NodeSpec {
     pub status: LifecycleStatus,
     pub attempt: u32,
     pub depends_on: Vec<String>,
+    pub execution: Option<String>,
+    pub judge_policy: JudgePolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -460,6 +463,8 @@ pub fn upsert_node(scope: &Path, run_id: &str, spec: NodeSpec) -> Result<Workflo
         status,
         attempt,
         depends_on,
+        execution,
+        judge_policy,
     } = spec;
     let scope = state::resolve_scope(scope)?;
     state::update(&scope, |workspace| {
@@ -475,6 +480,8 @@ pub fn upsert_node(scope: &Path, run_id: &str, spec: NodeSpec) -> Result<Workflo
             role: contract.role,
             harness: contract.harness.clone(),
             model: contract.model.clone(),
+            execution,
+            judge_policy,
             goal: contract.goal.clone(),
             expected_output: contract.expected_output.clone(),
             success_criteria: contract.success_criteria.clone(),

@@ -7,6 +7,7 @@ use crate::{
     config::Config,
     control,
     domain::{CompletionTarget, LifecycleStatus, RegistrationSource, RunMode, SessionRole},
+    preferences::{self, AutonomyMode},
     state, workflow,
 };
 
@@ -32,12 +33,13 @@ fn tools() -> Value {
         { "name": "orc_run_approve", "description": "Approve one pending human gate and optionally resume the run.", "inputSchema": schema(json!({"id":{"type":"string"},"gateId":{"type":"string"},"resume":{"type":"boolean"}}), &["id"]) },
         { "name": "orc_run_cancel", "description": "Cancel a workflow run and its local executor.", "inputSchema": schema(json!({"id":{"type":"string"}}), &["id"]) },
         { "name": "orc_workflow_propose", "description": "Validate and version a proposed deterministic workflow without executing it.", "inputSchema": schema(json!({"definition":{"type":"object"}}), &["definition"]) },
-        { "name": "orc_workflow_start", "description": "Materialize and start a versioned workflow for this directory.", "inputSchema": schema(json!({"name":{"type":"string"},"background":{"type":"boolean"}}), &["name"]) },
+        { "name": "orc_workflow_start", "description": "Materialize a versioned workflow proposal and start it when workspace autonomy permits.", "inputSchema": schema(json!({"name":{"type":"string"},"background":{"type":"boolean"}}), &["name"]) },
         { "name": "orc_node_upsert", "description": "Create or replace a workflow node and dependencies.", "inputSchema": schema(json!({
             "runId":{"type":"string"},"id":{"type":"string"},"name":{"type":"string"},"purpose":{"type":"string"},"role":{"type":"string"},
             "harness":{"type":"string"},"model":{"type":"string"},"goal":{"type":"string"},"expectedOutput":{"type":"string"},
             "successCriteria":{"type":"array","items":{"type":"string"}},"completion":{"type":"string"},"reviewBy":{"type":"string"},
-            "sessionId":{"type":"string"},"status":{"type":"string"},"attempt":{"type":"integer"},"dependsOn":{"type":"array","items":{"type":"string"}}
+            "sessionId":{"type":"string"},"status":{"type":"string"},"attempt":{"type":"integer"},"dependsOn":{"type":"array","items":{"type":"string"}},
+            "execution":{"type":"string"},"judgePolicy":{"type":"string","enum":["llm","human","llm+human"]}
         }), &["runId","id","name","role","goal","expectedOutput"]) },
         { "name": "orc_node_update", "description": "Update a workflow node lifecycle status.", "inputSchema": schema(json!({"runId":{"type":"string"},"id":{"type":"string"},"status":{"type":"string"}}), &["runId","id","status"]) }
         ,{ "name": "orc_node_report", "description": "Report a node result, activity message, token count, and cost.", "inputSchema": schema(json!({"runId":{"type":"string"},"id":{"type":"string"},"status":{"type":"string"},"output":{},"message":{"type":"string"},"tokens":{"type":"integer"},"costUsd":{"type":"number"}}), &["runId","id","status"]) }
@@ -179,7 +181,10 @@ fn call(name: &str, input: &Value, config: &Config) -> Result<Value> {
                     RunMode::Foreground
                 },
             )?;
-            serde_json::to_value(if background {
+            let autonomy = preferences::read(&scope)?.autonomy;
+            serde_json::to_value(if autonomy != AutonomyMode::Autonomous {
+                run
+            } else if background {
                 workflow::spawn(&scope, &run.id)?
             } else {
                 workflow::execute(config, &scope, &run.id)?
@@ -214,6 +219,11 @@ fn call(name: &str, input: &Value, config: &Config) -> Result<Value> {
                     .map_err(anyhow::Error::msg)?,
                 attempt: input.get("attempt").and_then(Value::as_u64).unwrap_or(0) as u32,
                 depends_on: strings(input, "dependsOn"),
+                execution: optional(input, "execution"),
+                judge_policy: optional(input, "judgePolicy")
+                    .unwrap_or_else(|| "llm".into())
+                    .parse::<crate::domain::JudgePolicy>()
+                    .map_err(anyhow::Error::msg)?,
             },
         )?)?,
         "orc_node_update" => serde_json::to_value(control::update_node(

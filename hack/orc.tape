@@ -15,21 +15,18 @@ Wait+Screen /Renderer provider migration/
 Sleep 1s
 Type "j"
 Sleep 250ms
-Enter
+Type "g"
 Wait+Screen /workflow/
-Sleep 500ms
+Sleep 3500ms
 Screenshot docs/orc.png
 Type "l"
 Sleep 250ms
 Ctrl+L
 Sleep 250ms
-Type "]"
-Sleep 500ms
 Ctrl+H
 Sleep 250ms
-Tab
+Type "p"
 Sleep 500ms
-Type "0"
 Wait+Screen /integrations/
 Sleep 500ms
 Type "v"

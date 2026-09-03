@@ -25,9 +25,9 @@
     },
     "ApprovalMode": {
       "enum": [
-        "full_auto",
         "supervised",
-        "manual"
+        "approval_gated",
+        "autonomous"
       ],
       "type": "string"
     },
@@ -90,6 +90,14 @@
         "user",
         "orchestrator_then_user",
         "orchestrator"
+      ],
+      "type": "string"
+    },
+    "JudgePolicy": {
+      "enum": [
+        "llm",
+        "human",
+        "llm+human"
       ],
       "type": "string"
     },
@@ -302,6 +310,10 @@
           },
           "default": {},
           "type": "object"
+        },
+        "judge_policy": {
+          "$ref": "#/$defs/JudgePolicy",
+          "default": "llm"
         },
         "max_depth": {
           "default": null,

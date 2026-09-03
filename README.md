@@ -36,18 +36,20 @@ orc
 
 The dashboard opens on the workspace tree. It shows the orchestrator, its
 agents, and their workflow runs in one ownership hierarchy. Press `Tab` to
-switch between the tree and the selected run's workflow graph. Press `0` to
+switch between the tree and the selected run's workflow graph. Press `p` to
 inspect integrations, then `Esc` to return to work.
 
-The graph always places the orchestrator above its stages. Dependency arrows
-flow from the orchestrator through each stage. Review feedback and report-back
-arrows remain visible without changing the layout. Press `Enter` on a run to
-open its graph. Press `Enter` on an agent to focus its active display or launch
-a new display for a dormant session.
+The graph keeps the orchestrator in a fixed rail above its left-to-right stage
+ranks. Dependency and review arrows stay inside the stage graph. Press `g` on a
+run to open its graph. Press `Enter` on any run, stage, or agent to focus its
+active display or launch a display for a dormant session.
 
 Use `hjkl` inside the focused pane. Use `Ctrl-h/j/k/l` to move between work and
-the inspector. Use `[` and `]` for Summary, Timeline, Result, and Changes.
-Changes load when the dashboard opens. Press `?` for generated key help.
+the inspector. `Tab` and `Shift-Tab` cycle the selected run, stage, agent, or
+provider's contextual inspector tabs. The mouse wheel zooms the graph within
+its safe range. Drag the blank canvas to pan; Orc keeps the graph inside its
+viewport. Changes load when the dashboard opens. Press `?` for generated key
+help.
 
 Register an orchestrator session:
 
@@ -91,16 +93,23 @@ orc workflow plan provider-migration
 orc workflow start provider-migration --background
 ```
 
-An orchestrator can also propose and start definitions through Orc's MCP
-tools. Orc validates the proposal before it commits the YAML definition. Ready
-nodes run concurrently. Each agent node chooses a harness, model, and execution
-provider. A nested workflow node composes another definition.
+An orchestrator can also propose and start definitions through Orc's MCP tools.
+Orc validates the proposal before it commits the YAML definition. Ready nodes
+run concurrently. Each agent node chooses a harness, model, execution provider,
+and judge policy. A nested workflow node composes another definition.
 
-Approval modes control human gates:
+Workspace autonomy controls when a proposal starts:
 
-- `full_auto` runs every ready node.
-- `supervised` pauses only at declared or node-level gates.
-- `manual` pauses before every node.
+- `supervised` creates a proposal and asks before each stage.
+- `approval_gated` creates a proposal and asks only at declared gates.
+- `autonomous` validates the proposal and starts ready nodes immediately.
+  Explicit human-gate stages still wait for a person.
+
+`orc mode` shows the current workspace mode. `orc mode autonomous` changes it.
+Press `m` in the dashboard to cycle modes. Proposed workflow nodes stay
+editable in every mode. Press `e` on a stage to edit its contract, runtime, and
+dependencies. Press `D` to remove it after confirmation. Orc versions these
+edits in the workflow Git catalog.
 
 Use `orc run approve <run-id>` to continue a waiting run. Use
 `orc guide <session-id> --text '...'` for a provider-supported correction.
@@ -113,7 +122,9 @@ inspect prior definitions.
 
 ## Providers
 
-Orc discovers YAML or JSON manifests from `~/.config/orc/providers/`. Set
+Orc discovers YAML or JSON manifests recursively from
+`~/.config/orc/providers/`. The standard layout is
+`~/.config/orc/providers/<name>/provider.yaml`. Set
 `ORC_PROVIDERS_DIRECTORY` to use another directory.
 
 Each provider advertises one kind and a set of capabilities:
@@ -162,7 +173,7 @@ Actions resolve through capability chains. Optional steps are marked with `?`:
 ```text
 attach    session.attach -> session.persist? -> terminal.open
 inspect   session.inspect -> terminal.open
-activity  session.inspect
+activity  activity.read | execution.logs | session.inspect
 changes   changes.inspect
 launch    session.launch -> session.persist? -> execution.run
 execute   execution.run
@@ -256,6 +267,23 @@ Usage: status [OPTIONS]
 Options:
       --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
       --json
+  -h, --help           Print help
+```
+
+### `orc mode`
+
+Show or change this workspace's autonomy mode
+
+```text
+Show or change this workspace's autonomy mode
+
+Usage: mode [OPTIONS] [MODE]
+
+Arguments:
+  [MODE]
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
   -h, --help           Print help
 ```
 
@@ -598,7 +626,10 @@ Usage: node <COMMAND>
 Commands:
   upsert
   update
-  help    Print this message or the help of the given subcommand(s)
+  edit
+  delete
+  dependency
+  help        Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
@@ -629,6 +660,8 @@ Options:
       --status <STATUS>                    [default: queued]
       --attempt <ATTEMPT>                  [default: 0]
       --depends-on <DEPENDS_ON>
+      --execution <EXECUTION>
+      --judge-policy <JUDGE_POLICY>        [default: llm]
   -h, --help                               Print help
 ```
 
@@ -645,6 +678,57 @@ Options:
       --run <RUN_ID>
       --status <STATUS>
   -h, --help             Print help
+```
+
+### `orc node edit`
+
+```text
+Usage: edit [OPTIONS] --run <RUN_ID> <ID>
+
+Arguments:
+  <ID>
+
+Options:
+      --scope <SCOPE>                      [env: ORC_SCOPE=] [default: .]
+      --run <RUN_ID>
+      --goal <GOAL>
+      --expected-output <EXPECTED_OUTPUT>
+      --success <SUCCESS_CRITERIA>
+      --harness <HARNESS>
+      --model <MODEL>
+      --execution <EXECUTION>
+      --judge-policy <JUDGE_POLICY>
+  -h, --help                               Print help
+```
+
+### `orc node delete`
+
+```text
+Usage: delete [OPTIONS] --run <RUN_ID> <ID>
+
+Arguments:
+  <ID>
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --run <RUN_ID>
+  -h, --help           Print help
+```
+
+### `orc node dependency`
+
+```text
+Usage: dependency [OPTIONS] --run <RUN_ID> --on <ON> <ID>
+
+Arguments:
+  <ID>
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --run <RUN_ID>
+      --on <ON>
+      --remove
+  -h, --help           Print help
 ```
 
 ### `orc provider`

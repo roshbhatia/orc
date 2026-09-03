@@ -56,6 +56,14 @@
       ],
       "type": "string"
     },
+    "JudgePolicy": {
+      "enum": [
+        "llm",
+        "human",
+        "llm+human"
+      ],
+      "type": "string"
+    },
     "LifecycleStatus": {
       "enum": [
         "queued",
@@ -333,6 +341,13 @@
           "format": "double",
           "type": "number"
         },
+        "execution": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "expectedOutput": {
           "type": "string"
         },
@@ -347,6 +362,10 @@
         },
         "input": {
           "default": null
+        },
+        "judgePolicy": {
+          "$ref": "#/$defs/JudgePolicy",
+          "default": "llm"
         },
         "model": {
           "type": [

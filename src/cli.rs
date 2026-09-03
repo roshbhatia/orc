@@ -14,8 +14,9 @@ use crate::{
     VERSION,
     config::{self, Config},
     control::{self, Contract, SessionLink},
-    domain::{CompletionTarget, LifecycleStatus, RegistrationSource, SessionRole},
+    domain::{CompletionTarget, JudgePolicy, LifecycleStatus, RegistrationSource, SessionRole},
     mcp,
+    preferences::{self, AutonomyMode},
     provider::{self, Action},
     state, tui, workflow,
 };
@@ -33,6 +34,12 @@ enum Commands {
     Tui(TuiArgs),
     #[command(about = "Show workspace status")]
     Status(OutputArgs),
+    #[command(about = "Show or change this workspace's autonomy mode")]
+    Mode {
+        mode: Option<AutonomyMode>,
+        #[command(flatten)]
+        scope: ScopeArgs,
+    },
     #[command(about = "List registered sessions")]
     List(OutputArgs),
     #[command(about = "Register the current session")]
@@ -312,6 +319,10 @@ enum NodeCommand {
         attempt: u32,
         #[arg(long = "depends-on")]
         depends_on: Vec<String>,
+        #[arg(long)]
+        execution: Option<String>,
+        #[arg(long = "judge-policy", default_value = "llm")]
+        judge_policy: JudgePolicy,
     },
     Update {
         id: String,
@@ -321,6 +332,45 @@ enum NodeCommand {
         run_id: String,
         #[arg(long)]
         status: LifecycleStatus,
+    },
+    Edit {
+        id: String,
+        #[command(flatten)]
+        scope: ScopeArgs,
+        #[arg(long = "run")]
+        run_id: String,
+        #[arg(long)]
+        goal: Option<String>,
+        #[arg(long = "expected-output")]
+        expected_output: Option<String>,
+        #[arg(long = "success")]
+        success_criteria: Option<Vec<String>>,
+        #[arg(long)]
+        harness: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        execution: Option<String>,
+        #[arg(long = "judge-policy")]
+        judge_policy: Option<JudgePolicy>,
+    },
+    Delete {
+        id: String,
+        #[command(flatten)]
+        scope: ScopeArgs,
+        #[arg(long = "run")]
+        run_id: String,
+    },
+    Dependency {
+        id: String,
+        #[command(flatten)]
+        scope: ScopeArgs,
+        #[arg(long = "run")]
+        run_id: String,
+        #[arg(long)]
+        on: String,
+        #[arg(long)]
+        remove: bool,
     },
 }
 
@@ -563,6 +613,15 @@ pub fn run() -> Result<u8> {
                 );
             }
         }
+        Commands::Mode { mode, scope } => {
+            let scope = state::resolve_scope(&scope.scope)?;
+            let mut selected = preferences::read(&scope)?;
+            if let Some(mode) = mode {
+                selected.autonomy = mode;
+                preferences::write(&scope, &selected)?;
+            }
+            println!("{}", selected.autonomy);
+        }
         Commands::List(args) => list_sessions(&args)?,
         Commands::Connect(args) => {
             if let Some(id) = register(&config, args)? {
@@ -721,6 +780,8 @@ pub fn run() -> Result<u8> {
                 status,
                 attempt,
                 depends_on,
+                execution,
+                judge_policy,
             } => print_json(&control::upsert_node(
                 &scope.scope,
                 &run_id,
@@ -731,6 +792,8 @@ pub fn run() -> Result<u8> {
                     status,
                     attempt,
                     depends_on,
+                    execution,
+                    judge_policy,
                 },
             )?)?,
             NodeCommand::Update {
@@ -739,6 +802,44 @@ pub fn run() -> Result<u8> {
                 run_id,
                 status,
             } => print_json(&control::update_node(&scope.scope, &run_id, &id, status)?)?,
+            NodeCommand::Edit {
+                id,
+                scope,
+                run_id,
+                goal,
+                expected_output,
+                success_criteria,
+                harness,
+                model,
+                execution,
+                judge_policy,
+            } => print_json(&workflow::edit_run_node(
+                &config,
+                &scope.scope,
+                &run_id,
+                &id,
+                workflow::NodeEdit {
+                    goal,
+                    expected_output,
+                    success_criteria,
+                    harness,
+                    model,
+                    execution,
+                    judge_policy,
+                },
+            )?)?,
+            NodeCommand::Delete { id, scope, run_id } => {
+                workflow::delete_run_node(&config, &scope.scope, &run_id, &id)?;
+            }
+            NodeCommand::Dependency {
+                id,
+                scope,
+                run_id,
+                on,
+                remove,
+            } => {
+                workflow::set_run_dependency(&config, &scope.scope, &run_id, &id, &on, !remove)?;
+            }
         },
         Commands::Provider { command } => match command {
             ProviderCommand::List(args) => {
@@ -949,10 +1050,15 @@ fn workflow_command(config: &Config, command: WorkflowCommand) -> Result<()> {
                 crate::domain::RunMode::Foreground
             };
             let run = workflow::materialize(config, &scope.scope, &definition_path, mode)?;
-            let run = if background {
-                workflow::spawn(&scope.scope, &run.id)?
+            let autonomy = preferences::read(&state::resolve_scope(&scope.scope)?)?.autonomy;
+            let run = if autonomy == AutonomyMode::Autonomous {
+                if background {
+                    workflow::spawn(&scope.scope, &run.id)?
+                } else {
+                    workflow::execute(config, &scope.scope, &run.id)?
+                }
             } else {
-                workflow::execute(config, &scope.scope, &run.id)?
+                run
             };
             if json {
                 print_json(&run)?;

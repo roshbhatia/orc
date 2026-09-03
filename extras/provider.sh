@@ -277,7 +277,7 @@ case "$provider_kind:$capability" in
       emit_description "${title:0:72}" "$prompt"
     fi
     ;;
-  traces:session.inspect)
+  traces:activity.read | traces:session.inspect)
     require_command traces || {
       emit_declined "traces is unavailable"
       exit 0

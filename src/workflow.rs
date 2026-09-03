@@ -18,20 +18,23 @@ use crate::{
     config::Config,
     control::{self, Contract, SessionLink},
     domain::{
-        ActivityEvent, CompletionTarget, LifecycleStatus, PendingGate, RegistrationSource, RunMode,
-        SessionRole, WorkflowEdge, WorkflowNode, WorkflowRun,
+        ActivityEvent, CompletionTarget, JudgePolicy, LifecycleStatus, PendingGate,
+        RegistrationSource, RunMode, SessionRole, WorkflowEdge, WorkflowNode, WorkflowRun,
     },
+    preferences::{self, AutonomyMode},
     provider::{self, Action, CommandPlan},
     state,
 };
 
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalMode {
-    FullAuto,
     #[default]
     Supervised,
-    Manual,
+    #[serde(alias = "manual")]
+    ApprovalGated,
+    #[serde(alias = "full_auto")]
+    Autonomous,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
@@ -126,6 +129,7 @@ pub struct Step {
     pub expected_output: String,
     pub success_criteria: Vec<String>,
     pub completion: CompletionTarget,
+    pub judge_policy: JudgePolicy,
     pub review_by: Option<String>,
     pub runtime: Runtime,
     pub prompt: Option<String>,
@@ -153,6 +157,7 @@ impl Default for Step {
             expected_output: "A verified result".into(),
             success_criteria: Vec::new(),
             completion: CompletionTarget::Orchestrator,
+            judge_policy: JudgePolicy::Llm,
             review_by: None,
             runtime: Runtime::default(),
             prompt: None,
@@ -440,6 +445,198 @@ pub fn save(config: &Config, scope: &Path, definition: &Definition) -> Result<Pa
     Ok(target)
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct NodeEdit {
+    pub goal: Option<String>,
+    pub expected_output: Option<String>,
+    pub success_criteria: Option<Vec<String>>,
+    pub harness: Option<String>,
+    pub model: Option<String>,
+    pub execution: Option<String>,
+    pub judge_policy: Option<JudgePolicy>,
+}
+
+fn run_definition(scope: &Path, run_id: &str) -> Result<(WorkflowRun, PathBuf, Definition)> {
+    let scope = state::resolve_scope(scope)?;
+    let run = state::read(&scope)?
+        .runs
+        .into_iter()
+        .find(|run| run.id == run_id)
+        .with_context(|| format!("unknown run: {run_id}"))?;
+    let path = run
+        .definition
+        .as_deref()
+        .map(PathBuf::from)
+        .context("this run has no versioned workflow definition")?;
+    let definition = load(&path)?;
+    Ok((run, path, definition))
+}
+
+pub fn edit_run_node(
+    config: &Config,
+    scope: &Path,
+    run_id: &str,
+    node_id: &str,
+    edit: NodeEdit,
+) -> Result<WorkflowNode> {
+    let (_, _, mut definition) = run_definition(scope, run_id)?;
+    let step = definition
+        .steps
+        .iter_mut()
+        .find(|step| step.name == node_id)
+        .with_context(|| format!("unknown node: {node_id}"))?;
+    if let Some(value) = edit.goal {
+        step.goal = value;
+    }
+    if let Some(value) = edit.expected_output {
+        step.expected_output = value;
+    }
+    if let Some(value) = edit.success_criteria {
+        step.success_criteria = value;
+    }
+    if let Some(value) = edit.harness {
+        step.runtime.harness = Some(value);
+    }
+    if let Some(value) = edit.model {
+        step.runtime.model = Some(value);
+    }
+    if let Some(value) = edit.execution {
+        step.runtime.execution = Some(value);
+    }
+    if let Some(value) = edit.judge_policy {
+        step.judge_policy = value;
+    }
+    save(config, scope, &definition)?;
+
+    let step = definition
+        .steps
+        .iter()
+        .find(|step| step.name == node_id)
+        .expect("edited step remains");
+    state::update(&state::resolve_scope(scope)?, |workspace| {
+        let run = workspace
+            .runs
+            .iter_mut()
+            .find(|run| run.id == run_id)
+            .with_context(|| format!("unknown run: {run_id}"))?;
+        let node = run
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == node_id)
+            .with_context(|| format!("unknown node: {node_id}"))?;
+        node.goal.clone_from(&step.goal);
+        node.expected_output.clone_from(&step.expected_output);
+        node.success_criteria.clone_from(&step.success_criteria);
+        if let Some(value) = &step.runtime.harness {
+            node.harness.clone_from(value);
+        }
+        node.model.clone_from(&step.runtime.model);
+        node.execution.clone_from(&step.runtime.execution);
+        node.judge_policy = step.judge_policy;
+        node.updated_at = Utc::now();
+        run.updated_at = Utc::now();
+        Ok(node.clone())
+    })
+}
+
+pub fn delete_run_node(config: &Config, scope: &Path, run_id: &str, node_id: &str) -> Result<()> {
+    let (_, _, mut definition) = run_definition(scope, run_id)?;
+    if !definition.steps.iter().any(|step| step.name == node_id) {
+        bail!("unknown node: {node_id}");
+    }
+    definition.steps.retain(|step| step.name != node_id);
+    for step in &mut definition.steps {
+        step.depends_on.retain(|dependency| dependency != node_id);
+        step.routes.retain(|route| route.to != node_id);
+        if step.review_by.as_deref() == Some(node_id) {
+            step.review_by = None;
+        }
+    }
+    definition.parallel.retain_mut(|group| {
+        group.agents.retain(|agent| agent != node_id);
+        if group.agent.as_deref() == Some(node_id) {
+            group.agent = None;
+        }
+        !group.agents.is_empty() || group.agent.is_some()
+    });
+    definition
+        .approval
+        .gates
+        .retain(|gate| gate.before != node_id);
+    if definition.entry_point == node_id {
+        definition.entry_point = definition
+            .steps
+            .first()
+            .map(|step| step.name.clone())
+            .unwrap_or_default();
+    }
+    save(config, scope, &definition)?;
+    state::update(&state::resolve_scope(scope)?, |workspace| {
+        let run = workspace
+            .runs
+            .iter_mut()
+            .find(|run| run.id == run_id)
+            .with_context(|| format!("unknown run: {run_id}"))?;
+        run.nodes.retain(|node| node.id != node_id);
+        run.edges
+            .retain(|edge| edge.from != node_id && edge.to != node_id);
+        run.updated_at = Utc::now();
+        Ok(())
+    })
+}
+
+pub fn set_run_dependency(
+    config: &Config,
+    scope: &Path,
+    run_id: &str,
+    node_id: &str,
+    dependency: &str,
+    present: bool,
+) -> Result<()> {
+    if node_id == dependency {
+        bail!("a node cannot depend on itself");
+    }
+    let (_, _, mut definition) = run_definition(scope, run_id)?;
+    if !definition.steps.iter().any(|step| step.name == dependency) {
+        bail!("unknown dependency: {dependency}");
+    }
+    let step = definition
+        .steps
+        .iter_mut()
+        .find(|step| step.name == node_id)
+        .with_context(|| format!("unknown node: {node_id}"))?;
+    step.depends_on.retain(|candidate| candidate != dependency);
+    if present {
+        step.depends_on.push(dependency.into());
+    }
+    let _ = plan(config, scope, &definition)?;
+    save(config, scope, &definition)?;
+    state::update(&state::resolve_scope(scope)?, |workspace| {
+        let run = workspace
+            .runs
+            .iter_mut()
+            .find(|run| run.id == run_id)
+            .with_context(|| format!("unknown run: {run_id}"))?;
+        run.edges
+            .retain(|edge| !(edge.to == node_id && edge.relationship == "depends_on"));
+        run.edges.extend(
+            definition
+                .steps
+                .iter()
+                .find(|step| step.name == node_id)
+                .into_iter()
+                .flat_map(|step| step.depends_on.iter())
+                .map(|from| WorkflowEdge {
+                    from: from.clone(),
+                    to: node_id.into(),
+                    relationship: "depends_on".into(),
+                }),
+        );
+        run.updated_at = Utc::now();
+        Ok(())
+    })
+}
+
 pub fn init(config: &Config, scope: &Path, name: &str) -> Result<PathBuf> {
     let target = path(config, scope, name)?;
     if target.exists() {
@@ -538,6 +735,7 @@ pub struct PlannedStep {
     pub harness: Option<String>,
     pub model: Option<String>,
     pub execution: Option<String>,
+    pub judge_policy: JudgePolicy,
     pub approval_required: bool,
     pub depends_on: Vec<String>,
 }
@@ -584,9 +782,10 @@ pub fn plan(config: &Config, scope: &Path, definition: &Definition) -> Result<Pl
                 .execution
                 .clone()
                 .or_else(|| definition.defaults.runtime.execution.clone()),
+            judge_policy: step.judge_policy,
             approval_required: match definition.approval.mode {
-                ApprovalMode::FullAuto => false,
-                ApprovalMode::Manual => true,
+                ApprovalMode::Autonomous => false,
+                ApprovalMode::ApprovalGated => true,
                 ApprovalMode::Supervised => {
                     step.requires_approval || gates.contains(step.name.as_str())
                 }
@@ -679,6 +878,12 @@ pub fn materialize(
             success_criteria: step.success_criteria.clone(),
             completion: step.completion,
             review_by: step.review_by.clone(),
+            execution: step
+                .runtime
+                .execution
+                .clone()
+                .or_else(|| definition.defaults.runtime.execution.clone()),
+            judge_policy: step.judge_policy,
             session_id: None,
             status: LifecycleStatus::Queued,
             attempt: 0,
@@ -772,17 +977,22 @@ pub fn materialize(
     })
 }
 
-fn required_gate(definition: &Definition, step: &Step, run: &WorkflowRun) -> Option<PendingGate> {
+fn required_gate(
+    definition: &Definition,
+    step: &Step,
+    run: &WorkflowRun,
+    autonomy: AutonomyMode,
+) -> Option<PendingGate> {
     let explicit = definition
         .approval
         .gates
         .iter()
         .find(|gate| gate.before == step.name);
     let required = matches!(step.r#type, StepKind::HumanGate)
-        || match definition.approval.mode {
-            ApprovalMode::FullAuto => false,
-            ApprovalMode::Manual => true,
-            ApprovalMode::Supervised => step.requires_approval || explicit.is_some(),
+        || match autonomy {
+            AutonomyMode::Supervised => true,
+            AutonomyMode::ApprovalGated => step.requires_approval || explicit.is_some(),
+            AutonomyMode::Autonomous => false,
         };
     if !required {
         return None;
@@ -1019,6 +1229,7 @@ fn execute_step(
 
 pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRun> {
     let scope = state::resolve_scope(scope)?;
+    let autonomy = preferences::read(&scope)?.autonomy;
     state::update(&scope, |workspace| {
         let run = workspace
             .runs
@@ -1084,7 +1295,7 @@ pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRu
         }
         if let Some(gate) = ready
             .iter()
-            .find_map(|step| required_gate(&definition, step, &run))
+            .find_map(|step| required_gate(&definition, step, &run, autonomy))
         {
             let before = gate.before.clone();
             state::update(&scope, |workspace| {

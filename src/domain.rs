@@ -79,6 +79,37 @@ pub enum CompletionTarget {
     Judge,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub enum JudgePolicy {
+    #[default]
+    #[serde(rename = "llm")]
+    Llm,
+    #[serde(rename = "human")]
+    Human,
+    #[serde(rename = "llm+human")]
+    LlmAndHuman,
+}
+
+impl std::fmt::Display for JudgePolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = serde_json::to_value(self).expect("judge policy serializes");
+        write!(
+            formatter,
+            "{}",
+            value.as_str().expect("judge policy is a string")
+        )
+    }
+}
+
+impl std::str::FromStr for JudgePolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        serde_json::from_str(&format!("\"{value}\""))
+            .map_err(|_| format!("unknown judge policy: {value}"))
+    }
+}
+
 impl std::fmt::Display for CompletionTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", format!("{self:?}").to_lowercase())
@@ -195,6 +226,10 @@ pub struct WorkflowNode {
     pub role: SessionRole,
     pub harness: String,
     pub model: Option<String>,
+    #[serde(default)]
+    pub execution: Option<String>,
+    #[serde(default)]
+    pub judge_policy: JudgePolicy,
     pub goal: String,
     pub expected_output: String,
     #[serde(default)]

@@ -5,9 +5,9 @@ description: Read agent titles, goals, messages, and tool activity
 kind: activity
 command: orc-provider-traces
 actions:
+  activity.read: Read recent messages and tool activity for a session
   session.bind: Link a session to its trace identity
   session.describe: Read the session title and goal
-  session.inspect: Show session activity
 requires:
   commands: [traces]
 priority: 100

@@ -7,9 +7,7 @@ expected output {{ session.expectedOutput }}
 {% for criterion in session.successCriteria %}  - {{ criterion }}
 {% endfor %}{% endif %}
 runtime
-  {{ session.role }} · {{ session.harness }}{% if session.model %}/{{ session.model }}{% endif %} · {{ session.status }}
+  {{ session.role }} · {{ placement }} · {{ session.harness }}{% if session.model %}/{{ session.model }}{% endif %}
+  lifecycle     {{ session.status }}
+  activity      {{ activity }}
   reports to    {% if session.reviewBy %}{{ session.reviewBy }}{% else %}{{ session.completion }}{% endif %}
-
-integrations
-{% for binding in session.providers %}  {{ binding.kind }}  {{ binding.provider }} · {{ binding.status }} · {{ binding.label }}
-{% endfor %}

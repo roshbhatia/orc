@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -23,6 +23,8 @@ use crate::{
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 pub enum Capability {
+    #[serde(rename = "activity.read")]
+    ActivityRead,
     #[serde(rename = "changes.inspect")]
     ChangesInspect,
     #[serde(rename = "session.attach")]
@@ -170,7 +172,7 @@ pub enum Action {
 impl Action {
     fn stages(self) -> &'static [(Capability, bool)] {
         match self {
-            Self::Activity => &[(Capability::SessionInspect, false)],
+            Self::Activity => &[(Capability::ActivityRead, false)],
             Self::Attach => &[
                 (Capability::SessionAttach, false),
                 (Capability::SessionPersist, true),
@@ -208,6 +210,39 @@ impl Action {
     }
 }
 
+pub fn resolve_activity_plan(
+    config: &Config,
+    providers: &[Manifest],
+    mut request: Value,
+) -> Result<CommandPlan> {
+    let capabilities = [
+        Capability::ActivityRead,
+        Capability::ExecutionLogs,
+        Capability::SessionInspect,
+    ];
+    let mut failures = Vec::new();
+    for capability in capabilities {
+        for provider in candidates(providers, capability) {
+            request["capability"] = Value::String(capability.to_string());
+            request["plan"] = Value::Null;
+            match invoke_raw(provider, &request, config)
+                .and_then(|value| parse_plan(provider, value))
+            {
+                Ok(Some(plan)) => return Ok(plan),
+                Ok(None) => failures.push(format!("{} declined {capability}", provider.name)),
+                Err(error) => failures.push(format!("{}: {error:#}", provider.name)),
+            }
+        }
+    }
+    if failures.is_empty() {
+        bail!("no provider advertises activity.read or execution.logs");
+    }
+    bail!(
+        "no activity provider accepted the session: {}",
+        failures.join("; ")
+    )
+}
+
 pub fn schema() -> serde_json::Value {
     serde_json::to_value(schema_for!(Manifest)).expect("provider schema serializes")
 }
@@ -217,19 +252,12 @@ pub fn discover(config: &Config) -> Result<Vec<Manifest>> {
     if !directory.exists() {
         return Ok(Vec::new());
     }
-    let mut entries: Vec<_> = fs::read_dir(directory)
-        .with_context(|| format!("read provider manifests from {}", directory.display()))?
-        .collect::<Result<_, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
+    let mut paths = Vec::new();
+    collect_manifest_paths(directory, &mut paths)?;
+    paths.sort();
     let mut providers = Vec::new();
-    for entry in entries {
-        let path = entry.path();
-        if !matches!(
-            path.extension().and_then(|value| value.to_str()),
-            Some("json" | "yaml" | "yml")
-        ) {
-            continue;
-        }
+    let mut names = BTreeSet::new();
+    for path in paths {
         let source = fs::read_to_string(&path)?;
         let provider: Manifest = if path.extension().and_then(|value| value.to_str())
             == Some("json")
@@ -239,9 +267,34 @@ pub fn discover(config: &Config) -> Result<Vec<Manifest>> {
             serde_yaml::from_str(&source).with_context(|| format!("parse {}", path.display()))?
         };
         validate_manifest(&provider, &path)?;
+        if !names.insert(provider.name.clone()) {
+            bail!(
+                "{}: duplicate provider name {}",
+                path.display(),
+                provider.name
+            );
+        }
         providers.push(provider);
     }
     Ok(providers)
+}
+
+fn collect_manifest_paths(directory: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(directory)
+        .with_context(|| format!("read provider manifests from {}", directory.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_manifest_paths(&path, paths)?;
+        } else if matches!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("json" | "yaml" | "yml")
+        ) {
+            paths.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn validate_manifest(provider: &Manifest, path: &Path) -> Result<()> {
@@ -803,6 +856,30 @@ pub fn describe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovers_nested_provider_manifests() {
+        let directory = tempfile::tempdir().expect("provider directory");
+        let nested = directory.path().join("example");
+        fs::create_dir_all(&nested).expect("nested provider directory");
+        fs::write(
+            nested.join("provider.yaml"),
+            r#"version: orc.provider/v1
+name: example
+command: example-provider
+actions:
+  session.bind: Bind a session
+"#,
+        )
+        .expect("provider manifest");
+        let mut config = Config::default();
+        config.providers.directory = directory.path().to_path_buf();
+
+        let providers = discover(&config).expect("nested provider discovered");
+
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].name, "example");
+    }
 
     #[test]
     fn attach_chain_composes_three_capabilities() {

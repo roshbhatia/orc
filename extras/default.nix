@@ -25,18 +25,28 @@ let
   };
   mkProvider =
     name:
-    writeShellApplication {
+    let
+      executable = writeShellApplication {
+        name = "orc-provider-${name}";
+        runtimeInputs = [
+          bash
+          coreutils
+          gnused
+          jq
+        ];
+        text = ''
+          export ORC_PROVIDER_KIND=${lib.escapeShellArg name}
+          export ORC_PROVIDER_HOLD=${lib.escapeShellArg (lib.getExe hold)}
+          ${builtins.readFile ./provider.sh}
+        '';
+      };
+    in
+    symlinkJoin {
       name = "orc-provider-${name}";
-      runtimeInputs = [
-        bash
-        coreutils
-        gnused
-        jq
-      ];
-      text = ''
-        export ORC_PROVIDER_KIND=${lib.escapeShellArg name}
-        export ORC_PROVIDER_HOLD=${lib.escapeShellArg (lib.getExe hold)}
-        ${builtins.readFile ./provider.sh}
+      paths = [ executable ];
+      postBuild = ''
+        mkdir -p "$out/share/orc/providers/${name}"
+        cp ${./.}/${name}/provider.yaml "$out/share/orc/providers/${name}/provider.yaml"
       '';
     };
   providers = {
@@ -53,9 +63,5 @@ providers
   all = symlinkJoin {
     name = "orc-providers";
     paths = (lib.attrValues providers) ++ [ hold ];
-    postBuild = ''
-      mkdir -p "$out/share/orc/providers"
-      cp ${./manifests}/*.yaml "$out/share/orc/providers/"
-    '';
   };
 }

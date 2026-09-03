@@ -7,6 +7,8 @@ expected output {{ node.expectedOutput }}
 {% for criterion in node.successCriteria %}  - {{ criterion }}
 {% endfor %}{% endif %}
 execution
-  {{ node.role }} · {{ node.harness }}{% if node.model %}/{{ node.model }}{% endif %} · {{ node.status }}
+  {{ node.role }} · {{ node.harness }}{% if node.model %}/{{ node.model }}{% endif %} · {% if node.execution %}{{ node.execution }}{% else %}unassigned{% endif %}
+  lifecycle     {{ node.status }}
+  judge         {{ node.judgePolicy }}
   attempt       {{ node.attempt }}
   reports to    {% if node.reviewBy %}{{ node.reviewBy }}{% else %}{{ node.completion }}{% endif %}

@@ -1,6 +1,6 @@
 {{ run.name }}
 
-status          {{ run.status }}
+status          {{ phase }}
 goal            {{ run.goal }}
 expected output {{ run.expectedOutput }}
 stages          {{ run.nodes | length }}

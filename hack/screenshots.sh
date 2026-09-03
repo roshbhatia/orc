@@ -114,7 +114,7 @@ critic=$(
   --session "$implementer" \
   --review-by review \
   --depends-on research \
-  --status working > /dev/null
+  --status queued > /dev/null
 
 "$ORC_SCREENSHOT_BIN" node upsert review \
   --scope "$ORC_SCREENSHOT_SCOPE" \

@@ -17,6 +17,6 @@ adapters they use and write YAML or JSON manifests under
 `~/.config/orc/providers/`. Use `orc provider validate` to test every adapter
 without opening the dashboard or launching a harness.
 
-Ready-to-install manifests live in [`manifests/`](manifests/). The combined
-extras package installs them under `share/orc/providers` so a system manager
-can link selected manifests into the user configuration.
+Each provider directory contains its ready-to-install `provider.yaml`. The
+combined extras package preserves that layout under `share/orc/providers` so a
+system manager can link selected providers into the user configuration.
