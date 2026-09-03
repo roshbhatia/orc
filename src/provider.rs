@@ -2149,7 +2149,7 @@ sleep 10
             directory.path(),
             "inherited-input",
             r#"#!/bin/sh
-(sleep 10) &
+(sleep 10 <&0) &
 exit 0
 "#,
         );

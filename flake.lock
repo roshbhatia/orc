@@ -73,11 +73,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1788473148,
-        "narHash": "sha256-2T0JGPJiCif51tQs4gWo/5aLcGDZkGNzZPvnXkokSr4=",
+        "lastModified": 1788474746,
+        "narHash": "sha256-wVryJQSscTJtufPCQQU+YzsodEDpTJWuzjZRxxCrzO4=",
         "owner": "roshbhatia",
         "repo": "traces",
-        "rev": "622634830f2d7f6e0ed9b5bbc277b499fe268838",
+        "rev": "90517b9cc7ed9b3672445438adc480cb44a33bff",
         "type": "github"
       },
       "original": {
