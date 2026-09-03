@@ -1739,12 +1739,12 @@ case "$request" in
     : > '{{ resolving }}'
     while [ ! -e '{{ release }}' ]; do sleep 0.01; done
     cat <<'JSON'
-{"version":"orc.provider/v1","command":["/usr/bin/touch","{{ launched }}"]}
+{"version":"orc.provider/v1","command":["touch","{{ launched }}"]}
 JSON
     ;;
   *session.stop*)
     cat <<'JSON'
-{"version":"orc.provider/v1","command":["/usr/bin/true"]}
+{"version":"orc.provider/v1","command":["true"]}
 JSON
     ;;
   *) printf '%s\n' 'null' ;;
@@ -1783,7 +1783,7 @@ JSON
     ;;
   *session.stop*)
     cat <<'JSON'
-{"version":"orc.provider/v1","command":["/bin/sh","-c","rm -f '{{ resource }}' && touch '{{ stopped }}'"]}
+{"version":"orc.provider/v1","command":["sh","-c","rm -f '{{ resource }}' && touch '{{ stopped }}'"]}
 JSON
     ;;
   *) printf '%s\n' 'null' ;;

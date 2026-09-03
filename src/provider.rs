@@ -1446,7 +1446,7 @@ impl ProcessGroup {
             };
             #[cfg(test)]
             let mut command = {
-                let mut command = Command::new("/bin/sh");
+                let mut command = Command::new("sh");
                 command
                     .args(["-c", TEST_PROCESS_MONITOR])
                     .stdin(Stdio::null())
