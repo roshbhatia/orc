@@ -144,7 +144,10 @@
                     ${pkgs.runtimeShell} -c '
                       mkdir -p "$ORC_PROVIDERS_DIRECTORY"
                       cp -R ${provider.adapter}/share/orc/providers/${name} "$ORC_PROVIDERS_DIRECTORY/${name}"
-                      orc provider validate ${name} --scope "$TMPDIR" --json > result.json
+                      if ! orc provider validate ${name} --scope "$TMPDIR" --json > result.json; then
+                        cat result.json >&2
+                        exit 1
+                      fi
                     '
                   jq -e '
                     length == 1
