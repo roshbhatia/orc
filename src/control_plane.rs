@@ -1133,6 +1133,16 @@ fn generated_resource(kind: ResourceKind, name: String, spec: Value) -> Resource
     }
 }
 
+fn generated_for_run(resource: &Resource, run_name: &str) -> bool {
+    resource.kind == ResourceKind::Execution
+        && resource.spec.get("runRef").and_then(Value::as_str) == Some(run_name)
+        && resource
+            .metadata
+            .field_owners
+            .get("spec")
+            .is_some_and(|owner| owner == "orc-reconciler")
+}
+
 fn reconcile_runs(store: &mut ControlStore) -> Result<bool> {
     let runs = store
         .resources
@@ -1171,6 +1181,7 @@ fn reconcile_runs(store: &mut ControlStore) -> Result<bool> {
                     .context("workflow stage name is required")
             })
             .collect::<Result<BTreeSet<_>>>()?;
+        let mut desired_executions = BTreeSet::new();
         for stage in stages {
             let stage_name = stage["name"]
                 .as_str()
@@ -1180,6 +1191,7 @@ fn reconcile_runs(store: &mut ControlStore) -> Result<bool> {
                 kind: ResourceKind::Execution,
                 name: execution_name.clone(),
             };
+            desired_executions.insert(execution_name.clone());
             let mut spec = stage
                 .as_object()
                 .context("workflow stage must be an object")?
@@ -1251,6 +1263,32 @@ fn reconcile_runs(store: &mut ControlStore) -> Result<bool> {
                 Some(_) => {}
             }
         }
+        let retired = store
+            .resources
+            .values()
+            .filter(|resource| generated_for_run(resource, &run.metadata.name))
+            .filter(|resource| !desired_executions.contains(&resource.metadata.name))
+            .filter(|resource| desired_state(resource) != "cancelled")
+            .map(Resource::key)
+            .collect::<Vec<_>>();
+        for key in retired {
+            store.resource_version += 1;
+            let resource_version = store.resource_version;
+            let execution = store
+                .resource_mut(&key)
+                .context("generated execution disappeared")?;
+            execution.spec["desiredState"] = Value::String("cancelled".into());
+            execution.metadata.generation += 1;
+            execution.metadata.resource_version = resource_version;
+            execution.metadata.updated_at = Utc::now();
+            store.emit(
+                "Normal",
+                "Pruned",
+                key.clone(),
+                format!("{key} retired after removal from {}", workflow.key()),
+            );
+            changed = true;
+        }
         let run_key = run.key();
         let phase = run_phase(store, &run.metadata.name);
         let current = store.resource_mut(&run_key).context("run disappeared")?;
@@ -1275,14 +1313,12 @@ fn run_phase(store: &ControlStore, run_name: &str) -> String {
     let phases = store
         .resources
         .values()
-        .filter(|resource| {
-            resource.kind == ResourceKind::Execution
-                && resource.spec.get("runRef").and_then(Value::as_str) == Some(run_name)
-        })
+        .filter(|resource| generated_for_run(resource, run_name))
+        .filter(|resource| desired_state(resource) != "cancelled")
         .map(|execution| execution.status.phase.as_str())
         .collect::<Vec<_>>();
     if phases.is_empty() {
-        "Pending".into()
+        "Succeeded".into()
     } else if phases.contains(&"Failed") {
         "Failed".into()
     } else if phases.iter().all(|phase| *phase == "Succeeded") {
@@ -2120,6 +2156,197 @@ mod tests {
         })
         .unwrap();
         assert!(stable.actions.is_empty());
+    }
+
+    #[test]
+    fn removed_completed_stage_is_cancelled_and_retained_for_audit() {
+        let scope = scope();
+        let workflow =
+            |stages: Value| resource(ResourceKind::Workflow, "release", json!({"stages": stages}));
+        apply(
+            scope.path(),
+            vec![
+                workflow(json!([{"name": "build", "provider": "fake"}])),
+                resource(
+                    ResourceKind::Run,
+                    "release-1",
+                    json!({"workflowRef": "release"}),
+                ),
+            ],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+        reconcile_with(scope.path(), 8, false, |_, _| {
+            Ok(ActionOutput {
+                provider: "fake".into(),
+                value: json!({"phase": "Succeeded"}),
+            })
+        })
+        .unwrap();
+        let before = list(
+            scope.path(),
+            Some(ResourceKind::Execution),
+            Some("release-1-build"),
+        )
+        .unwrap()
+        .remove(0);
+
+        apply(
+            scope.path(),
+            vec![workflow(json!([]))],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+        let reconciled = reconcile_with(scope.path(), 8, false, |capability, request| {
+            assert_eq!(capability, Capability::ExecutionCancel);
+            assert_eq!(request["resource"]["status"]["phase"], "Succeeded");
+            assert_eq!(request["resource"]["spec"]["desiredState"], "cancelled");
+            Ok(ActionOutput {
+                provider: "fake".into(),
+                value: json!({"phase": "Cancelled"}),
+            })
+        })
+        .unwrap();
+
+        assert_eq!(reconciled.actions.len(), 1);
+        let after = list(
+            scope.path(),
+            Some(ResourceKind::Execution),
+            Some("release-1-build"),
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(after.spec["desiredState"], "cancelled");
+        assert_eq!(after.status.phase, "Cancelled");
+        assert_eq!(after.metadata.generation, before.metadata.generation + 1);
+        assert_eq!(after.metadata.field_owners, before.metadata.field_owners);
+        assert_eq!(
+            list(scope.path(), Some(ResourceKind::Run), Some("release-1")).unwrap()[0]
+                .status
+                .phase,
+            "Succeeded"
+        );
+        assert!(
+            events(
+                scope.path(),
+                Some(ResourceKind::Execution),
+                Some("release-1-build"),
+                0
+            )
+            .unwrap()
+            .iter()
+            .any(|event| event.reason == "Pruned")
+        );
+    }
+
+    #[test]
+    fn removed_running_stage_is_cancelled_but_external_execution_is_preserved() {
+        let scope = scope();
+        apply(
+            scope.path(),
+            vec![
+                resource(
+                    ResourceKind::Workflow,
+                    "release",
+                    json!({"stages": [{"name": "build"}]}),
+                ),
+                resource(
+                    ResourceKind::Run,
+                    "release-1",
+                    json!({"workflowRef": "release"}),
+                ),
+            ],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+        reconcile_with(scope.path(), 1, false, |capability, _| {
+            assert_eq!(capability, Capability::ExecutionEnsure);
+            Ok(ActionOutput {
+                provider: "fake".into(),
+                value: json!({"phase": "Running"}),
+            })
+        })
+        .unwrap();
+        apply(
+            scope.path(),
+            vec![resource(
+                ResourceKind::Execution,
+                "external",
+                json!({
+                    "runRef": "release-1",
+                    "desiredState": "running"
+                }),
+            )],
+            "operator",
+            false,
+            false,
+        )
+        .unwrap();
+        let external_before = list(
+            scope.path(),
+            Some(ResourceKind::Execution),
+            Some("external"),
+        )
+        .unwrap()
+        .remove(0);
+        apply(
+            scope.path(),
+            vec![resource(
+                ResourceKind::Workflow,
+                "release",
+                json!({"stages": []}),
+            )],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+        let mut cancelled = Vec::new();
+        reconcile_with(scope.path(), 8, false, |capability, request| {
+            let name = request["resource"]["metadata"]["name"].as_str().unwrap();
+            let phase = match (name, capability) {
+                ("external", Capability::ExecutionEnsure) => "Succeeded",
+                ("release-1-build", Capability::ExecutionCancel) => {
+                    cancelled.push(name.to_owned());
+                    "Cancelled"
+                }
+                _ => panic!("unexpected action {capability} for {name}"),
+            };
+            Ok(ActionOutput {
+                provider: "fake".into(),
+                value: json!({"phase": phase}),
+            })
+        })
+        .unwrap();
+
+        assert_eq!(cancelled, vec!["release-1-build"]);
+        let generated = list(
+            scope.path(),
+            Some(ResourceKind::Execution),
+            Some("release-1-build"),
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(generated.status.phase, "Cancelled");
+        let external_after = list(
+            scope.path(),
+            Some(ResourceKind::Execution),
+            Some("external"),
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(
+            external_after.metadata.generation,
+            external_before.metadata.generation
+        );
+        assert_eq!(external_after.spec, external_before.spec);
+        assert_eq!(external_after.status.phase, "Succeeded");
     }
 
     #[test]
