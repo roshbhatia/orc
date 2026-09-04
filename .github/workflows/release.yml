@@ -26,14 +26,30 @@ jobs:
         include:
           - runner: ubuntu-latest
             system: x86_64-linux
+            target: x86_64-unknown-linux-gnu
+            release_os: linux
+            release_arch: amd64
           - runner: ubuntu-24.04-arm
             system: aarch64-linux
+            target: aarch64-unknown-linux-gnu
+            release_os: linux
+            release_arch: arm64
           - runner: macos-15
             system: aarch64-darwin
+            target: aarch64-apple-darwin
+            release_os: darwin
+            release_arch: arm64
+          - runner: macos-15
+            system: x86_64-darwin
+            target: x86_64-apple-darwin
+            release_os: darwin
+            release_arch: amd64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: cachix/install-nix-action@v31
       - name: Run required checks
         run: |
@@ -43,8 +59,9 @@ jobs:
           nix flake check --accept-flake-config --print-build-logs
           nix flake check --accept-flake-config --print-build-logs ./extras
       - run: |
-          cargo build --locked --release
-          archive="orc-${{ runner.os }}-${{ runner.arch }}"
+          cargo build --locked --release --target "${{ matrix.target }}"
+          archive="orc_${GITHUB_REF_NAME#v}_${{ matrix.release_os }}_${{ matrix.release_arch }}"
+          binary="target/${{ matrix.target }}/release/orc"
           mkdir -p dist
           mkdir -p \
             "$archive/bin" \
@@ -53,20 +70,20 @@ jobs:
             "$archive/share/nushell/vendor/autoload" \
             "$archive/share/orc" \
             "$archive/share/zsh/site-functions"
-          install -m 0755 target/release/orc "$archive/bin/orc"
+          install -m 0755 "$binary" "$archive/bin/orc"
           install -m 0644 LICENSE README.md "$archive/"
-          target/release/orc completion bash > "$archive/share/bash-completion/completions/orc"
-          target/release/orc completion fish > "$archive/share/fish/vendor_completions.d/orc.fish"
-          target/release/orc completion nu > "$archive/share/nushell/vendor/autoload/orc.nu"
-          target/release/orc completion zsh > "$archive/share/zsh/site-functions/_orc"
+          "$binary" completion bash > "$archive/share/bash-completion/completions/orc"
+          "$binary" completion fish > "$archive/share/fish/vendor_completions.d/orc.fish"
+          "$binary" completion nu > "$archive/share/nushell/vendor/autoload/orc.nu"
+          "$binary" completion zsh > "$archive/share/zsh/site-functions/_orc"
           for schema in config provider state workflow; do
-            target/release/orc schema "$schema" > "$archive/share/orc/$schema.schema.json"
+            "$binary" schema "$schema" > "$archive/share/orc/$schema.schema.json"
           done
           tar -czf "dist/$archive.tar.gz" "$archive"
           (cd dist && shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256")
       - uses: actions/upload-artifact@v7
         with:
-          name: orc-${{ runner.os }}-${{ runner.arch }}
+          name: orc-${{ matrix.release_os }}-${{ matrix.release_arch }}
           path: dist/*
 
   release:
@@ -79,6 +96,7 @@ jobs:
           merge-multiple: true
       - name: Create or update release
         run: |
+          (cd dist && cat ./*.sha256 > checksums.txt)
           if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
           else
