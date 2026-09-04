@@ -1,11 +1,15 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     str::FromStr,
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -315,14 +319,45 @@ fn read_store(scope: &Path) -> Result<ControlStore> {
 
 fn write_store(scope: &Path, store: &ControlStore) -> Result<()> {
     let target = control_path(scope);
+    let parent = prepare_state_directory(&target)?;
+    let temporary = parent.join(format!(".{}.tmp", Uuid::new_v4()));
+    let bytes = serde_json::to_vec_pretty(store)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temporary)
+        .context("create private temporary control-plane state")?;
+    file.write_all(&bytes)
+        .context("write temporary control-plane state")?;
+    file.sync_all()
+        .context("sync temporary control-plane state")?;
+    fs::rename(&temporary, &target).context("commit control-plane state")?;
+    Ok(())
+}
+
+fn prepare_state_directory(target: &Path) -> Result<&Path> {
     let parent = target
         .parent()
         .context("control-plane state has no parent")?;
+    if let Some(orc) = parent.parent() {
+        fs::create_dir_all(orc).context("create Orc state directory")?;
+        set_private_directory_permissions(orc)?;
+    }
     fs::create_dir_all(parent).context("create control-plane state directory")?;
-    let temporary = parent.join(format!(".{}.tmp", Uuid::new_v4()));
-    fs::write(&temporary, serde_json::to_vec_pretty(store)?)
-        .context("write temporary control-plane state")?;
-    fs::rename(&temporary, &target).context("commit control-plane state")?;
+    set_private_directory_permissions(parent)?;
+    Ok(parent)
+}
+
+#[cfg(unix)]
+fn set_private_directory_permissions(path: &Path) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("secure state directory {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_private_directory_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -331,6 +366,7 @@ fn update_store<T>(
     operation: impl FnOnce(&mut ControlStore) -> Result<T>,
 ) -> Result<T> {
     let target = control_path(scope);
+    prepare_state_directory(&target)?;
     state::with_path_lock(&target, || {
         let mut store = read_store(scope)?;
         let result = operation(&mut store)?;
@@ -386,6 +422,213 @@ fn validate_resource(resource: &Resource) -> Result<()> {
     if !resource.spec.is_object() {
         bail!("{} spec must be an object", resource.key());
     }
+    let spec = resource.spec.as_object().context("validated object spec")?;
+    match resource.kind {
+        ResourceKind::Workflow => validate_workflow_spec(resource, spec)?,
+        ResourceKind::Run => {
+            required_nonempty_string(spec, "workflowRef", &resource.key().to_string())?;
+            if spec
+                .get("parameters")
+                .is_some_and(|parameters| !parameters.is_object())
+            {
+                bail!("{} spec.parameters must be an object", resource.key());
+            }
+        }
+        ResourceKind::Session => validate_provider_inputs(resource, spec)?,
+        ResourceKind::Execution => validate_execution_spec(resource, spec)?,
+        ResourceKind::EventBinding => validate_event_binding_spec(resource, spec)?,
+        ResourceKind::Artifact => validate_artifact_spec(resource, spec)?,
+    }
+    Ok(())
+}
+
+fn required_nonempty_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> Result<&'a str> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .with_context(|| format!("{context} spec.{field} must be a nonempty string"))
+}
+
+fn validate_optional_nonempty_string(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> Result<()> {
+    if object.contains_key(field) {
+        required_nonempty_string(object, field, context)?;
+    }
+    Ok(())
+}
+
+fn validate_string_array(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    context: &str,
+) -> Result<Vec<String>> {
+    let Some(value) = object.get(field) else {
+        return Ok(Vec::new());
+    };
+    let values = value
+        .as_array()
+        .with_context(|| format!("{context} spec.{field} must be an array of strings"))?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .with_context(|| format!("{context} spec.{field} entries must be nonempty strings"))
+        })
+        .collect()
+}
+
+fn validate_inputs(object: &serde_json::Map<String, Value>, context: &str) -> Result<()> {
+    let Some(inputs) = object.get("inputs") else {
+        return Ok(());
+    };
+    let inputs = inputs
+        .as_object()
+        .with_context(|| format!("{context} spec.inputs must be an object"))?;
+    for (name, value) in inputs {
+        if name.trim().is_empty() {
+            bail!("{context} spec.inputs keys must be nonempty");
+        }
+        let Some(input) = value.as_object() else {
+            continue;
+        };
+        let has_artifact = input.contains_key("artifactRef");
+        let has_execution = input.contains_key("executionRef");
+        if has_artifact && has_execution {
+            bail!("{context} input {name} cannot combine artifactRef and executionRef");
+        }
+        if has_artifact {
+            required_nonempty_string(input, "artifactRef", context)?;
+            if input.contains_key("output") {
+                bail!("{context} artifact input {name} cannot define output");
+            }
+        }
+        if has_execution {
+            required_nonempty_string(input, "executionRef", context)?;
+            required_nonempty_string(input, "output", context)?;
+        } else if input.contains_key("output") {
+            bail!("{context} input {name} defines output without executionRef");
+        }
+    }
+    Ok(())
+}
+
+fn validate_provider_inputs(
+    resource: &Resource,
+    object: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    let context = resource.key().to_string();
+    validate_optional_nonempty_string(object, "provider", &context)?;
+    validate_inputs(object, &context)
+}
+
+fn validate_execution_fields(object: &serde_json::Map<String, Value>, context: &str) -> Result<()> {
+    validate_optional_nonempty_string(object, "provider", context)?;
+    validate_inputs(object, context)?;
+    validate_string_array(object, "dependsOn", context)?;
+    if let Some(desired_state) = object.get("desiredState") {
+        match desired_state.as_str() {
+            Some("running" | "cancelled") => {}
+            _ => bail!("{context} spec.desiredState must be running or cancelled"),
+        }
+    }
+    Ok(())
+}
+
+fn validate_execution_spec(
+    resource: &Resource,
+    object: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    validate_execution_fields(object, &resource.key().to_string())
+}
+
+fn validate_workflow_spec(
+    resource: &Resource,
+    object: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    let context = resource.key().to_string();
+    let stages = object
+        .get("stages")
+        .and_then(Value::as_array)
+        .with_context(|| format!("{context} spec.stages must be an array"))?;
+    let mut names = BTreeSet::new();
+    let mut dependencies = Vec::new();
+    for (index, stage) in stages.iter().enumerate() {
+        let stage = stage
+            .as_object()
+            .with_context(|| format!("{context} stage {index} must be an object"))?;
+        let stage_context = format!("{context} stage {index}");
+        let name = required_nonempty_string(stage, "name", &stage_context)?.to_owned();
+        if !names.insert(name.clone()) {
+            bail!("{context} has duplicate stage {name}");
+        }
+        validate_execution_fields(stage, &stage_context)?;
+        dependencies.push((
+            name,
+            validate_string_array(stage, "dependsOn", &stage_context)?,
+        ));
+    }
+    for (stage, stage_dependencies) in dependencies {
+        for dependency in stage_dependencies {
+            if dependency == stage {
+                bail!("{context} stage {stage} cannot depend on itself");
+            }
+            if !names.contains(&dependency) {
+                bail!("{context} stage {stage} depends on missing stage {dependency}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_event_binding_spec(
+    resource: &Resource,
+    object: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    let context = resource.key().to_string();
+    validate_provider_inputs(resource, object)?;
+    for event_type in validate_string_array(object, "eventTypes", &context)? {
+        if !matches!(event_type.as_str(), "Normal" | "Warning") {
+            bail!("{context} spec.eventTypes entries must be Normal or Warning");
+        }
+    }
+    validate_string_array(object, "reasons", &context)?;
+    for kind in validate_string_array(object, "subjectKinds", &context)? {
+        ResourceKind::from_str(&kind)
+            .with_context(|| format!("{context} spec.subjectKinds contains {kind}"))?;
+    }
+    Ok(())
+}
+
+fn validate_artifact_spec(
+    resource: &Resource,
+    object: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    let context = resource.key().to_string();
+    validate_optional_nonempty_string(object, "mediaType", &context)?;
+    if object.contains_key("content") {
+        return Ok(());
+    }
+    let digest = required_nonempty_string(object, "digest", &context)?;
+    let valid_digest = digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64 && hex.chars().all(|character| character.is_ascii_hexdigit())
+    });
+    if !valid_digest {
+        bail!("{context} spec.digest must be a sha256 digest");
+    }
+    if object.get("size").and_then(Value::as_u64).is_none() {
+        bail!("{context} spec.size must be a nonnegative integer");
+    }
     Ok(())
 }
 
@@ -435,6 +678,8 @@ pub fn diff(scope: &Path, resources: &[Resource]) -> Result<Vec<ResourceChange>>
     let store = read_store(&scope)?;
     let mut changes = Vec::new();
     for resource in resources {
+        validate_resource(resource)?;
+        validate_artifact_body(&store, resource)?;
         let mut resource = resource.clone();
         normalize_artifact(&mut resource)?;
         let current = store.resource(&resource.key());
@@ -464,10 +709,14 @@ pub fn apply(
     if field_manager.trim().is_empty() {
         bail!("field manager must not be empty");
     }
+    for resource in &resources {
+        validate_resource(resource)?;
+    }
     let scope = state::resolve_scope(scope)?;
     let operation = |store: &mut ControlStore| {
         let mut changes = Vec::new();
         for mut incoming in resources {
+            validate_artifact_body(store, &incoming)?;
             let artifact = normalize_artifact(&mut incoming)?;
             let key = incoming.key();
             let current = store.resource(&key).cloned();
@@ -549,6 +798,24 @@ pub fn apply(
     } else {
         update_store(&scope, operation)
     }
+}
+
+fn validate_artifact_body(store: &ControlStore, resource: &Resource) -> Result<()> {
+    if resource.kind != ResourceKind::Artifact || resource.spec.get("content").is_some() {
+        return Ok(());
+    }
+    let digest = resource
+        .spec
+        .get("digest")
+        .and_then(Value::as_str)
+        .context("artifact digest is required when content is absent")?;
+    if !store.artifacts.contains_key(digest) {
+        bail!(
+            "{} references missing artifact body {digest}",
+            resource.key()
+        );
+    }
+    Ok(())
 }
 
 fn normalize_artifact(resource: &mut Resource) -> Result<Option<(String, ArtifactReference)>> {
@@ -913,9 +1180,6 @@ fn reconcile_runs(store: &mut ControlStore) -> Result<bool> {
                 kind: ResourceKind::Execution,
                 name: execution_name.clone(),
             };
-            if store.resource(&key).is_some() {
-                continue;
-            }
             let mut spec = stage
                 .as_object()
                 .context("workflow stage must be an object")?
@@ -940,18 +1204,52 @@ fn reconcile_runs(store: &mut ControlStore) -> Result<bool> {
             spec.insert("runRef".into(), Value::String(run.metadata.name.clone()));
             spec.entry("desiredState")
                 .or_insert_with(|| Value::String("running".into()));
-            store.resource_version += 1;
-            let mut execution =
-                generated_resource(ResourceKind::Execution, execution_name, Value::Object(spec));
-            execution.metadata.resource_version = store.resource_version;
-            store.resources.insert(key.to_string(), execution);
-            store.emit(
-                "Normal",
-                "Created",
-                key.clone(),
-                format!("{key} materialized from {}", workflow.key()),
-            );
-            changed = true;
+            let desired_spec = Value::Object(spec);
+            match store.resource(&key).cloned() {
+                None => {
+                    store.resource_version += 1;
+                    let mut execution =
+                        generated_resource(ResourceKind::Execution, execution_name, desired_spec);
+                    execution.metadata.resource_version = store.resource_version;
+                    store.resources.insert(key.to_string(), execution);
+                    store.emit(
+                        "Normal",
+                        "Created",
+                        key.clone(),
+                        format!("{key} materialized from {}", workflow.key()),
+                    );
+                    changed = true;
+                }
+                Some(existing) if existing.spec != desired_spec => {
+                    let owned_by_reconciler = existing
+                        .metadata
+                        .field_owners
+                        .get("spec")
+                        .is_some_and(|owner| owner == "orc-reconciler");
+                    let belongs_to_run = existing.spec.get("runRef").and_then(Value::as_str)
+                        == Some(run.metadata.name.as_str());
+                    if !owned_by_reconciler || !belongs_to_run {
+                        bail!("{key} conflicts with a non-generated execution");
+                    }
+                    store.resource_version += 1;
+                    let resource_version = store.resource_version;
+                    let execution = store
+                        .resource_mut(&key)
+                        .context("generated execution disappeared")?;
+                    execution.spec = desired_spec;
+                    execution.metadata.generation += 1;
+                    execution.metadata.resource_version = resource_version;
+                    execution.metadata.updated_at = Utc::now();
+                    store.emit(
+                        "Normal",
+                        "Configured",
+                        key.clone(),
+                        format!("{key} updated from {}", workflow.key()),
+                    );
+                    changed = true;
+                }
+                Some(_) => {}
+            }
         }
         let run_key = run.key();
         let phase = run_phase(store, &run.metadata.name);
@@ -1441,7 +1739,7 @@ mod tests {
             vec![resource(
                 ResourceKind::Workflow,
                 "build",
-                json!({"goal": "ship"}),
+                json!({"goal": "ship", "stages": []}),
             )],
             "test",
             false,
@@ -1454,6 +1752,66 @@ mod tests {
     }
 
     #[test]
+    fn invalid_execution_dependencies_are_rejected_before_state_changes() {
+        let scope = scope();
+        let invalid = resource(
+            ResourceKind::Execution,
+            "verify",
+            json!({"dependsOn": "build", "desiredState": "running"}),
+        );
+
+        let error = apply(scope.path(), vec![invalid.clone()], "test", false, true).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("spec.dependsOn must be an array of strings")
+        );
+        assert!(diff(scope.path(), &[invalid]).is_err());
+        assert!(!control_path(scope.path()).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_state_remains_private_across_atomic_replacement() {
+        let scope = scope();
+        for goal in ["one", "two"] {
+            apply(
+                scope.path(),
+                vec![resource(
+                    ResourceKind::Workflow,
+                    "build",
+                    json!({"goal": goal, "stages": []}),
+                )],
+                "test",
+                false,
+                false,
+            )
+            .unwrap();
+            let path = control_path(&state::resolve_scope(scope.path()).unwrap());
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(path.parent().unwrap().parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
     fn field_ownership_rejects_conflicting_manager() {
         let scope = scope();
         apply(
@@ -1461,7 +1819,7 @@ mod tests {
             vec![resource(
                 ResourceKind::Workflow,
                 "build",
-                json!({"goal": "one"}),
+                json!({"goal": "one", "stages": []}),
             )],
             "first",
             false,
@@ -1473,7 +1831,7 @@ mod tests {
             vec![resource(
                 ResourceKind::Workflow,
                 "build",
-                json!({"goal": "two"}),
+                json!({"goal": "two", "stages": []}),
             )],
             "second",
             false,
@@ -1533,6 +1891,29 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn artifact_digest_cannot_reference_a_missing_body() {
+        let scope = scope();
+        let dangling = resource(
+            ResourceKind::Artifact,
+            "report",
+            json!({
+                "digest": format!("sha256:{}", "0".repeat(64)),
+                "size": 8,
+                "mediaType": "text/plain"
+            }),
+        );
+
+        let error = apply(scope.path(), vec![dangling.clone()], "test", false, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("references missing artifact body")
+        );
+        assert!(diff(scope.path(), &[dangling]).is_err());
+        assert!(!control_path(scope.path()).exists());
     }
 
     #[test]
@@ -1643,6 +2024,105 @@ mod tests {
     }
 
     #[test]
+    fn workflow_update_reconfigures_existing_execution() {
+        let scope = scope();
+        let workflow = |provider: &str, command: &str, depends_on: Value| {
+            resource(
+                ResourceKind::Workflow,
+                "release",
+                json!({"stages": [
+                    {"name": "prepare", "provider": "v1", "command": ["prepare"]},
+                    {
+                        "name": "build",
+                        "provider": provider,
+                        "command": [command],
+                        "dependsOn": depends_on
+                    }
+                ]}),
+            )
+        };
+        apply(
+            scope.path(),
+            vec![
+                workflow("v1", "build-v1", json!([])),
+                resource(
+                    ResourceKind::Run,
+                    "release-1",
+                    json!({"workflowRef": "release"}),
+                ),
+            ],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+        reconcile_with(scope.path(), 8, false, |_, _| {
+            Ok(ActionOutput {
+                provider: "fake".into(),
+                value: json!({"phase": "Succeeded"}),
+            })
+        })
+        .unwrap();
+        let before = list(
+            scope.path(),
+            Some(ResourceKind::Execution),
+            Some("release-1-build"),
+        )
+        .unwrap()
+        .remove(0);
+
+        apply(
+            scope.path(),
+            vec![workflow("v2", "build-v2", json!(["prepare"]))],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+        let mut requests = Vec::new();
+        let reconciled = reconcile_with(scope.path(), 8, false, |capability, request| {
+            requests.push((capability, request));
+            Ok(ActionOutput {
+                provider: "fake".into(),
+                value: json!({"phase": "Succeeded"}),
+            })
+        })
+        .unwrap();
+
+        assert_eq!(reconciled.actions.len(), 1);
+        assert_eq!(
+            reconciled.actions[0].capability,
+            Capability::ExecutionEnsure
+        );
+        assert_eq!(requests.len(), 1);
+        let requested = &requests[0].1["resource"];
+        assert_eq!(requested["status"]["phase"], "Succeeded");
+        assert_eq!(requested["status"]["observedGeneration"], 1);
+        assert_eq!(requested["spec"]["provider"], "v2");
+        assert_eq!(requested["spec"]["command"], json!(["build-v2"]));
+        assert_eq!(requested["spec"]["dependsOn"], json!(["release-1-prepare"]));
+
+        let after = list(
+            scope.path(),
+            Some(ResourceKind::Execution),
+            Some("release-1-build"),
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(after.metadata.generation, before.metadata.generation + 1);
+        assert!(after.metadata.resource_version > before.metadata.resource_version);
+        assert_eq!(after.metadata.field_owners, before.metadata.field_owners);
+        assert_eq!(after.status.phase, "Succeeded");
+        assert_eq!(after.status.observed_generation, after.metadata.generation);
+
+        let stable = reconcile_with(scope.path(), 8, false, |_, _| {
+            panic!("unchanged generated execution must not rerun")
+        })
+        .unwrap();
+        assert!(stable.actions.is_empty());
+    }
+
+    #[test]
     fn reconcile_dry_run_never_invokes_or_persists() {
         let scope = scope();
         apply(
@@ -1669,7 +2149,7 @@ mod tests {
     }
 
     #[test]
-    fn event_delivery_is_exactly_once_per_binding_and_event() {
+    fn event_delivery_stops_after_provider_acknowledgement() {
         let scope = scope();
         apply(
             scope.path(),
@@ -1679,7 +2159,11 @@ mod tests {
                     "notify",
                     json!({"reasons": ["Created"]}),
                 ),
-                resource(ResourceKind::Workflow, "build", json!({"goal": "ship"})),
+                resource(
+                    ResourceKind::Workflow,
+                    "build",
+                    json!({"goal": "ship", "stages": []}),
+                ),
             ],
             "test",
             false,
@@ -1710,6 +2194,55 @@ mod tests {
         .unwrap()
         .remove(0);
         assert_eq!(binding.status.delivered_events.len(), 1);
+    }
+
+    #[test]
+    fn event_delivery_retries_with_a_stable_operation_id() {
+        let scope = scope();
+        apply(
+            scope.path(),
+            vec![
+                resource(
+                    ResourceKind::EventBinding,
+                    "notify",
+                    json!({"reasons": ["Created"], "subjectKinds": ["Workflow"]}),
+                ),
+                resource(
+                    ResourceKind::Workflow,
+                    "build",
+                    json!({"goal": "ship", "stages": []}),
+                ),
+            ],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+
+        let mut operation_ids = Vec::new();
+        let first = reconcile_with(scope.path(), 4, false, |capability, request| {
+            assert_eq!(capability, Capability::EventDeliver);
+            operation_ids.push(request["operationId"].as_str().unwrap().to_owned());
+            Err(anyhow::anyhow!(
+                "provider performed its side effect, then returned invalid JSON"
+            ))
+        })
+        .unwrap();
+        assert_eq!(first.actions.len(), 1);
+        assert!(first.actions[0].error.is_some());
+
+        let second = reconcile_with(scope.path(), 4, false, |capability, request| {
+            assert_eq!(capability, Capability::EventDeliver);
+            operation_ids.push(request["operationId"].as_str().unwrap().to_owned());
+            Ok(ActionOutput {
+                provider: "fake".into(),
+                value: json!({"status": "delivered"}),
+            })
+        })
+        .unwrap();
+        assert_eq!(second.actions.len(), 1);
+        assert_eq!(operation_ids.len(), 2);
+        assert_eq!(operation_ids[0], operation_ids[1]);
     }
 
     #[test]

@@ -192,11 +192,11 @@ inputs:
 ```
 
 `EventBinding` filters durable events by `eventTypes`, `reasons`, and
-`subjectKinds`, then delivers each match once through `event.deliver`.
-Providers receive a stable
-`operationId`, the complete resource, resolved inputs, and the event when one
-exists. A provider may return observed state directly or a command plan. The
-declarative provider capabilities are:
+`subjectKinds`, then delivers each match through `event.deliver`. Delivery is
+at least once. Providers receive a stable `operationId`, the complete resource,
+resolved inputs, and the event when one exists. A provider with side effects
+must deduplicate retries by operation ID. A provider may return observed state
+directly or a command plan. The declarative provider capabilities are:
 
 ```text
 execution.ensure   make desired execution state exist
@@ -204,7 +204,7 @@ execution.observe  refresh observed execution state
 execution.cancel   stop an execution idempotently
 execution.logs     return execution logs
 session.observe    refresh session state
-event.deliver      execute an EventBinding hook once per event
+event.deliver      execute an idempotent EventBinding hook
 ```
 
 The bundled local provider reads `spec.command` for `execution.ensure`. Other
@@ -217,7 +217,9 @@ JSON observation such as:
 
 An action can set `cwd` and `environment` beside `command`. The provider only
 translates the resource into a command plan. Orc owns execution, timeout
-handling, output capture, and status persistence.
+handling, output capture, and status persistence. The local provider exposes
+the stable operation ID to each command as `ORC_OPERATION_ID`; a command with
+side effects must persist a receipt before acknowledging delivery.
 
 `orc watch` emits JSON lines and always stops at the requested event count or
 timeout. The maximum timeout is one hour. See

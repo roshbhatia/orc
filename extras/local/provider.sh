@@ -8,7 +8,7 @@ source "$provider_library"
 provider_init "local"
 
 emit_resource_action() {
-  local action command_cwd command_environment value
+  local action command_cwd command_environment operation_id value
   local -a plan_command=()
   action=$(jq -c --arg capability "$capability" \
     '.resource.spec.actions[$capability] // {} | objects' <<< "$request")
@@ -23,7 +23,9 @@ emit_resource_action() {
     plan_command+=("$value")
   done < <(jq -j '.command | .[] | @text, "\u0000"' <<< "$action")
   command_cwd=$(jq -r --arg scope "$scope" '.cwd // $scope' <<< "$action")
-  command_environment=$(jq -ce '.environment // {} | objects' <<< "$action")
+  operation_id=$(jq -er '.operationId' <<< "$request")
+  command_environment=$(jq -ce --arg operation_id "$operation_id" \
+    '(.environment // {} | objects) + {ORC_OPERATION_ID: $operation_id}' <<< "$action")
   emit_plan "$command_cwd" "$command_environment" "${plan_command[@]}"
 }
 

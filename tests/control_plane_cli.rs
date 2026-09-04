@@ -24,6 +24,7 @@ metadata:
   name: build
 spec:
   goal: {goal}
+  stages: []
 "#
         ),
     )
@@ -145,8 +146,16 @@ case "$request" in
     printf '%s\n' '{"version":"orc.provider/v1","phase":"Succeeded","outputs":{"result":"verified"}}'
     ;;
   *event.deliver*)
-    printf '%s\n' delivered >> "$MARKER"
-    printf '%s\n' '{"version":"orc.provider/v1","status":"delivered"}'
+    operation_id=${request#*\"operationId\":\"}
+    operation_id=${operation_id%%\"*}
+    receipt="$MARKER.$operation_id"
+    if [ ! -e "$receipt" ]; then
+      printf '%s\n' delivered >> "$MARKER"
+      : > "$receipt"
+      printf '%s\n' 'not-json'
+    else
+      printf '%s\n' '{"version":"orc.provider/v1","status":"delivered"}'
+    fi
     ;;
   *execution.logs*)
     printf '%s\n' '{"version":"orc.provider/v1","status":"ok","logs":"build complete\n"}'
@@ -209,7 +218,7 @@ spec:
         ])
         .output()
         .unwrap();
-    assert!(applied.status.success());
+    assert!(!applied.status.success());
     let mut delivery_counts = vec![fs::read_to_string(&marker).unwrap().lines().count()];
     for _ in 0..1 {
         let reconciled = Command::new(env!("CARGO_BIN_EXE_orc"))
