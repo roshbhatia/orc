@@ -38,6 +38,7 @@ const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PROVIDER_CACHE_ENTRIES: usize = 256;
 const MAX_PROVIDER_CACHE_ENTRY_BYTES: u64 = 1024 * 1024;
 const MAX_PROVIDER_OUTPUT_BYTES: usize = 1024 * 1024;
+const LAUNCH_OWNERSHIP_LABEL_PREFIX: &str = "Launch ownership: ";
 
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
@@ -87,12 +88,13 @@ impl std::fmt::Display for Capability {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 pub struct Manifest {
     pub version: String,
+    #[schemars(regex(pattern = r"^[a-z0-9._-]+$"))]
     pub name: String,
     #[serde(default = "default_description")]
     pub description: String,
     #[serde(default = "default_kind")]
     pub kind: ProviderKind,
-    pub command: String,
+    pub command: ProviderCommand,
     #[serde(default)]
     pub actions: BTreeMap<Capability, String>,
     #[serde(default)]
@@ -101,6 +103,72 @@ pub struct Manifest {
     pub requires: Requirements,
     #[serde(default)]
     pub priority: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(untagged)]
+pub enum ProviderCommand {
+    Program(#[schemars(length(min = 1))] String),
+    Argv(#[schemars(length(min = 1), inner(length(min = 1)))] Vec<String>),
+}
+
+impl Default for ProviderCommand {
+    fn default() -> Self {
+        Self::Program(String::new())
+    }
+}
+
+impl ProviderCommand {
+    fn program(&self) -> Option<&str> {
+        match self {
+            Self::Program(program) => Some(program.as_str()),
+            Self::Argv(command) => command.first().map(String::as_str),
+        }
+        .filter(|program| !program.is_empty())
+    }
+
+    fn arguments(&self) -> &[String] {
+        match self {
+            Self::Program(_) => &[],
+            Self::Argv(command) => command.get(1..).unwrap_or_default(),
+        }
+    }
+
+    fn valid(&self) -> bool {
+        self.program().is_some()
+            && match self {
+                Self::Program(_) => true,
+                Self::Argv(command) => command.iter().all(|part| !part.is_empty()),
+            }
+    }
+
+    fn resolve_relative_paths(&mut self, directory: &Path) {
+        let resolve = |value: &mut String| {
+            let path = Path::new(value);
+            if path.is_relative()
+                && (value.starts_with("./") || value.starts_with("../") || value.contains('/'))
+            {
+                let joined = directory.join(path);
+                *value = fs::canonicalize(&joined)
+                    .unwrap_or(joined)
+                    .display()
+                    .to_string();
+            }
+        };
+        match self {
+            Self::Program(program) => resolve(program),
+            Self::Argv(command) => {
+                if let Some(program) = command.first_mut() {
+                    resolve(program);
+                }
+                for argument in command.iter_mut().skip(1) {
+                    if argument.starts_with("./") || argument.starts_with("../") {
+                        resolve(argument);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
@@ -174,6 +242,19 @@ pub struct Validation {
     pub provider: Manifest,
     pub status: CheckStatus,
     pub checks: Vec<ValidationCheck>,
+}
+
+#[derive(Debug)]
+struct InvalidManifest {
+    path: PathBuf,
+    name: Option<String>,
+    error: String,
+}
+
+#[derive(Debug, Default)]
+struct Discovery {
+    providers: Vec<Manifest>,
+    invalid: Vec<InvalidManifest>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -267,15 +348,173 @@ pub fn resolve_activity_plan(
 }
 
 pub fn schema() -> serde_json::Value {
-    serde_json::to_value(schema_for!(Manifest)).expect("provider schema serializes")
+    let mut schema =
+        serde_json::to_value(schema_for!(Manifest)).expect("provider schema serializes");
+    schema["properties"]["version"] = json!({"const": "orc.provider/v1", "type": "string"});
+    schema["allOf"] = json!([{
+        "anyOf": [
+            {
+                "properties": {"actions": {"minProperties": 1}},
+                "required": ["actions"]
+            },
+            {
+                "properties": {"capabilities": {"minItems": 1}},
+                "required": ["capabilities"]
+            }
+        ]
+    }]);
+    schema
 }
 
 pub fn discover(config: &Config) -> Result<Vec<Manifest>> {
-    discover_in(config.provider_directories())
+    Ok(discover_with_diagnostics(config.provider_directories())?.providers)
 }
 
+pub(crate) fn runtime_fingerprint(config: &Config) -> Result<Value> {
+    let discovery = discover_with_diagnostics(config.provider_directories())?;
+    let providers = discovery
+        .providers
+        .iter()
+        .map(|provider| {
+            let program = provider.command.program().unwrap_or_default();
+            let resolved = which::which(program).unwrap_or_else(|_| PathBuf::from(program));
+            let canonical = fs::canonicalize(&resolved).unwrap_or(resolved);
+            let command_identities = std::iter::once(canonical.clone())
+                .chain(
+                    provider
+                        .command
+                        .arguments()
+                        .iter()
+                        .map(PathBuf::from)
+                        .filter(|path| path.is_file()),
+                )
+                .map(|path| {
+                    let canonical = fs::canonicalize(&path).unwrap_or(path);
+                    json!({
+                        "path": canonical,
+                        "identity": file_identity(&canonical),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let environment = fingerprint_environment(provider, |name| std::env::var_os(name));
+            json!({
+                "manifest": provider,
+                "resolvedCommand": canonical,
+                "commandIdentities": command_identities,
+                "environment": environment,
+            })
+        })
+        .collect::<Vec<_>>();
+    let invalid = discovery
+        .invalid
+        .iter()
+        .map(|manifest| {
+            json!({
+                "path": manifest.path,
+                "name": manifest.name,
+                "error": manifest.error,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "runtimeGeneration": std::env::var("ORC_RUNTIME_GENERATION").ok(),
+        "providers": providers,
+        "invalid": invalid,
+    }))
+}
+
+fn file_identity(path: &Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer).ok()?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Some(hex::encode(digest.finalize()))
+}
+
+fn fingerprint_environment(
+    provider: &Manifest,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> BTreeMap<&str, Value> {
+    provider
+        .requires
+        .environment
+        .iter()
+        .map(|name| {
+            let value = lookup(name);
+            let identity = value
+                .as_ref()
+                .map(|value| hex::encode(Sha256::digest(value.to_string_lossy().as_bytes())));
+            (
+                name.as_str(),
+                json!({"present": value.is_some(), "identity": identity}),
+            )
+        })
+        .collect()
+}
+
+pub fn launch_lifecycle_bindings(
+    providers: &[Manifest],
+    session_id: &str,
+) -> Result<Vec<ProviderBinding>> {
+    let mut bindings = Vec::new();
+    for (lifecycle, launch_capabilities) in [
+        (
+            Capability::SessionStop,
+            &[Capability::SessionLaunch, Capability::SessionPersist][..],
+        ),
+        (Capability::ExecutionCancel, &[Capability::ExecutionRun][..]),
+    ] {
+        let owners = candidates(providers, lifecycle)
+            .into_iter()
+            .filter(|provider| {
+                launch_capabilities
+                    .iter()
+                    .any(|capability| provider.supports(*capability))
+            })
+            .collect::<Vec<_>>();
+        match owners.as_slice() {
+            [] => {}
+            [owner] => bindings.push(ProviderBinding {
+                provider: owner.name.clone(),
+                kind: owner.kind,
+                r#ref: Some(session_id.to_owned()),
+                status: BindingStatus::Active,
+                label: format!("{LAUNCH_OWNERSHIP_LABEL_PREFIX}{}", owner.description),
+            }),
+            _ => bail!(
+                "ambiguous launch ownership for capability {lifecycle}: {}",
+                owners
+                    .into_iter()
+                    .map(|provider| provider.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+    if bindings.is_empty() {
+        bail!("managed launch has no provider with stop or cancel ownership");
+    }
+    Ok(bindings)
+}
+
+pub(crate) fn is_launch_ownership(binding: &ProviderBinding) -> bool {
+    binding.label.starts_with(LAUNCH_OWNERSHIP_LABEL_PREFIX)
+}
+
+#[cfg(test)]
 fn discover_in(directories: impl IntoIterator<Item = PathBuf>) -> Result<Vec<Manifest>> {
+    Ok(discover_with_diagnostics(directories)?.providers)
+}
+
+fn discover_with_diagnostics(directories: impl IntoIterator<Item = PathBuf>) -> Result<Discovery> {
     let mut providers = Vec::new();
+    let mut invalid = Vec::new();
     let mut names = BTreeSet::new();
     for directory in directories {
         if !directory.exists() {
@@ -286,21 +525,74 @@ fn discover_in(directories: impl IntoIterator<Item = PathBuf>) -> Result<Vec<Man
         paths.sort();
         let mut directory_names = BTreeSet::new();
         for path in paths {
-            let provider = read_manifest(&path)?;
+            let provider = match read_manifest(&path) {
+                Ok(provider) => provider,
+                Err(error) => {
+                    let name =
+                        manifest_name(&path).or_else(|| manifest_path_name(&directory, &path));
+                    if let Some(name) = &name {
+                        directory_names.insert(name.clone());
+                        names.insert(name.clone());
+                    }
+                    invalid.push(InvalidManifest {
+                        name,
+                        path,
+                        error: format!("{error:#}"),
+                    });
+                    continue;
+                }
+            };
             if !directory_names.insert(provider.name.clone()) {
-                bail!(
-                    "{}: duplicate provider name {} in {}",
-                    path.display(),
-                    provider.name,
-                    directory.display()
-                );
+                invalid.push(InvalidManifest {
+                    name: Some(provider.name.clone()),
+                    path: path.clone(),
+                    error: format!(
+                        "{}: duplicate provider name {} in {}",
+                        path.display(),
+                        provider.name,
+                        directory.display()
+                    ),
+                });
+                continue;
             }
             if names.insert(provider.name.clone()) {
                 providers.push(provider);
             }
         }
     }
-    Ok(providers)
+    Ok(Discovery { providers, invalid })
+}
+
+fn manifest_name(path: &Path) -> Option<String> {
+    let source = fs::read_to_string(path).ok()?;
+    let value = if path.extension().and_then(|value| value.to_str()) == Some("json") {
+        serde_json::from_str::<Value>(&source).ok()?
+    } else {
+        serde_yaml::from_str::<Value>(&source).ok()?
+    };
+    value
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_owned)
+}
+
+fn manifest_path_name(directory: &Path, path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let candidate = if stem == "provider" {
+        let parent = path.parent()?;
+        (parent != directory)
+            .then(|| parent.file_name())
+            .flatten()?
+            .to_str()?
+    } else {
+        stem
+    };
+    (!candidate.is_empty()
+        && candidate
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || "._-".contains(ch)))
+    .then(|| candidate.to_owned())
 }
 
 fn read_manifest(path: &Path) -> Result<Manifest> {
@@ -309,11 +601,16 @@ fn read_manifest(path: &Path) -> Result<Manifest> {
         bail!("{}: provider manifest exceeds 1 MiB", path.display());
     }
     let source = fs::read_to_string(path)?;
-    let provider = if path.extension().and_then(|value| value.to_str()) == Some("json") {
-        serde_json::from_str(&source).with_context(|| format!("parse {}", path.display()))?
-    } else {
-        serde_yaml::from_str(&source).with_context(|| format!("parse {}", path.display()))?
-    };
+    let mut provider: Manifest =
+        if path.extension().and_then(|value| value.to_str()) == Some("json") {
+            serde_json::from_str(&source).with_context(|| format!("parse {}", path.display()))?
+        } else {
+            serde_yaml::from_str(&source).with_context(|| format!("parse {}", path.display()))?
+        };
+    provider.command.resolve_relative_paths(
+        path.parent()
+            .with_context(|| format!("provider manifest has no directory: {}", path.display()))?,
+    );
     validate_manifest(&provider, path)?;
     Ok(provider)
 }
@@ -349,7 +646,7 @@ fn validate_manifest(provider: &Manifest, path: &Path) -> Result<()> {
     {
         bail!("{}: provider name is invalid", path.display());
     }
-    if provider.command.trim().is_empty() || provider.all_capabilities().is_empty() {
+    if !provider.command.valid() || provider.all_capabilities().is_empty() {
         bail!("{}: command and actions are required", path.display());
     }
     Ok(())
@@ -392,9 +689,17 @@ fn invoke_raw(
 ) -> Result<Value> {
     let started = Instant::now();
     let payload = serde_json::to_vec(request)?;
-    let mut command = Command::new(&provider.command);
+    let program = provider
+        .command
+        .program()
+        .context("provider command has no executable")?;
+    let working_directory = provider_working_directory(Path::new(
+        request.get("scope").and_then(Value::as_str).unwrap_or("."),
+    ))?;
+    let mut command = Command::new(program);
     command
-        .current_dir(request.get("scope").and_then(Value::as_str).unwrap_or("."))
+        .args(provider.command.arguments())
+        .current_dir(working_directory)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -503,14 +808,14 @@ fn invoke_raw(
         config.provider_timeout().saturating_sub(started.elapsed()),
     )
     .with_context(|| format!("{} timed out draining stderr", provider.name))?;
-    record_invocation(
-        provider,
-        request,
-        status.success(),
-        started.elapsed().as_millis(),
-        &stderr,
-    );
     if !status.success() {
+        record_invocation(
+            provider,
+            request,
+            false,
+            started.elapsed().as_millis(),
+            &stderr,
+        );
         bail!(
             "{}",
             stderr
@@ -519,8 +824,85 @@ fn invoke_raw(
                 .if_empty_then(|| format!("{} exited with {status}", provider.name))
         );
     }
-    serde_json::from_str(&stdout)
+    let value = match serde_json::from_str(&stdout)
         .with_context(|| format!("{} returned invalid JSON", provider.name))
+        .and_then(|value| validate_protocol_response(provider, request, value))
+    {
+        Ok(value) => value,
+        Err(error) => {
+            record_invocation(
+                provider,
+                request,
+                false,
+                started.elapsed().as_millis(),
+                &format!("{error:#}"),
+            );
+            return Err(error);
+        }
+    };
+    record_invocation(
+        provider,
+        request,
+        true,
+        started.elapsed().as_millis(),
+        &stderr,
+    );
+    Ok(value)
+}
+
+fn provider_working_directory(preferred: &Path) -> Result<PathBuf> {
+    if preferred.is_dir() {
+        return Ok(preferred.to_path_buf());
+    }
+    let fallback = crate::config::state_home().join("orc");
+    fs::create_dir_all(&fallback).context("create stable provider working directory")?;
+    Ok(fallback)
+}
+
+fn plan_working_directory(plan: &CommandPlan, scope: &Path) -> Result<PathBuf> {
+    let preferred = plan.cwd.as_deref().map(Path::new).unwrap_or(scope);
+    if preferred == scope {
+        provider_working_directory(scope)
+    } else {
+        Ok(preferred.to_path_buf())
+    }
+}
+
+fn validate_protocol_response(provider: &Manifest, request: &Value, value: Value) -> Result<Value> {
+    if value.get("version").and_then(Value::as_str) != Some("orc.provider/v1") {
+        bail!(
+            "{} returned an invalid or missing protocol version",
+            provider.name
+        );
+    }
+    if value.get("status").and_then(Value::as_str) == Some("declined") {
+        value
+            .get("reason")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.trim().is_empty())
+            .with_context(|| format!("{} declined without a reason", provider.name))?;
+        return Ok(value);
+    }
+
+    match request.get("capability").and_then(Value::as_str) {
+        Some("provider.validate") => {
+            parse_provider_checks(&value).with_context(|| {
+                format!("{} returned an invalid validation response", provider.name)
+            })?;
+        }
+        Some("session.bind") => {
+            parse_binding(provider, &value)?;
+        }
+        Some("session.describe") => {
+            parse_description(provider, &value)?;
+        }
+        Some(_) => {
+            parse_plan(provider, value.clone())?
+                .with_context(|| format!("{} returned no command plan", provider.name))?;
+        }
+        None => {}
+    }
+    Ok(value)
 }
 
 #[cfg(unix)]
@@ -766,6 +1148,7 @@ fn invoke_cached(provider: &Manifest, request: &Value, config: &Config) -> Resul
         && let Ok(source) = fs::read_to_string(&path)
         && let Ok(cached) = serde_json::from_str::<CachedValue>(&source)
         && now.saturating_sub(cached.created_at_ms) <= config.cache.provider_ttl_ms as i64
+        && validate_protocol_response(provider, request, cached.value.clone()).is_ok()
     {
         return Ok(cached.value);
     }
@@ -840,40 +1223,11 @@ fn command_check(name: String, command: &str) -> ValidationCheck {
     }
 }
 
-fn requirements_checks(provider: &Manifest) -> Vec<ValidationCheck> {
-    let mut checks = vec![command_check("executable".into(), &provider.command)];
-    checks.extend(
-        provider
-            .requires
-            .commands
-            .iter()
-            .map(|command| command_check(format!("command:{command}"), command)),
-    );
-    checks.extend(provider.requires.environment.iter().map(|variable| {
-        let present = std::env::var_os(variable).is_some();
-        ValidationCheck {
-            name: format!("environment:{variable}"),
-            status: if present {
-                CheckStatus::Ok
-            } else {
-                CheckStatus::Failed
-            },
-            message: if present { "set" } else { "not set" }.into(),
-        }
-    }));
-    checks.extend(provider.requires.paths.iter().map(|path| {
-        let present = path.exists();
-        ValidationCheck {
-            name: format!("path:{}", path.display()),
-            status: if present {
-                CheckStatus::Ok
-            } else {
-                CheckStatus::Failed
-            },
-            message: if present { "exists" } else { "missing" }.into(),
-        }
-    }));
-    checks
+fn host_checks(provider: &Manifest) -> Vec<ValidationCheck> {
+    vec![command_check(
+        "executable".into(),
+        provider.command.program().unwrap_or_default(),
+    )]
 }
 
 fn failed_check(name: impl Into<String>, message: impl Into<String>) -> ValidationCheck {
@@ -1016,39 +1370,10 @@ fn validate_action_response(
         }
         match capability {
             Capability::SessionBind => {
-                let binding = value
-                    .get("binding")
-                    .context("response is missing binding")?;
-                serde_json::from_value::<BindingStatus>(
-                    binding
-                        .get("status")
-                        .context("binding is missing status")?
-                        .clone(),
-                )?;
-                serde_json::from_value::<ProviderKind>(
-                    binding
-                        .get("kind")
-                        .context("binding is missing kind")?
-                        .clone(),
-                )?;
-                binding
-                    .get("label")
-                    .and_then(Value::as_str)
-                    .filter(|label| !label.trim().is_empty())
-                    .context("binding is missing label")?;
+                parse_binding(provider, &value)?;
             }
             Capability::SessionDescribe => {
-                let description = value
-                    .get("description")
-                    .and_then(Value::as_object)
-                    .context("response is missing description")?;
-                if !description
-                    .values()
-                    .filter_map(Value::as_str)
-                    .any(|text| !text.trim().is_empty())
-                {
-                    bail!("description has no text fields");
-                }
+                parse_description(provider, &value)?;
             }
             _ => {
                 parse_plan(provider, value)?.context("provider declined without a status")?;
@@ -1067,15 +1392,21 @@ fn validate_action_response(
 }
 
 pub fn validate_all(config: &Config, scope: &Path, name: Option<&str>) -> Result<Vec<Validation>> {
-    let providers = discover(config)?;
-    let selected: Vec<_> = providers
+    let discovery = discover_with_diagnostics(config.provider_directories())?;
+    let selected: Vec<_> = discovery
+        .providers
         .into_iter()
         .filter(|provider| name.is_none_or(|name| provider.name == name))
         .collect();
-    if name.is_some() && selected.is_empty() {
+    let invalid: Vec<_> = discovery
+        .invalid
+        .into_iter()
+        .filter(|manifest| name.is_none_or(|name| manifest.name.as_deref() == Some(name)))
+        .collect();
+    if name.is_some() && selected.is_empty() && invalid.is_empty() {
         bail!("unknown provider: {}", name.unwrap_or_default());
     }
-    Ok(selected
+    let mut validations: Vec<_> = selected
         .into_iter()
         .map(|provider| {
             let request = json!({
@@ -1087,6 +1418,7 @@ pub fn validate_all(config: &Config, scope: &Path, name: Option<&str>) -> Result
                     "name": provider.name,
                     "kind": provider.kind,
                     "actions": provider.actions,
+                    "requires": provider.requires,
                 },
             });
             let mut checks = vec![ValidationCheck {
@@ -1094,7 +1426,7 @@ pub fn validate_all(config: &Config, scope: &Path, name: Option<&str>) -> Result
                 status: CheckStatus::Ok,
                 message: "manifest is valid".into(),
             }];
-            checks.extend(requirements_checks(&provider));
+            checks.extend(host_checks(&provider));
             checks.extend(provider_checks(invoke_raw(
                 &provider, &request, config, None,
             )));
@@ -1117,7 +1449,37 @@ pub fn validate_all(config: &Config, scope: &Path, name: Option<&str>) -> Result
                 checks,
             }
         })
-        .collect())
+        .collect();
+    validations.extend(invalid.into_iter().map(invalid_manifest_validation));
+    Ok(validations)
+}
+
+fn invalid_manifest_validation(invalid: InvalidManifest) -> Validation {
+    let name = invalid.name.unwrap_or_else(|| {
+        invalid
+            .path
+            .parent()
+            .and_then(Path::file_name)
+            .or_else(|| invalid.path.file_stem())
+            .and_then(|name| name.to_str())
+            .unwrap_or("invalid-manifest")
+            .to_owned()
+    });
+    Validation {
+        provider: Manifest {
+            version: "invalid".into(),
+            name,
+            description: format!("Invalid provider manifest at {}", invalid.path.display()),
+            kind: ProviderKind::Integration,
+            command: ProviderCommand::default(),
+            actions: BTreeMap::new(),
+            capabilities: Vec::new(),
+            requires: Requirements::default(),
+            priority: 0,
+        },
+        status: CheckStatus::Failed,
+        checks: vec![failed_check("manifest", invalid.error)],
+    }
 }
 
 fn parse_plan(provider: &Manifest, value: Value) -> Result<Option<CommandPlan>> {
@@ -1134,6 +1496,98 @@ fn parse_plan(provider: &Manifest, value: Value) -> Result<Option<CommandPlan>> 
         bail!("{} returned an invalid command plan", provider.name);
     }
     Ok(Some(plan))
+}
+
+fn parse_binding(provider: &Manifest, value: &Value) -> Result<ProviderBinding> {
+    let binding = value
+        .get("binding")
+        .and_then(Value::as_object)
+        .with_context(|| format!("{} returned an invalid binding", provider.name))?;
+    let kind = serde_json::from_value(
+        binding
+            .get("kind")
+            .with_context(|| format!("{} binding is missing kind", provider.name))?
+            .clone(),
+    )
+    .with_context(|| format!("{} binding has an invalid kind", provider.name))?;
+    let status = serde_json::from_value(
+        binding
+            .get("status")
+            .with_context(|| format!("{} binding is missing status", provider.name))?
+            .clone(),
+    )
+    .with_context(|| format!("{} binding has an invalid status", provider.name))?;
+    if kind != provider.kind {
+        bail!(
+            "{} returned a {kind} binding from a {} provider",
+            provider.name,
+            provider.kind
+        );
+    }
+    let reference = binding
+        .get("ref")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .with_context(|| format!("{} binding has an invalid ref", provider.name))
+        })
+        .transpose()?;
+    if status == BindingStatus::Active && reference.is_none() {
+        bail!("{} returned an active binding without a ref", provider.name);
+    }
+    let label = binding
+        .get("label")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+                .with_context(|| format!("{} binding has an invalid label", provider.name))
+        })
+        .transpose()?
+        .unwrap_or_else(|| provider.description.clone());
+    Ok(ProviderBinding {
+        provider: provider.name.clone(),
+        kind,
+        r#ref: reference,
+        status,
+        label,
+    })
+}
+
+fn parse_description(
+    provider: &Manifest,
+    value: &Value,
+) -> Result<(Option<String>, Option<String>)> {
+    let description = value
+        .get("description")
+        .and_then(Value::as_object)
+        .with_context(|| format!("{} returned an invalid description", provider.name))?;
+    let text = |field: &str| -> Result<Option<String>> {
+        description
+            .get(field)
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_owned)
+                    .with_context(|| {
+                        format!("{} description has an invalid {field}", provider.name)
+                    })
+            })
+            .transpose()
+    };
+    let title = text("title")?;
+    let goal = text("goal")?;
+    if title.is_none() && goal.is_none() {
+        bail!("{} description has no text fields", provider.name);
+    }
+    Ok((title, goal))
 }
 
 pub fn resolve_plan(
@@ -1189,7 +1643,11 @@ pub(crate) fn resolve_plan_from_tracked(
         {
             bail!("provider resolution cancelled");
         }
-        let stage = candidates_for_request(providers, capability, &request);
+        let owner = lifecycle_owner(providers, capability, &request)?;
+        let mut stage = candidates_for_request(providers, capability, &request);
+        if let Some(owner) = owner.as_deref() {
+            stage.retain(|provider| provider.name == owner);
+        }
         let explicitly_selected = request
             .get("providers")
             .and_then(|providers| providers.get(capability.to_string()))
@@ -1229,7 +1687,95 @@ pub(crate) fn resolve_plan_from_tracked(
             )
         })?);
     }
-    plan.ok_or_else(|| anyhow!("provider chain for {} produced no command", action.name()))
+    let mut plan =
+        plan.ok_or_else(|| anyhow!("provider chain for {} produced no command", action.name()))?;
+    apply_session_linkage(&mut plan, &request);
+    Ok(plan)
+}
+
+fn lifecycle_owner(
+    providers: &[Manifest],
+    capability: Capability,
+    request: &Value,
+) -> Result<Option<String>> {
+    if !matches!(
+        capability,
+        Capability::SessionStop | Capability::ExecutionCancel
+    ) {
+        return Ok(None);
+    }
+    let session = request
+        .get("session")
+        .and_then(Value::as_object)
+        .with_context(|| format!("{capability} requires a session"))?;
+    let advertised = candidates(providers, capability);
+    let advertised_names = advertised
+        .iter()
+        .map(|provider| provider.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let owners = session
+        .get("providers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|binding| binding.get("status").and_then(Value::as_str) == Some("active"))
+        .filter(|binding| {
+            binding
+                .get("ref")
+                .and_then(Value::as_str)
+                .is_some_and(|reference| !reference.is_empty())
+        })
+        .filter_map(|binding| binding.get("provider").and_then(Value::as_str))
+        .filter(|provider| advertised_names.contains(provider))
+        .collect::<BTreeSet<_>>();
+    let owner = match owners.len() {
+        0 => bail!("no active provider binding owns capability {capability}"),
+        1 => owners.into_iter().next().expect("one owner").to_owned(),
+        _ => bail!(
+            "ambiguous active provider ownership for capability {capability}: {}",
+            owners.into_iter().collect::<Vec<_>>().join(", ")
+        ),
+    };
+    if let Some(selected) = request
+        .get("providers")
+        .and_then(|providers| providers.get(capability.to_string()))
+        .and_then(Value::as_str)
+        && selected != owner
+    {
+        bail!("selected provider {selected} does not own capability {capability}");
+    }
+    Ok(Some(owner))
+}
+
+fn apply_session_linkage(plan: &mut CommandPlan, request: &Value) {
+    let Some(session) = request.get("session").and_then(Value::as_object) else {
+        return;
+    };
+    let fields = [
+        ("ORC_SESSION_ID", "id"),
+        ("ORC_NATIVE_SESSION_ID", "nativeId"),
+        ("ORC_PARENT_SESSION_ID", "parentId"),
+        ("ORC_RUN_ID", "runId"),
+        ("ORC_NODE_ID", "nodeId"),
+        ("ORC_PROVIDER_REF", "providerRef"),
+        ("ORC_MODEL", "model"),
+    ];
+    if let Some(scope) = request
+        .get("scope")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        plan.environment.insert("ORC_SCOPE".into(), scope.into());
+    }
+    for (environment, field) in fields {
+        if let Some(value) = session
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            plan.environment.insert(environment.into(), value.into());
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1258,10 +1804,11 @@ pub(crate) fn run_plan_tracked_cancellable(
     cancelled: Option<&dyn Fn() -> Result<bool>>,
 ) -> Result<CommandResult> {
     let program = plan.command.first().context("command plan is empty")?;
+    let working_directory = plan_working_directory(plan, scope)?;
     let mut command = Command::new(program);
     command
         .args(&plan.command[1..])
-        .current_dir(plan.cwd.as_deref().map(Path::new).unwrap_or(scope))
+        .current_dir(working_directory)
         .envs(&plan.environment)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1662,10 +2209,11 @@ pub fn run_plan_with_timeout(
 ) -> Result<CommandResult> {
     let started = Instant::now();
     let program = plan.command.first().context("command plan is empty")?;
+    let working_directory = plan_working_directory(plan, scope)?;
     let mut command = Command::new(program);
     command
         .args(&plan.command[1..])
-        .current_dir(plan.cwd.as_deref().map(Path::new).unwrap_or(scope))
+        .current_dir(working_directory)
         .envs(&plan.environment)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1857,10 +2405,11 @@ where
     F: FnOnce(&mut Child) -> Result<()>,
 {
     let program = plan.command.first().context("command plan is empty")?;
+    let working_directory = plan_working_directory(plan, scope)?;
     let mut command = Command::new(program);
     command
         .args(&plan.command[1..])
-        .current_dir(plan.cwd.as_deref().map(Path::new).unwrap_or(scope))
+        .current_dir(working_directory)
         .envs(&plan.environment)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -1924,14 +2473,7 @@ pub fn discover_bindings(
         });
         let value = invoke_raw(provider, &request, config, None).ok()?;
         if value.get("status").and_then(Value::as_str) == Some("declined") { return None; }
-        let binding = value.get("binding")?;
-        Some(ProviderBinding {
-            provider: provider.name.clone(),
-            kind: serde_json::from_value(binding.get("kind")?.clone()).ok()?,
-            r#ref: binding.get("ref").and_then(Value::as_str).map(str::to_owned),
-            status: serde_json::from_value(binding.get("status")?.clone()).ok().unwrap_or(BindingStatus::Unavailable),
-            label: binding.get("label").and_then(Value::as_str).unwrap_or(&provider.description).to_owned(),
-        })
+        parse_binding(provider, &value).ok()
     }).collect()
 }
 
@@ -1949,19 +2491,9 @@ pub fn describe(
         let Ok(value) = invoke_cached(provider, &request, config) else {
             continue;
         };
-        let Some(description) = value.get("description") else {
-            continue;
-        };
-        return (
-            description
-                .get("title")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            description
-                .get("goal")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        );
+        if let Ok(description) = parse_description(provider, &value) {
+            return description;
+        }
     }
     (None, None)
 }
@@ -2006,7 +2538,7 @@ esac
             name: name.into(),
             description: name.into(),
             kind: ProviderKind::Integration,
-            command: command.display().to_string(),
+            command: ProviderCommand::Program(command.display().to_string()),
             actions: BTreeMap::from([(Capability::ChangesInspect, "Inspect changes".into())]),
             capabilities: Vec::new(),
             requires: Requirements::default(),
@@ -2087,9 +2619,257 @@ actions:
     }
 
     #[test]
+    fn malformed_configured_provider_reserves_its_name() {
+        let directory = tempfile::tempdir().expect("provider directories");
+        let configured = directory.path().join("configured");
+        let installed = directory.path().join("installed");
+        fs::create_dir_all(configured.join("example")).expect("configured directory");
+        fs::create_dir_all(&installed).expect("installed directory");
+        fs::write(
+            configured.join("example/provider.yaml"),
+            "version: [not valid yaml",
+        )
+        .expect("invalid configured manifest");
+        fs::write(
+            installed.join("provider.yaml"),
+            r#"version: orc.provider/v1
+name: example
+command: installed-provider
+actions:
+  session.bind: Bind a session
+"#,
+        )
+        .expect("installed manifest");
+
+        let discovery =
+            discover_with_diagnostics([configured, installed]).expect("provider discovery");
+
+        assert!(discovery.providers.is_empty());
+        assert_eq!(discovery.invalid.len(), 1);
+        assert_eq!(discovery.invalid[0].name.as_deref(), Some("example"));
+    }
+
+    #[test]
+    fn malformed_manifest_does_not_hide_valid_providers() {
+        let directory = tempfile::tempdir().expect("provider directory");
+        fs::write(
+            directory.path().join("valid.yaml"),
+            r#"version: orc.provider/v1
+name: valid
+command: valid-provider
+actions:
+  session.bind: Bind a session
+"#,
+        )
+        .expect("valid manifest");
+        fs::write(
+            directory.path().join("broken.yaml"),
+            r#"version: orc.provider/v1
+name: broken
+command: []
+actions:
+  session.bind: Bind a session
+"#,
+        )
+        .expect("broken manifest");
+
+        let discovery = discover_with_diagnostics([directory.path().to_path_buf()])
+            .expect("provider discovery");
+
+        assert_eq!(discovery.providers.len(), 1);
+        assert_eq!(discovery.providers[0].name, "valid");
+        assert_eq!(discovery.invalid.len(), 1);
+        assert_eq!(discovery.invalid[0].name.as_deref(), Some("broken"));
+        assert!(discovery.invalid[0].error.contains("broken.yaml"));
+
+        let mut config = Config::default();
+        config.providers.directory = directory.path().to_path_buf();
+        let validation = validate_all(&config, directory.path(), Some("broken"))
+            .expect("invalid manifest remains addressable");
+        assert_eq!(validation.len(), 1);
+        assert_eq!(validation[0].provider.name, "broken");
+        assert_eq!(validation[0].status, CheckStatus::Failed);
+        assert_eq!(validation[0].checks[0].name, "manifest");
+    }
+
+    #[test]
+    fn provider_fingerprint_hashes_only_declared_environment_values() {
+        let mut provider = provider_manifest("example", Path::new("example-provider"), 0);
+        provider.requires.environment = vec!["TOKEN".into()];
+
+        let first = fingerprint_environment(&provider, |name| match name {
+            "TOKEN" => Some("first".into()),
+            _ => None,
+        });
+        let second = fingerprint_environment(&provider, |name| match name {
+            "TOKEN" => Some("second".into()),
+            _ => None,
+        });
+
+        assert_ne!(first, second);
+        assert!(
+            !serde_json::to_string(&first)
+                .expect("environment fingerprint serializes")
+                .contains("first")
+        );
+        assert_eq!(first.keys().copied().collect::<Vec<_>>(), vec!["TOKEN"]);
+    }
+
+    #[test]
+    fn provider_fingerprint_tracks_resolved_command_content() {
+        let directory = tempfile::tempdir().expect("provider directory");
+        let command = directory.path().join("provider-command");
+        let manifest = directory.path().join("provider.yaml");
+        fs::write(&command, "first\n").expect("first provider command");
+        fs::write(
+            &manifest,
+            format!(
+                "version: orc.provider/v1\nname: example\ncommand: {}\nactions:\n  session.bind: Bind a session\n",
+                command.display()
+            ),
+        )
+        .expect("provider manifest");
+        let mut config = Config::default();
+        config.providers.directory = directory.path().to_path_buf();
+
+        let first = runtime_fingerprint(&config).expect("first provider fingerprint");
+        fs::write(&command, "second\n").expect("second provider command");
+        let second = runtime_fingerprint(&config).expect("second provider fingerprint");
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn provider_fingerprint_tracks_interpreter_script_content() {
+        let directory = tempfile::tempdir().expect("provider directory");
+        let command = directory.path().join("provider.sh");
+        let manifest = directory.path().join("provider.yaml");
+        fs::write(&command, "printf first\n").expect("first provider script");
+        fs::write(
+            &manifest,
+            r#"version: orc.provider/v1
+name: example
+command: [sh, ./provider.sh]
+actions:
+  session.bind: Bind a session
+"#,
+        )
+        .expect("provider manifest");
+        let mut config = Config::default();
+        config.providers.directory = directory.path().to_path_buf();
+
+        let first = runtime_fingerprint(&config).expect("first provider fingerprint");
+        fs::write(&command, "printf second\n").expect("second provider script");
+        let second = runtime_fingerprint(&config).expect("second provider fingerprint");
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn parent_validation_checks_only_the_provider_executable() {
+        let mut provider = provider_manifest("example", Path::new("true"), 0);
+        provider.requires.commands = vec!["provider-owned-command".into()];
+        provider.requires.environment = vec!["PROVIDER_OWNED_ENVIRONMENT".into()];
+        provider.requires.paths = vec![PathBuf::from("/provider/owned/path")];
+
+        let checks = host_checks(&provider);
+
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "executable");
+    }
+
+    #[test]
+    fn generated_schema_rejects_empty_provider_commands_and_capabilities() {
+        let schema = schema();
+        let command = &schema["$defs"]["ProviderCommand"]["anyOf"];
+
+        assert_eq!(command[0]["minLength"], 1);
+        assert_eq!(command[1]["minItems"], 1);
+        assert_eq!(command[1]["items"]["minLength"], 1);
+        assert_eq!(schema["properties"]["version"]["const"], "orc.provider/v1");
+        assert_eq!(schema["properties"]["name"]["pattern"], "^[a-z0-9._-]+$");
+        assert_eq!(
+            schema["allOf"][0]["anyOf"][0]["properties"]["actions"]["minProperties"],
+            1
+        );
+        assert_eq!(
+            schema["allOf"][0]["anyOf"][1]["properties"]["capabilities"]["minItems"],
+            1
+        );
+    }
+
+    #[test]
+    fn provider_command_accepts_argv_and_resolves_manifest_relative_paths() {
+        let directory = tempfile::tempdir().expect("provider directory");
+        let manifest = directory.path().join("provider.yaml");
+        fs::create_dir_all(directory.path().join("cmd/provider")).expect("provider source path");
+        fs::write(
+            directory.path().join("cmd/provider/main.go"),
+            "package main\n",
+        )
+        .expect("provider source");
+        fs::write(
+            &manifest,
+            r#"version: orc.provider/v1
+name: source-provider
+command: [go, run, ./cmd/provider/main.go]
+actions:
+  session.bind: Bind a session
+"#,
+        )
+        .expect("provider manifest");
+
+        let provider = read_manifest(&manifest).expect("read argv provider");
+
+        assert_eq!(provider.command.program(), Some("go"));
+        assert_eq!(provider.command.arguments()[0], "run");
+        assert_eq!(
+            provider.command.arguments()[1],
+            fs::canonicalize(directory.path().join("cmd/provider/main.go"))
+                .expect("canonical provider source")
+                .display()
+                .to_string()
+        );
+    }
+
+    #[test]
     fn attach_chain_composes_three_capabilities() {
         assert_eq!(Action::Attach.stages().len(), 3);
         assert!(Action::Attach.stages()[1].1);
+    }
+
+    #[test]
+    fn resolved_plans_cannot_drop_orc_session_linkage() {
+        let mut plan = CommandPlan {
+            version: "orc.provider/v1".into(),
+            command: vec!["true".into()],
+            cwd: None,
+            environment: BTreeMap::from([("ORC_SESSION_ID".into(), "stale".into())]),
+            success_codes: vec![0],
+        };
+        let request = json!({
+            "scope": "/workspace",
+            "session": {
+                "id": "session-1",
+                "nativeId": "native-1",
+                "parentId": "parent-1",
+                "runId": "run-1",
+                "nodeId": "node-1",
+                "providerRef": "provider-1",
+                "model": "model-1"
+            }
+        });
+
+        apply_session_linkage(&mut plan, &request);
+
+        assert_eq!(plan.environment["ORC_SCOPE"], "/workspace");
+        assert_eq!(plan.environment["ORC_SESSION_ID"], "session-1");
+        assert_eq!(plan.environment["ORC_NATIVE_SESSION_ID"], "native-1");
+        assert_eq!(plan.environment["ORC_PARENT_SESSION_ID"], "parent-1");
+        assert_eq!(plan.environment["ORC_RUN_ID"], "run-1");
+        assert_eq!(plan.environment["ORC_NODE_ID"], "node-1");
+        assert_eq!(plan.environment["ORC_PROVIDER_REF"], "provider-1");
+        assert_eq!(plan.environment["ORC_MODEL"], "model-1");
     }
 
     #[test]
@@ -2149,7 +2929,8 @@ sleep 10
             directory.path(),
             "inherited-input",
             r#"#!/bin/sh
-(sleep 10 <&0) &
+exec 3<&0
+(sleep 10 <&3) &
 exit 0
 "#,
         );
@@ -2185,6 +2966,146 @@ exit 0
 
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].name, "second");
+    }
+
+    #[test]
+    fn lifecycle_actions_use_the_provider_with_the_active_binding() {
+        let command = Path::new("provider");
+        let mut higher_priority = provider_manifest("higher-priority", command, 100);
+        higher_priority.actions =
+            BTreeMap::from([(Capability::SessionStop, "Stop a persistent session".into())]);
+        let mut owner = provider_manifest("owner", command, 0);
+        owner.actions = higher_priority.actions.clone();
+        let request = json!({
+            "session": {
+                "providers": [{
+                    "provider": "owner",
+                    "kind": "persistence",
+                    "ref": "owned-session",
+                    "status": "active"
+                }]
+            }
+        });
+
+        assert_eq!(
+            lifecycle_owner(&[higher_priority, owner], Capability::SessionStop, &request,)
+                .expect("active owner"),
+            Some("owner".into())
+        );
+    }
+
+    #[test]
+    fn lifecycle_plan_resolution_does_not_fall_back_to_global_priority() {
+        let directory = tempfile::tempdir().expect("provider directory");
+        let higher_command = write_provider(
+            directory.path(),
+            "higher-priority",
+            r#"#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"version":"orc.provider/v1","command":["higher-priority"]}'
+"#,
+        );
+        let owner_command = write_provider(
+            directory.path(),
+            "owner",
+            r#"#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"version":"orc.provider/v1","command":["owner"]}'
+"#,
+        );
+        let mut higher_priority = provider_manifest("higher-priority", &higher_command, 100);
+        higher_priority.actions =
+            BTreeMap::from([(Capability::SessionStop, "Stop a persistent session".into())]);
+        let mut owner = provider_manifest("owner", &owner_command, 0);
+        owner.actions = higher_priority.actions.clone();
+        let request = json!({
+            "scope": directory.path(),
+            "session": {
+                "providers": [{
+                    "provider": "owner",
+                    "kind": "persistence",
+                    "ref": "owned-session",
+                    "status": "active"
+                }]
+            }
+        });
+
+        let plan = resolve_plan(
+            &Config::default(),
+            &[higher_priority, owner],
+            Action::Stop,
+            request,
+        )
+        .expect("owned stop plan");
+
+        assert_eq!(plan.command, ["owner"]);
+    }
+
+    #[test]
+    fn lifecycle_actions_reject_missing_or_ambiguous_owners() {
+        let command = Path::new("provider");
+        let mut first = provider_manifest("first", command, 100);
+        first.actions = BTreeMap::from([(
+            Capability::ExecutionCancel,
+            "Cancel remote execution".into(),
+        )]);
+        let mut second = provider_manifest("second", command, 0);
+        second.actions = first.actions.clone();
+        let unavailable = json!({
+            "session": {
+                "providers": [{
+                    "provider": "first",
+                    "kind": "execution",
+                    "ref": null,
+                    "status": "unavailable"
+                }]
+            }
+        });
+        let ambiguous = json!({
+            "session": {
+                "providers": [
+                    {"provider": "first", "kind": "execution", "ref": "one", "status": "active"},
+                    {"provider": "second", "kind": "execution", "ref": "two", "status": "active"}
+                ]
+            }
+        });
+
+        let unavailable_error = lifecycle_owner(
+            &[first.clone(), second.clone()],
+            Capability::ExecutionCancel,
+            &unavailable,
+        )
+        .expect_err("unavailable binding");
+        assert!(
+            unavailable_error
+                .to_string()
+                .contains("no active provider binding")
+        );
+        let ambiguous_error =
+            lifecycle_owner(&[first, second], Capability::ExecutionCancel, &ambiguous)
+                .expect_err("ambiguous bindings");
+        assert!(
+            ambiguous_error
+                .to_string()
+                .contains("ambiguous active provider ownership")
+        );
+    }
+
+    #[test]
+    fn managed_launch_rejects_ambiguous_lifecycle_ownership() {
+        let command = Path::new("provider");
+        let mut first = provider_manifest("first", command, 100);
+        first.actions = BTreeMap::from([
+            (Capability::SessionPersist, "Persist a session".into()),
+            (Capability::SessionStop, "Stop a session".into()),
+        ]);
+        let mut second = provider_manifest("second", command, 0);
+        second.actions = first.actions.clone();
+
+        let error =
+            launch_lifecycle_bindings(&[first, second], "managed").expect_err("ambiguous owners");
+
+        assert!(error.to_string().contains("ambiguous launch ownership"));
     }
 
     #[test]
@@ -2278,7 +3199,7 @@ exit 0
             name: "activity".into(),
             description: "Activity".into(),
             kind: ProviderKind::Activity,
-            command: "activity-provider".into(),
+            command: ProviderCommand::Program("activity-provider".into()),
             actions: BTreeMap::new(),
             capabilities: Vec::new(),
             requires: Requirements::default(),
@@ -2297,6 +3218,80 @@ exit 0
 
         assert!(plan.accepts(2));
         assert!(!plan.accepts(1));
+    }
+
+    #[test]
+    fn reconciliation_rejects_invalid_binding_and_description_protocols() {
+        let provider = provider_manifest("test", Path::new("test-provider"), 0);
+        let mut binding_provider = provider.clone();
+        binding_provider.kind = ProviderKind::Harness;
+        let binding_request = json!({"capability": "session.bind"});
+        let description_request = json!({"capability": "session.describe"});
+
+        for value in [
+            json!({
+                "version": "orc.provider/v0",
+                "binding": {"kind": "harness", "status": "active"}
+            }),
+            json!({
+                "version": "orc.provider/v1",
+                "binding": {"kind": "harness", "status": "unknown"}
+            }),
+        ] {
+            assert!(validate_protocol_response(&provider, &binding_request, value).is_err());
+        }
+        assert!(
+            validate_protocol_response(
+                &binding_provider,
+                &binding_request,
+                json!({
+                    "version": "orc.provider/v1",
+                    "binding": {
+                        "kind": "harness",
+                        "status": "active",
+                        "label": "missing ref"
+                    }
+                }),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_protocol_response(
+                &binding_provider,
+                &binding_request,
+                json!({
+                    "version": "orc.provider/v1",
+                    "binding": {
+                        "kind": "harness",
+                        "status": "active",
+                        "ref": "native-session",
+                        "label": "valid"
+                    }
+                }),
+            )
+            .is_ok()
+        );
+        for value in [
+            json!({"description": {"title": "missing version"}}),
+            json!({"version": "orc.provider/v1", "description": {"title": 42}}),
+        ] {
+            assert!(validate_protocol_response(&provider, &description_request, value).is_err());
+        }
+    }
+
+    #[test]
+    fn successful_provider_health_requires_valid_json_and_protocol() {
+        let provider = provider_manifest("test", Path::new("test-provider"), 0);
+        let request = json!({"capability": "changes.inspect"});
+        let parse = |source: &str| {
+            serde_json::from_str(source)
+                .context("provider returned invalid JSON")
+                .and_then(|value| validate_protocol_response(&provider, &request, value))
+        };
+
+        assert!(parse("not json").is_err());
+        assert!(parse(r#"{"command":["true"]}"#).is_err());
+        assert!(parse(r#"{"version":"orc.provider/v1","command":["true"]}"#).is_ok());
     }
 
     #[test]

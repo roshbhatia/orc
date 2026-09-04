@@ -14,6 +14,7 @@ const CONTROL_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 #[cfg(unix)]
@@ -23,7 +24,7 @@ use crate::{
     config::{self, Config},
     control,
     domain::{LifecycleStatus, RegistrationSource, Session},
-    state, workflow,
+    provider, state, workflow,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -35,6 +36,41 @@ pub struct Status {
     pub last_sweep_at: Option<DateTime<Utc>>,
     pub runtime_timeout_seconds: u64,
     pub idle_timeout_seconds: u64,
+    #[serde(default)]
+    pub executable_path: String,
+    #[serde(default)]
+    pub executable_identity: String,
+    #[serde(default)]
+    pub executable_version: String,
+    #[serde(default)]
+    pub config_fingerprint: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DaemonIdentity {
+    executable_path: String,
+    executable_identity: String,
+    executable_version: String,
+    config_fingerprint: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DaemonConfigFingerprint<'a> {
+    cache: &'a crate::config::CacheConfig,
+    daemon: DaemonRuntimeConfig,
+    lifecycle: &'a crate::config::LifecycleConfig,
+    providers: &'a crate::config::ProviderConfig,
+    provider_runtime: &'a serde_json::Value,
+    workflows: &'a crate::config::WorkflowConfig,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DaemonRuntimeConfig {
+    scan_interval_ms: u64,
+    idle_shutdown_seconds: u64,
+    termination_retry_seconds: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -218,43 +254,65 @@ fn inspect_lock(path: &Path) -> Result<bool> {
 }
 
 pub fn start() -> Result<Status> {
-    fs::create_dir_all(directory()).context("create daemon state directory")?;
-    let _launcher = acquire_blocking_lock(&launcher_lock_path())?;
-    if let Some(status) = status()? {
-        let _ = fs::remove_file(stop_request_path(&status.token));
-        return Ok(status);
-    }
-    rotate_log()?;
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path())
-        .context("open daemon log")?;
-    let error_log = log.try_clone().context("clone daemon log handle")?;
-    let mut command = Command::new(std::env::current_exe().context("resolve Orc executable")?);
-    command
-        .args(["daemon", "run"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(error_log));
-    #[cfg(unix)]
-    command.process_group(0);
-    let mut child = command.spawn().context("start Orc daemon")?;
-    thread::spawn(move || {
-        let _ = child.wait();
-    });
+    start_with_config(&config::load()?)
+}
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
+fn start_with_config(config: &Config) -> Result<Status> {
+    fs::create_dir_all(directory()).context("create daemon state directory")?;
+    let expected = daemon_identity(config)?;
+    loop {
+        let launcher = acquire_blocking_lock(&launcher_lock_path())?;
         if let Some(status) = status()? {
-            return Ok(status);
+            if daemon_matches(&status, &expected) {
+                let _ = fs::remove_file(stop_request_path(&status.token));
+                return Ok(status);
+            }
+            request_restart(&status, launcher)?;
+            continue;
         }
-        thread::sleep(Duration::from_millis(25));
+        rotate_log()?;
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path())
+            .context("open daemon log")?;
+        let error_log = log.try_clone().context("clone daemon log handle")?;
+        let mut command = Command::new(std::env::current_exe().context("resolve Orc executable")?);
+        command
+            .args(["daemon", "run"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(error_log));
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn().context("start Orc daemon")?;
+        thread::spawn(move || {
+            let _ = child.wait();
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut restart_requested = false;
+        while Instant::now() < deadline {
+            if let Some(status) = status()? {
+                if daemon_matches(&status, &expected) {
+                    return Ok(status);
+                }
+                request_restart(&status, launcher)?;
+                restart_requested = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        if restart_requested {
+            continue;
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "Orc daemon did not become ready; see {}",
+                log_path().display()
+            );
+        }
     }
-    bail!(
-        "Orc daemon did not become ready; see {}",
-        log_path().display()
-    )
 }
 
 pub fn ensure_running(_config: &Config) -> Result<Option<Status>> {
@@ -262,10 +320,25 @@ pub fn ensure_running(_config: &Config) -> Result<Option<Status>> {
     return Ok(None);
     #[cfg(not(test))]
     if _config.daemon.autostart {
-        start().map(Some)
+        start_with_config(_config).map(Some)
     } else {
         Ok(None)
     }
+}
+
+fn request_restart(status: &Status, launcher: File) -> Result<()> {
+    let request = stop_request_path(&status.token);
+    fs::write(&request, status.token.as_bytes()).context("request Orc daemon restart")?;
+    drop(launcher);
+    if !wait_for_identity_release(&status.token, CONTROL_WAIT_TIMEOUT)? {
+        if !stop_requested(&status.token)? {
+            bail!("Orc daemon restart was cancelled by new managed work");
+        }
+        bail!("Orc daemon restart is still pending");
+    }
+    cleanup_status(Some(&status.token))?;
+    let _ = fs::remove_file(request);
+    Ok(())
 }
 
 pub fn stop() -> Result<bool> {
@@ -341,6 +414,7 @@ fn acquire_lock(path: &Path, timeout: Duration) -> Result<File> {
 
 pub fn run(config: &Config) -> Result<()> {
     let daemon_lock = DaemonLock::acquire()?;
+    let identity = daemon_identity(config)?;
     let mut status = Status {
         pid: std::process::id(),
         token: daemon_lock.token.clone(),
@@ -348,6 +422,10 @@ pub fn run(config: &Config) -> Result<()> {
         last_sweep_at: None,
         runtime_timeout_seconds: config.lifecycle.runtime_timeout_seconds,
         idle_timeout_seconds: config.lifecycle.idle_timeout_seconds,
+        executable_path: identity.executable_path,
+        executable_identity: identity.executable_identity,
+        executable_version: identity.executable_version,
+        config_fingerprint: identity.config_fingerprint,
     };
     let stop_request = stop_request_path(&daemon_lock.token);
     let _ = fs::remove_file(&stop_request);
@@ -449,22 +527,50 @@ fn sweep_at(config: &Config, now: DateTime<Utc>) -> Result<SweepReport> {
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        let scope = match scope_from_state_file(&path) {
-            Ok(scope) => scope,
-            Err(error) => {
-                report.unreadable += 1;
-                report
-                    .failures
-                    .push(format!("read {}: {error:#}", path.display()));
-                continue;
-            }
-        };
-        merge_report(&mut report, sweep_scope_at(config, &scope, now));
+        merge_report(&mut report, sweep_state_file(config, &path, now));
     }
     Ok(report)
 }
 
+fn sweep_state_file(config: &Config, path: &Path, now: DateTime<Utc>) -> SweepReport {
+    let scope = match scope_from_state_file(path) {
+        Ok(scope) => scope,
+        Err(error) => {
+            return SweepReport {
+                unreadable: 1,
+                failures: vec![format!("read {}: {error:#}", path.display())],
+                ..SweepReport::default()
+            };
+        }
+    };
+    match fs::metadata(&scope) {
+        Ok(metadata) if metadata.is_dir() => sweep_scope_at(config, &scope, now),
+        Ok(_) => SweepReport::default(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            sweep_persisted_scope_at(config, &scope, now)
+        }
+        Err(error) => SweepReport {
+            unreadable: 1,
+            failures: vec![format!("inspect workspace {}: {error}", scope.display())],
+            ..SweepReport::default()
+        },
+    }
+}
+
 fn sweep_scope_at(config: &Config, scope: &Path, now: DateTime<Utc>) -> SweepReport {
+    sweep_scope_at_mode(config, scope, now, false)
+}
+
+fn sweep_persisted_scope_at(config: &Config, scope: &Path, now: DateTime<Utc>) -> SweepReport {
+    sweep_scope_at_mode(config, scope, now, true)
+}
+
+fn sweep_scope_at_mode(
+    config: &Config,
+    scope: &Path,
+    now: DateTime<Utc>,
+    persisted_only: bool,
+) -> SweepReport {
     let mut report = SweepReport::default();
     let workspace = match state::read(scope) {
         Ok(workspace) => workspace,
@@ -476,55 +582,57 @@ fn sweep_scope_at(config: &Config, scope: &Path, now: DateTime<Utc>) -> SweepRep
             return report;
         }
     };
-    for run in workspace.runs.iter().filter(|run| {
-        (run.status == LifecycleStatus::Terminating
-            && run.parent_run_id.as_ref().is_none_or(|parent_id| {
-                !workspace.runs.iter().any(|parent| {
-                    parent.id == *parent_id && parent.status == LifecycleStatus::Terminating
-                })
-            }))
-            || (run.resume_requested
-                && run.status.active()
-                && run.status != LifecycleStatus::Terminating)
-            || (run.status == LifecycleStatus::Working && run.process_id.is_some())
-    }) {
-        report.monitored += 1;
-        if run.status == LifecycleStatus::Terminating {
-            if let Err(error) = workflow::cancel(config, scope, &run.id) {
-                report.failures.push(format!(
-                    "resume workflow cancellation {} in {}: {error:#}",
-                    run.id,
-                    scope.display()
-                ));
-            }
-            continue;
-        }
-        if run.resume_requested {
-            if let Err(error) = workflow::spawn(config, scope, &run.id) {
-                report.failures.push(format!(
-                    "resume workflow {} in {}: {error:#}",
-                    run.id,
-                    scope.display()
-                ));
-            }
-            continue;
-        }
-        match workflow::executor_active(scope, run) {
-            Ok(true) => {}
-            Ok(false) => {
-                if let Err(error) = workflow::spawn(config, scope, &run.id) {
+    if !persisted_only {
+        for run in workspace.runs.iter().filter(|run| {
+            (run.status == LifecycleStatus::Terminating
+                && run.parent_run_id.as_ref().is_none_or(|parent_id| {
+                    !workspace.runs.iter().any(|parent| {
+                        parent.id == *parent_id && parent.status == LifecycleStatus::Terminating
+                    })
+                }))
+                || (run.resume_requested
+                    && run.status.active()
+                    && run.status != LifecycleStatus::Terminating)
+                || (run.status == LifecycleStatus::Working && run.process_id.is_some())
+        }) {
+            report.monitored += 1;
+            if run.status == LifecycleStatus::Terminating {
+                if let Err(error) = workflow::cancel(config, scope, &run.id) {
                     report.failures.push(format!(
-                        "recover workflow {} in {}: {error:#}",
+                        "resume workflow cancellation {} in {}: {error:#}",
                         run.id,
                         scope.display()
                     ));
                 }
+                continue;
             }
-            Err(error) => report.failures.push(format!(
-                "inspect workflow {} in {}: {error:#}",
-                run.id,
-                scope.display()
-            )),
+            if run.resume_requested {
+                if let Err(error) = workflow::spawn(config, scope, &run.id) {
+                    report.failures.push(format!(
+                        "resume workflow {} in {}: {error:#}",
+                        run.id,
+                        scope.display()
+                    ));
+                }
+                continue;
+            }
+            match workflow::executor_active(scope, run) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if let Err(error) = workflow::spawn(config, scope, &run.id) {
+                        report.failures.push(format!(
+                            "recover workflow {} in {}: {error:#}",
+                            run.id,
+                            scope.display()
+                        ));
+                    }
+                }
+                Err(error) => report.failures.push(format!(
+                    "inspect workflow {} in {}: {error:#}",
+                    run.id,
+                    scope.display()
+                )),
+            }
         }
     }
     for session in workspace
@@ -574,14 +682,26 @@ fn sweep_scope_at(config: &Config, scope: &Path, now: DateTime<Utc>) -> SweepRep
         };
         let observed_heartbeat = (pending_claim.is_none() && reason == "idle timeout exceeded")
             .then_some(session.heartbeat_at);
-        match control::terminate_expired(
-            config,
-            scope,
-            &session.id,
-            reason,
-            observed_heartbeat,
-            pending_claim,
-        ) {
+        let termination = if persisted_only {
+            control::terminate_expired_persisted_scope(
+                config,
+                scope,
+                &session.id,
+                reason,
+                observed_heartbeat,
+                pending_claim,
+            )
+        } else {
+            control::terminate_expired(
+                config,
+                scope,
+                &session.id,
+                reason,
+                observed_heartbeat,
+                pending_claim,
+            )
+        };
+        match termination {
             Ok(stopped)
                 if stopped.status == crate::domain::LifecycleStatus::Cancelled
                     && stopped.termination_reason.as_deref() == Some(reason) =>
@@ -682,6 +802,66 @@ fn scope_from_state_file(path: &Path) -> Result<PathBuf> {
         .and_then(serde_json::Value::as_str)
         .context("state has no scope")?;
     Ok(PathBuf::from(scope))
+}
+
+fn daemon_identity(config: &Config) -> Result<DaemonIdentity> {
+    let executable = std::env::current_exe().context("resolve Orc executable")?;
+    let executable = fs::canonicalize(&executable).unwrap_or(executable);
+    let executable_identity = hash_reader(
+        File::open(&executable)
+            .with_context(|| format!("open Orc executable {}", executable.display()))?,
+    )?;
+    Ok(DaemonIdentity {
+        executable_path: executable.display().to_string(),
+        executable_identity,
+        executable_version: env!("CARGO_PKG_VERSION").into(),
+        config_fingerprint: config_fingerprint(config)?,
+    })
+}
+
+fn config_fingerprint(config: &Config) -> Result<String> {
+    let provider_runtime = provider::runtime_fingerprint(config)?;
+    config_fingerprint_for_runtime(config, &provider_runtime)
+}
+
+fn config_fingerprint_for_runtime(
+    config: &Config,
+    provider_runtime: &serde_json::Value,
+) -> Result<String> {
+    let relevant = DaemonConfigFingerprint {
+        cache: &config.cache,
+        daemon: DaemonRuntimeConfig {
+            scan_interval_ms: config.daemon.scan_interval_ms,
+            idle_shutdown_seconds: config.daemon.idle_shutdown_seconds,
+            termination_retry_seconds: config.daemon.termination_retry_seconds,
+        },
+        lifecycle: &config.lifecycle,
+        providers: &config.providers,
+        provider_runtime,
+        workflows: &config.workflows,
+    };
+    let encoded = serde_json::to_vec(&relevant).context("encode Orc daemon configuration")?;
+    Ok(hex::encode(Sha256::digest(encoded)))
+}
+
+fn hash_reader(mut reader: impl Read) -> Result<String> {
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = reader.read(&mut buffer).context("read Orc executable")?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn daemon_matches(status: &Status, expected: &DaemonIdentity) -> bool {
+    status.executable_path == expected.executable_path
+        && status.executable_identity == expected.executable_identity
+        && status.executable_version == expected.executable_version
+        && status.config_fingerprint == expected.config_fingerprint
 }
 
 fn write_status(status: &Status) -> Result<()> {
@@ -815,7 +995,10 @@ mod tests {
     use super::*;
     use crate::{
         control::{Contract, SessionLink},
-        domain::{CompletionTarget, LifecycleStatus, SessionRole},
+        domain::{
+            BindingStatus, CompletionTarget, LifecycleStatus, ProviderBinding, ProviderKind,
+            SessionRole,
+        },
         test_support::render_fixture,
     };
     use std::os::unix::fs::PermissionsExt;
@@ -854,6 +1037,126 @@ actions:
 
         assert!(!report_is_idle(&report));
         assert!(report_is_idle(&SweepReport::default()));
+    }
+
+    #[test]
+    fn config_fingerprint_tracks_only_daemon_runtime_settings() {
+        let config = Config::default();
+        let baseline = config_fingerprint(&config).expect("config fingerprint");
+        assert_eq!(
+            baseline,
+            config_fingerprint(&config).expect("stable config fingerprint")
+        );
+
+        let mut ui_change = config.clone();
+        ui_change.ui.refresh_ms += 1;
+        assert_eq!(
+            baseline,
+            config_fingerprint(&ui_change).expect("UI-independent fingerprint")
+        );
+
+        let mut launch_change = config.clone();
+        launch_change.daemon.autostart = !launch_change.daemon.autostart;
+        assert_eq!(
+            baseline,
+            config_fingerprint(&launch_change).expect("launch-independent fingerprint")
+        );
+
+        let mut lifecycle_change = config;
+        lifecycle_change.lifecycle.idle_timeout_seconds += 1;
+        assert_ne!(
+            baseline,
+            config_fingerprint(&lifecycle_change).expect("changed config fingerprint")
+        );
+
+        let providers_v1 = serde_json::json!({"runtimeGeneration": "providers-v1"});
+        let providers_v2 = serde_json::json!({"runtimeGeneration": "providers-v2"});
+        assert_ne!(
+            config_fingerprint_for_runtime(&Config::default(), &providers_v1)
+                .expect("first provider generation"),
+            config_fingerprint_for_runtime(&Config::default(), &providers_v2)
+                .expect("second provider generation")
+        );
+    }
+
+    #[test]
+    fn daemon_status_requires_the_current_binary_and_configuration() {
+        let expected = DaemonIdentity {
+            executable_path: "/nix/store/current/bin/orc".into(),
+            executable_identity: "sha256-current".into(),
+            executable_version: "1.2.3".into(),
+            config_fingerprint: "config-current".into(),
+        };
+        let mut status = Status {
+            pid: 42,
+            token: "token".into(),
+            started_at: Utc::now(),
+            last_sweep_at: None,
+            runtime_timeout_seconds: 60,
+            idle_timeout_seconds: 30,
+            executable_path: expected.executable_path.clone(),
+            executable_identity: expected.executable_identity.clone(),
+            executable_version: expected.executable_version.clone(),
+            config_fingerprint: expected.config_fingerprint.clone(),
+        };
+        assert!(daemon_matches(&status, &expected));
+
+        status.executable_identity = "sha256-old".into();
+        assert!(!daemon_matches(&status, &expected));
+        status.executable_identity = expected.executable_identity.clone();
+        status.config_fingerprint = "config-old".into();
+        assert!(!daemon_matches(&status, &expected));
+        status.config_fingerprint = expected.config_fingerprint.clone();
+        status.executable_version = "1.2.2".into();
+        assert!(!daemon_matches(&status, &expected));
+    }
+
+    #[test]
+    fn deleted_workspace_state_is_dormant_and_preserved() {
+        let directory = tempfile::tempdir().expect("daemon fixture");
+        let missing_scope = directory.path().join("deleted-workspace");
+        let state_file = directory.path().join("persisted.json");
+        fs::write(
+            &state_file,
+            serde_json::to_vec(&serde_json::json!({
+                "scope": missing_scope.display().to_string()
+            }))
+            .expect("persisted state fixture"),
+        )
+        .expect("write persisted state fixture");
+
+        let report = sweep_state_file(&Config::default(), &state_file, Utc::now());
+
+        assert!(report_is_idle(&report));
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert!(
+            state_file.exists(),
+            "persisted state must remain recoverable"
+        );
+    }
+
+    #[test]
+    fn deleted_workspace_keeps_managed_sessions_under_supervision() {
+        let directory = tempfile::tempdir().expect("daemon fixture");
+        let missing_scope = directory.path().join("deleted-workspace");
+        let now = Utc::now();
+        state::update(&missing_scope, |workspace| {
+            workspace.sessions.push(session(now));
+            Ok(())
+        })
+        .expect("persist managed session");
+        let state_file = state::path(&missing_scope);
+        let mut config = Config::default();
+        config.lifecycle.runtime_timeout_seconds = 0;
+        config.lifecycle.idle_timeout_seconds = 0;
+
+        let report = sweep_state_file(&config, &state_file, now);
+
+        assert_eq!(report.monitored, 1);
+        assert!(!report_is_idle(&report));
+        assert!(report.failures.is_empty());
+        assert!(state_file.exists());
+        let _ = fs::remove_file(state_file);
     }
 
     fn session(at: DateTime<Utc>) -> Session {
@@ -1003,11 +1306,23 @@ actions:
             SessionLink {
                 id: Some(format!("worker-{}", Uuid::new_v4())),
                 native_id: Some(Uuid::new_v4().to_string()),
-                source: RegistrationSource::Managed,
+                source: RegistrationSource::Connected,
                 ..SessionLink::default()
             },
         )
         .expect("managed session");
+        state::update(&scope, |workspace| {
+            workspace.sessions[0].registration = RegistrationSource::Managed;
+            workspace.sessions[0].providers.push(ProviderBinding {
+                provider: "missing-stopper".into(),
+                kind: ProviderKind::Persistence,
+                r#ref: Some("managed-process".into()),
+                status: BindingStatus::Active,
+                label: "Launch ownership: missing stop provider".into(),
+            });
+            Ok(())
+        })
+        .expect("record missing lifecycle owner");
         control::terminate(&config, &scope, &linked.id, "idle timeout exceeded")
             .expect_err("missing provider fails the first termination");
         let failed = state::read(&scope)
@@ -1126,11 +1441,23 @@ actions:
                 id: Some(format!("worker-{}", uuid::Uuid::new_v4())),
                 native_id: Some(uuid::Uuid::new_v4().to_string()),
                 run_id: Some("test-run".into()),
-                source: RegistrationSource::Managed,
+                source: RegistrationSource::Connected,
                 ..SessionLink::default()
             },
         )
         .expect("managed session");
+        state::update(&scope, |workspace| {
+            workspace.sessions[0].registration = RegistrationSource::Managed;
+            workspace.sessions[0].providers.push(ProviderBinding {
+                provider: "stopper".into(),
+                kind: ProviderKind::Persistence,
+                r#ref: Some("managed-process".into()),
+                status: BindingStatus::Active,
+                label: "Launch ownership: test stop provider".into(),
+            });
+            Ok(())
+        })
+        .expect("record lifecycle owner");
 
         let report = sweep_scope_at(
             &config,
@@ -1138,7 +1465,7 @@ actions:
             linked.connected_at + chrono::Duration::seconds(2),
         );
 
-        assert!(report.failures.is_empty());
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert_eq!(report.terminated.len(), 1);
         assert_eq!(report.terminated.first(), Some(&linked.id));
         assert!(marker.exists());

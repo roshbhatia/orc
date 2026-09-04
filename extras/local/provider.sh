@@ -9,7 +9,7 @@ provider_init "local"
 
 case "$capability" in
   provider.validate)
-    emit_validation "ok" "runtime" "local process execution is available"
+    validate_manifest_requirements
     ;;
   execution.run)
     plan_command=()

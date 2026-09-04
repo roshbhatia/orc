@@ -9,7 +9,7 @@ provider_init "traces"
 
 case "$capability" in
   provider.validate)
-    validate_dependency "traces"
+    validate_manifest_requirements
     ;;
   session.bind)
     trace_id=$(jq -r '.session.traceId // .session.nativeId // empty' <<< "$request")

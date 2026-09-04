@@ -9,7 +9,7 @@ provider_init "changes"
 
 case "$capability" in
   provider.validate)
-    validate_dependency "changes"
+    validate_manifest_requirements
     ;;
   changes.inspect)
     executable=$(command -v changes || true)

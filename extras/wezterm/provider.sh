@@ -7,12 +7,16 @@ source "$provider_library"
 
 if [[ ${1:-} == hold ]]; then
   shift
+  started_at=$SECONDS
   set +e
   "$@"
   code=$?
   set -e
   if ((code != 0)); then
     printf '\nCommand exited with %s. Press Enter to close.\n' "$code"
+    IFS= read -r _ || true
+  elif ((SECONDS - started_at < 2)); then
+    printf '\nCommand exited before an interactive session was ready. Press Enter to close.\n'
     IFS= read -r _ || true
   fi
   exit "$code"
@@ -22,7 +26,7 @@ provider_init "wezterm"
 
 case "$capability" in
   provider.validate)
-    validate_dependency "wezterm"
+    validate_manifest_requirements
     ;;
   session.bind)
     executable=$(command -v wezterm || true)
@@ -95,20 +99,11 @@ case "$capability" in
       ' <<< "$request"
     )
     session_command+=("$0" hold "${plan_command[@]}")
-    columns=0
     if [[ -n ${WEZTERM_PANE:-} ]]; then
-      columns=$(
-        "$executable" cli --no-auto-start list --format json 2> /dev/null |
-          jq -r --argjson pane "$WEZTERM_PANE" 'first(.[] | select(.pane_id == $pane) | .size.cols) // 0'
-      )
-    fi
-    if ((columns > 0 && columns < 160)); then
-      split_command=("$executable" cli --no-auto-start spawn --cwd "$prior_cwd")
-    else
       split_command=("$executable" cli --no-auto-start split-pane "--$direction" --cwd "$prior_cwd")
-      if [[ -n ${WEZTERM_PANE:-} ]]; then
-        split_command+=(--pane-id "$WEZTERM_PANE")
-      fi
+      split_command+=(--pane-id "$WEZTERM_PANE")
+    else
+      split_command=("$executable" cli --no-auto-start spawn --cwd "$prior_cwd")
     fi
     split_command+=(-- "${session_command[@]}")
     emit_plan "$scope" "$prior_environment" "${split_command[@]}"

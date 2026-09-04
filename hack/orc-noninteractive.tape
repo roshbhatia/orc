@@ -7,12 +7,15 @@ Set Padding 18
 Set Framerate 20
 Set TypingSpeed 25ms
 
-Type "$ORC_SCREENSHOT_BIN status --scope $ORC_SCREENSHOT_SCOPE"
+Type "cd examples/provider-migration"
+Enter
+Sleep 500ms
+Type "orc status"
 Enter
 Sleep 1s
-Type "$ORC_SCREENSHOT_BIN run list --scope $ORC_SCREENSHOT_SCOPE"
+Type "orc run list"
 Enter
 Sleep 1s
-Type "$ORC_SCREENSHOT_BIN run show $ORC_SCREENSHOT_RUN --scope $ORC_SCREENSHOT_SCOPE"
+Type "orc provider list"
 Enter
 Sleep 2s

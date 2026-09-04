@@ -17,7 +17,7 @@ if [[ -z ${ORC_SCREENSHOT_BIN:-} ]]; then
       --option eval-cache false \
       --no-link \
       --print-out-paths \
-      .#full
+      ./extras#full
   )
   export ORC_PROVIDER_DIR="$package/share/orc/providers"
   export ORC_SCREENSHOT_BIN="$package/bin/orc"
@@ -26,6 +26,7 @@ if [[ -z ${ORC_PROVIDER_DIR:-} ]]; then
   printf 'ORC_PROVIDER_DIR is required when ORC_SCREENSHOT_BIN is set\n' >&2
   exit 2
 fi
+export PATH="$(dirname "$ORC_SCREENSHOT_BIN"):$PATH"
 export ORC_SCREENSHOT_SCOPE="$repo_dir/examples/provider-migration"
 export XDG_STATE_HOME="$fixture/state"
 
@@ -42,14 +43,52 @@ orchestrator=$(
     --expected-output "A tested provider API and migrated renderer"
 )
 
+workflow="$fixture/provider-migration.yaml"
+cat >"$workflow" <<'YAML'
+version: orc.workflow/v1
+name: renderer-provider-migration
+description: Move rendering behind provider contracts
+goal: Replace direct rendering calls with provider contracts
+expected_output: A passing migration with review evidence
+entry_point: research
+approval:
+  mode: autonomous
+defaults:
+  runtime:
+    harness: codex
+steps:
+  - name: research
+    type: set
+    role: researcher
+    purpose: Find direct renderer dependencies
+    goal: List every call site and its owner
+    expected_output: A verified dependency map
+    value:
+      mapped: true
+  - name: implement
+    type: agent
+    role: implementer
+    purpose: Implement the provider interface
+    goal: Migrate call sites without behavior changes
+    expected_output: Passing tests and typed providers
+    depends_on: [research]
+    review_by: review
+    completion: judge
+  - name: review
+    type: agent
+    role: critic
+    purpose: Check behavior and contracts
+    goal: Reject incomplete provider boundaries
+    expected_output: Findings or approval evidence
+    routes:
+      - to: implement
+        when: output.approved == false
+      - to: $end
+YAML
 run=$(
-  "$ORC_SCREENSHOT_BIN" run create \
+  "$ORC_SCREENSHOT_BIN" workflow start "$workflow" \
     --scope "$ORC_SCREENSHOT_SCOPE" \
-    --name "Renderer provider migration" \
-    --goal "Replace direct rendering calls with provider contracts" \
-    --expected-output "A passing migration with review evidence" \
-    --orchestrator "$orchestrator" \
-    --harness codex
+    --json | jq -r .id
 )
 export ORC_SCREENSHOT_RUN=$run
 
@@ -113,6 +152,7 @@ critic=$(
   --success "All direct imports are removed" \
   --session "$implementer" \
   --review-by review \
+  --completion judge \
   --depends-on research \
   --status queued > /dev/null
 

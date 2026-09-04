@@ -8,6 +8,26 @@ source "$provider_library"
 provider_init "harness"
 agent_registry=${ORC_AGENT_REGISTRY:-${XDG_CONFIG_HOME:-$HOME/.config}/sysinit/agents.json}
 
+session_environment() {
+  jq -ce --arg scope "$scope" '
+    {
+      ORC_SCOPE: $scope,
+      ORC_SESSION_ID: .session.id,
+      ORC_NATIVE_SESSION_ID: .session.nativeId,
+      ORC_PARENT_SESSION_ID: .session.parentId,
+      ORC_RUN_ID: .session.runId,
+      ORC_NODE_ID: .session.nodeId,
+      ORC_PROVIDER_REF: .session.providerRef,
+      ORC_MODEL: .session.model
+    }
+    | with_entries(select(.value | type == "string" and length > 0))
+    | if has("ORC_SESSION_ID") and has("ORC_NATIVE_SESSION_ID")
+      then .
+      else error("session linkage is incomplete")
+      end
+  ' <<< "$request"
+}
+
 case "$capability" in
   provider.validate)
     if [[ ! -s $agent_registry ]] || ! jq -e '
@@ -71,7 +91,8 @@ case "$capability" in
     if [[ -n $model && -n $model_flag ]]; then
       resume_command+=("$model_flag" "$model")
     fi
-    emit_plan "$scope" '{}' "${resume_command[@]}"
+    environment=$(session_environment)
+    emit_plan "$scope" "$environment" "${resume_command[@]}"
     ;;
   session.launch)
     if [[ ! -s $agent_registry ]]; then
@@ -99,7 +120,9 @@ case "$capability" in
     while IFS= read -r -d '' value; do
       launch_command+=("$value")
     done < <(jq -j '.command[1:] | .[] | @text, "\u0000"' <<< "$request")
-    environment=$(jq -ce '.environment // {} | objects' <<< "$request")
+    environment=$(jq -ce --argjson linkage "$(session_environment)" '
+      (.environment // {} | objects) * $linkage
+    ' <<< "$request")
     emit_plan "$scope" "$environment" "${launch_command[@]}"
     ;;
   *) unsupported_capability ;;

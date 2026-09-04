@@ -462,6 +462,8 @@ enum WorkflowCommand {
     },
     Validate {
         workflow: PathBuf,
+        #[command(flatten)]
+        scope: ScopeArgs,
     },
     Plan {
         workflow: PathBuf,
@@ -605,21 +607,23 @@ fn register(config: &Config, mut args: RegisterArgs) -> Result<Option<String>> {
             return Ok(None);
         }
     }
-    let session = control::register(
-        &args.scope.scope,
-        args.contract.into(),
-        SessionLink {
-            id: args.id,
-            native_id: args.native_id,
-            parent_id: args.parent_id,
-            run_id: args.run_id,
-            node_id: args.node_id,
-            provider_ref: args.provider_ref,
-            runtime_timeout_seconds: args.runtime_timeout_seconds,
-            idle_timeout_seconds: args.idle_timeout_seconds,
-            source: args.source,
-        },
-    )?;
+    let contract = args.contract.into();
+    let link = SessionLink {
+        id: args.id,
+        native_id: args.native_id,
+        parent_id: args.parent_id,
+        run_id: args.run_id,
+        node_id: args.node_id,
+        provider_ref: args.provider_ref,
+        runtime_timeout_seconds: args.runtime_timeout_seconds,
+        idle_timeout_seconds: args.idle_timeout_seconds,
+        source: args.source,
+    };
+    let session = if link.source == RegistrationSource::Managed {
+        control::register_managed(config, &args.scope.scope, contract, link)?
+    } else {
+        control::register(&args.scope.scope, contract, link)?
+    };
     if session.registration == RegistrationSource::Managed {
         daemon::ensure_running(config)?;
     }
@@ -637,6 +641,20 @@ fn print_json(value: &impl serde::Serialize) -> Result<()> {
 
 fn require_orchestrator_or_operator(scope: &std::path::Path) -> Result<()> {
     control::require_supervisor_control(scope)
+}
+
+fn approval_actor(scope: &std::path::Path) -> Result<workflow::ApprovalActor> {
+    let Some(session_id) = env::var_os("ORC_SESSION_ID") else {
+        return Ok(workflow::ApprovalActor::User);
+    };
+    let session_id = session_id
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("ORC_SESSION_ID must be valid UTF-8"))?;
+    let (_, caller) = control::ensure_active_context_for(scope, &session_id)?;
+    if caller.role != SessionRole::Orchestrator {
+        bail!("only the orchestrator or an external operator can change managed lifecycle state");
+    }
+    Ok(workflow::ApprovalActor::Orchestrator)
 }
 
 fn require_supervisor_control() -> Result<()> {
@@ -850,7 +868,16 @@ pub fn run() -> Result<u8> {
             SessionCommand::List(args) => list_sessions(&args)?,
             SessionCommand::Update { id, scope, status } => {
                 require_orchestrator_or_operator(&scope.scope)?;
-                print_json(&control::update_session(&scope.scope, &id, status)?)?
+                if status == LifecycleStatus::Cancelled {
+                    print_json(&control::terminate(
+                        &config,
+                        &scope.scope,
+                        &id,
+                        "cancelled by operator",
+                    )?)?
+                } else {
+                    print_json(&control::update_session(&scope.scope, &id, status)?)?
+                }
             }
             SessionCommand::Keepalive { id, scope } => {
                 require_orchestrator_or_operator(&scope.scope)?;
@@ -927,7 +954,11 @@ pub fn run() -> Result<u8> {
             }
             RunCommand::Update { id, scope, status } => {
                 require_orchestrator_or_operator(&scope.scope)?;
-                print_json(&control::update_run(&scope.scope, &id, status)?)?
+                if status == LifecycleStatus::Cancelled {
+                    print_json(&workflow::cancel(&config, &scope.scope, &id)?)?
+                } else {
+                    print_json(&control::update_run(&scope.scope, &id, status)?)?
+                }
             }
             RunCommand::Execute { id, scope } | RunCommand::Resume { id, scope } => {
                 require_orchestrator_or_operator(&scope.scope)?;
@@ -945,13 +976,14 @@ pub fn run() -> Result<u8> {
                 gate,
                 no_resume,
             } => {
-                require_orchestrator_or_operator(&scope.scope)?;
-                print_json(&workflow::approve(
+                let actor = approval_actor(&scope.scope)?;
+                print_json(&workflow::approve_as(
                     &config,
                     &scope.scope,
                     &id,
                     gate.as_deref(),
                     !no_resume,
+                    actor,
                 )?)?
             }
             RunCommand::Cancel { id, scope } => {
@@ -1219,7 +1251,11 @@ fn workflow_command(config: &Config, command: WorkflowCommand) -> Result<()> {
             workflow::load(&path)?;
             workflow::commit(config, &format!("feat: update {name} workflow"))?;
         }
-        WorkflowCommand::Validate { workflow: path } => {
+        WorkflowCommand::Validate {
+            workflow: requested,
+            scope,
+        } => {
+            let path = resolve_workflow_reference(config, &scope.scope, &requested)?;
             let definition = workflow::load(&path)?;
             println!(
                 "valid · {} · {} steps",
@@ -1228,10 +1264,11 @@ fn workflow_command(config: &Config, command: WorkflowCommand) -> Result<()> {
             );
         }
         WorkflowCommand::Plan {
-            workflow: path,
+            workflow: requested,
             scope,
             json,
         } => {
+            let path = resolve_workflow_reference(config, &scope.scope, &requested)?;
             let definition = workflow::load(&path)?;
             let plan = workflow::plan(config, &scope.scope, &definition)?;
             if json {
@@ -1258,14 +1295,7 @@ fn workflow_command(config: &Config, command: WorkflowCommand) -> Result<()> {
             json,
         } => {
             require_orchestrator_or_operator(&scope.scope)?;
-            let definition_path = if requested.exists() {
-                requested
-            } else {
-                let name = requested
-                    .to_str()
-                    .context("workflow name is not valid UTF-8")?;
-                workflow::path(config, &scope.scope, name)?
-            };
+            let definition_path = resolve_workflow_reference(config, &scope.scope, &requested)?;
             let mode = if background {
                 crate::domain::RunMode::Background
             } else {
@@ -1297,6 +1327,20 @@ fn workflow_command(config: &Config, command: WorkflowCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn resolve_workflow_reference(
+    config: &Config,
+    scope: &std::path::Path,
+    requested: &std::path::Path,
+) -> Result<PathBuf> {
+    if requested.exists() {
+        return Ok(requested.to_owned());
+    }
+    let name = requested
+        .to_str()
+        .context("workflow name is not valid UTF-8")?;
+    workflow::path(config, scope, name)
 }
 
 fn guide(config: &Config, args: &GuideArgs) -> Result<()> {
@@ -1345,7 +1389,11 @@ fn generate_artifacts(root: &std::path::Path, check: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::SplitDirection;
+    use super::{Cli, Commands, SplitDirection, WorkflowCommand, resolve_workflow_reference};
+    use crate::{config::Config, workflow};
+    use clap::Parser;
+    use std::{fs, path::Path};
+    use tempfile::TempDir;
 
     #[test]
     fn split_directions_render_without_recursive_formatting() {
@@ -1353,5 +1401,57 @@ mod tests {
         assert_eq!(SplitDirection::Left.to_string(), "left");
         assert_eq!(SplitDirection::Top.to_string(), "top");
         assert_eq!(SplitDirection::Bottom.to_string(), "bottom");
+    }
+
+    #[test]
+    fn workflow_validate_accepts_scope() {
+        let cli = Cli::try_parse_from([
+            "orc",
+            "workflow",
+            "validate",
+            "release",
+            "--scope",
+            "/tmp/project",
+        ])
+        .unwrap();
+
+        let Some(Commands::Workflow {
+            command: WorkflowCommand::Validate { workflow, scope },
+        }) = cli.command
+        else {
+            panic!("workflow validate command");
+        };
+        assert_eq!(workflow, Path::new("release"));
+        assert_eq!(scope.scope, Path::new("/tmp/project"));
+    }
+
+    #[test]
+    fn workflow_reference_accepts_catalog_names_and_paths() {
+        let directory = TempDir::new().unwrap();
+        let scope = directory.path().join("project");
+        let repository = directory.path().join("catalog");
+        fs::create_dir(&scope).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&scope)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let mut config = Config::default();
+        config.workflows.repository = repository;
+        config.workflows.auto_commit = false;
+
+        let catalog = workflow::path(&config, &scope, "release").unwrap();
+        let explicit = directory.path().join("explicit.yaml");
+        fs::write(&explicit, "version: orc.workflow/v1\n").unwrap();
+
+        assert_eq!(
+            resolve_workflow_reference(&config, &scope, Path::new("release")).unwrap(),
+            catalog
+        );
+        assert_eq!(
+            resolve_workflow_reference(&config, &scope, &explicit).unwrap(),
+            explicit
+        );
     }
 }

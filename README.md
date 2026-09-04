@@ -13,6 +13,34 @@ Rataflow. Orc does not require a remote broker, terminal multiplexer, or
 specific agent harness. A small local supervisor enforces leases for managed
 child sessions and exits when no managed work remains.
 
+## Install
+
+Install provider-neutral Orc with Nix:
+
+```bash
+nix profile install github:roshbhatia/orc
+```
+
+Install Orc with every optional provider and its runtime dependencies:
+
+```bash
+nix profile install 'github:roshbhatia/orc?dir=extras#full'
+```
+
+Each GitHub release also contains provider-neutral archives for x86_64 Linux,
+aarch64 Linux, and aarch64 macOS. Verify the adjacent `.sha256` file, unpack
+the archive, and add its `bin` directory to `PATH`. Copy the directories under
+`share` into the matching system or user data directories for completions and
+schemas. The standalone archive requires Git on `PATH` for the versioned
+workflow catalog. Install optional providers separately; each provider owns its
+other runtime dependencies.
+
+Build from source with the declared development shell:
+
+```bash
+nix develop --command cargo build --locked --release
+```
+
 ## Terms
 
 - An orchestrator is the root harness session for one workspace.
@@ -40,17 +68,28 @@ agents, and their workflow runs in one ownership hierarchy. Press `Tab` to
 switch between the tree and the selected run's workflow graph. Press `p` to
 inspect integrations, then `Esc` to return to work.
 
-The graph places the orchestrator above its stage ranks. Delegation, dependency,
-review, and report arrows show the planned contracts and their live state.
-Press `g` on a run to open its graph. Press `Enter` on any run, stage, or agent
-to focus its active display or launch a display for a dormant session.
+The graph places the orchestrator above its stage ranks. Labeled delegation,
+dependency, review, feedback, and report lanes show the planned contracts and
+their live state. Stage cards show execution placement and judge policy. Human
+gates appear on the affected stage and in the header. Press `g` on a run in the
+tree to open its graph.
 
-Use `hjkl` inside the focused pane. Use `Ctrl-h/j/k/l` to move between work and
+Press `Enter` on a run, stage, or agent that has a live session to open its
+display. On an active unassigned agent stage, `Enter` starts the workflow
+executor, waits briefly for its managed session, then opens that session. The
+workflow keeps running if its display is not ready within that bound. A finished
+stage without a session has nothing to open. Press `d` to cycle the display
+direction before opening or launching an agent.
+
+Use `hjkl` inside the focused pane. Click `tree`, `graph`, or `integrations` in
+the header to change the main view. Use `Ctrl-h/j/k/l` to move between work and
 the inspector. `Tab` and `Shift-Tab` cycle the selected run, stage, agent, or
 provider's contextual inspector tabs. The mouse wheel zooms the graph within
 its safe range. Drag the blank canvas to pan; Orc keeps the graph inside its
-viewport. Changes load when the dashboard opens. Press `?` for generated key
-help.
+viewport. Changes load when you open the Changes inspector. They refresh only
+when you request changes or refresh that view. Orc temporarily hides the
+inspector when the terminal is too small to keep both panes usable. Press `?`
+for generated key help.
 
 Register an orchestrator session:
 
@@ -112,10 +151,13 @@ Create a starter definition in the current workspace's workflow catalog:
 ```bash
 orc workflow init provider-migration
 orc workflow edit provider-migration
-orc workflow validate "$(orc workflow path provider-migration)"
+orc workflow validate provider-migration
 orc workflow plan provider-migration
 orc workflow start provider-migration --background
 ```
+
+`validate`, `plan`, and `start` accept either a catalog name or a workflow
+file path. `--scope` selects the workspace catalog for all three commands.
 
 An orchestrator can also propose and start definitions through Orc's MCP tools.
 Orc validates the proposal before it commits the YAML definition. Ready nodes
@@ -232,14 +274,20 @@ The optional provider packages live in [`extras/`](extras/README.md). Install
 only the adapters your environment uses:
 
 ```bash
-nix profile install github:roshbhatia/orc#provider-harness
-nix profile install github:roshbhatia/orc#provider-zmx
-nix profile install github:roshbhatia/orc#provider-wezterm
+# Install core and every provider as one package.
+nix profile install 'github:roshbhatia/orc?dir=extras#full'
+
+# Or install provider-neutral core with selected providers.
+nix profile install github:roshbhatia/orc
+nix profile install 'github:roshbhatia/orc?dir=extras#provider-harness'
+nix profile install 'github:roshbhatia/orc?dir=extras#provider-zmx'
+nix profile install 'github:roshbhatia/orc?dir=extras#provider-wezterm'
 ```
 
 Every provider directory owns its adapter, manifest, and Nix runtime
-dependencies. `#extras` installs all providers. `#full` installs provider-neutral
-core plus that bundle. The default package remains core only.
+dependencies. The extras flake default installs all providers. Its `#full`
+output installs provider-neutral core plus that bundle. The root flake contains
+only Orc core.
 
 Orc reads provider manifests in precedence order. It checks the configured
 provider directory first, then `$XDG_DATA_HOME/orc/providers`, then each
@@ -1033,13 +1081,14 @@ Options:
 ### `orc workflow validate`
 
 ```text
-Usage: orc workflow validate <WORKFLOW>
+Usage: orc workflow validate [OPTIONS] <WORKFLOW>
 
 Arguments:
   <WORKFLOW>
 
 Options:
-  -h, --help  Print help
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+  -h, --help           Print help
 ```
 
 ### `orc workflow plan`
@@ -1271,5 +1320,6 @@ cargo clippy --all-targets -- -D warnings
 ./hack/generate.sh --check
 nix build --accept-flake-config
 nix flake check --accept-flake-config
+nix flake check --accept-flake-config ./extras
 ./hack/screenshots.sh
 ```

@@ -11,7 +11,7 @@ Sleep 1s
 
 Type "$ORC_SCREENSHOT_BIN tui --scope $ORC_SCREENSHOT_SCOPE"
 Enter
-Wait+Screen /Renderer provider migration/
+Wait+Screen /renderer-provider-migration/
 Sleep 1s
 Type "j"
 Sleep 250ms

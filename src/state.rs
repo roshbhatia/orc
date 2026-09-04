@@ -2,6 +2,7 @@ use std::{
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -19,8 +20,54 @@ use std::os::fd::AsRawFd;
 use crate::{config, domain::WorkspaceState};
 
 pub fn resolve_scope(scope: impl AsRef<Path>) -> Result<PathBuf> {
-    fs::canonicalize(scope.as_ref())
-        .with_context(|| format!("resolve workspace scope {}", scope.as_ref().display()))
+    let requested = scope.as_ref();
+    let directory = fs::canonicalize(requested)
+        .with_context(|| format!("resolve workspace scope {}", requested.display()))?;
+    if !directory.is_dir() {
+        bail!(
+            "workspace scope is not a directory: {}",
+            directory.display()
+        );
+    }
+
+    let Some(output) = git_worktree_root(&directory)? else {
+        return Ok(directory);
+    };
+    if !output.status.success() {
+        return Ok(directory);
+    }
+
+    let root = String::from_utf8(output.stdout).context("Git worktree root is not UTF-8")?;
+    let root = root.trim_end_matches(['\r', '\n']);
+    if root.is_empty() {
+        bail!(
+            "git returned an empty worktree root for {}",
+            directory.display()
+        );
+    }
+    fs::canonicalize(root).with_context(|| format!("resolve Git worktree root {root}"))
+}
+
+fn git_worktree_root(directory: &Path) -> Result<Option<std::process::Output>> {
+    git_worktree_root_with(Path::new("git"), directory)
+}
+
+fn git_worktree_root_with(
+    executable: &Path,
+    directory: &Path,
+) -> Result<Option<std::process::Output>> {
+    match Command::new(executable)
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(directory)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(output) => Ok(Some(output)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("find Git worktree root"),
+    }
 }
 
 pub fn scope_key(scope: &Path) -> String {
@@ -405,6 +452,52 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Barrier, atomic::AtomicUsize, atomic::Ordering};
     use tempfile::TempDir;
+
+    fn init_git(path: &Path) {
+        let status = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn root_and_nested_paths_resolve_to_the_same_git_scope() {
+        let directory = TempDir::new().unwrap();
+        let nested = directory.path().join("src/nested");
+        fs::create_dir_all(&nested).unwrap();
+        init_git(directory.path());
+
+        let root_scope = resolve_scope(directory.path()).unwrap();
+        let nested_scope = resolve_scope(&nested).unwrap();
+
+        assert_eq!(root_scope, fs::canonicalize(directory.path()).unwrap());
+        assert_eq!(nested_scope, root_scope);
+        assert_eq!(scope_key(&nested_scope), scope_key(&root_scope));
+    }
+
+    #[test]
+    fn directory_outside_git_is_its_own_canonical_scope() {
+        let directory = TempDir::new().unwrap();
+
+        assert_eq!(
+            resolve_scope(directory.path()).unwrap(),
+            fs::canonicalize(directory.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn missing_git_falls_back_to_the_canonical_directory() {
+        let directory = TempDir::new().unwrap();
+        let missing = directory.path().join("missing-git");
+
+        assert!(
+            git_worktree_root_with(&missing, directory.path())
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn scope_key_is_stable() {

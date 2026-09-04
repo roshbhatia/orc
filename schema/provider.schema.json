@@ -21,6 +21,22 @@
       ],
       "type": "string"
     },
+    "ProviderCommand": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      ]
+    },
     "ProviderKind": {
       "enum": [
         "persistence",
@@ -61,6 +77,32 @@
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "anyOf": [
+        {
+          "properties": {
+            "actions": {
+              "minProperties": 1
+            }
+          },
+          "required": [
+            "actions"
+          ]
+        },
+        {
+          "properties": {
+            "capabilities": {
+              "minItems": 1
+            }
+          },
+          "required": [
+            "capabilities"
+          ]
+        }
+      ]
+    }
+  ],
   "properties": {
     "actions": {
       "additionalProperties": false,
@@ -125,7 +167,7 @@
       "type": "array"
     },
     "command": {
-      "type": "string"
+      "$ref": "#/$defs/ProviderCommand"
     },
     "description": {
       "default": "Orc provider",
@@ -136,6 +178,7 @@
       "default": "integration"
     },
     "name": {
+      "pattern": "^[a-z0-9._-]+$",
       "type": "string"
     },
     "priority": {
@@ -152,6 +195,7 @@
       }
     },
     "version": {
+      "const": "orc.provider/v1",
       "type": "string"
     }
   },

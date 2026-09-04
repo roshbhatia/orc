@@ -281,10 +281,21 @@ fn optional_u64(value: &Value, name: &str) -> Option<u64> {
     value.get(name).and_then(Value::as_u64)
 }
 
+fn active_context(
+    scope: &std::path::Path,
+    session_id: Option<&str>,
+) -> Result<(crate::domain::WorkspaceState, crate::domain::Session)> {
+    let session_id = session_id.context(
+        "ORC_SESSION_ID is required for Orc MCP tools; connect this harness session first",
+    )?;
+    control::ensure_active_context_for(scope, session_id)
+}
+
 fn call(name: &str, input: &Value, config: &Config) -> Result<Value> {
     let scope = std::env::var("ORC_SCOPE").context("ORC_SCOPE is required for Orc MCP tools")?;
     let scope = state::resolve_scope(scope)?;
-    let (workspace, current) = control::ensure_active_context(&scope)?;
+    let session_id = std::env::var("ORC_SESSION_ID").ok();
+    let (workspace, current) = active_context(&scope, session_id.as_deref())?;
     if orchestrator_only(name) && current.role != SessionRole::Orchestrator {
         bail!("only the orchestrator can call {name}");
     }
@@ -306,7 +317,8 @@ fn call(name: &str, input: &Value, config: &Config) -> Result<Value> {
             if role == SessionRole::Orchestrator {
                 bail!("managed child sessions cannot have the orchestrator role");
             }
-            let session = control::register(
+            let session = control::register_managed(
+                config,
                 &scope,
                 control::Contract {
                     harness: string(input, "harness"),
@@ -340,13 +352,19 @@ fn call(name: &str, input: &Value, config: &Config) -> Result<Value> {
         }
         "orc_session_update" => {
             let id = string(input, "id");
-            serde_json::to_value(control::update_session(
-                &scope,
-                &id,
-                string(input, "status")
-                    .parse::<LifecycleStatus>()
-                    .map_err(anyhow::Error::msg)?,
-            )?)?
+            let status = string(input, "status")
+                .parse::<LifecycleStatus>()
+                .map_err(anyhow::Error::msg)?;
+            if status == LifecycleStatus::Cancelled {
+                serde_json::to_value(control::terminate(
+                    config,
+                    &scope,
+                    &id,
+                    "cancelled by orchestrator",
+                )?)?
+            } else {
+                serde_json::to_value(control::update_session(&scope, &id, status)?)?
+            }
         }
         "orc_session_keepalive" => {
             let session = control::keepalive(&scope, &string(input, "id"))?;
@@ -365,19 +383,24 @@ fn call(name: &str, input: &Value, config: &Config) -> Result<Value> {
             optional(input, "harness"),
             optional(input, "model"),
         )?)?,
-        "orc_run_update" => serde_json::to_value(control::update_run(
-            &scope,
-            &string(input, "id"),
-            string(input, "status")
+        "orc_run_update" => {
+            let id = string(input, "id");
+            let status = string(input, "status")
                 .parse::<LifecycleStatus>()
-                .map_err(anyhow::Error::msg)?,
-        )?)?,
-        "orc_run_approve" => serde_json::to_value(workflow::approve(
+                .map_err(anyhow::Error::msg)?;
+            if status == LifecycleStatus::Cancelled {
+                serde_json::to_value(workflow::cancel(config, &scope, &id)?)?
+            } else {
+                serde_json::to_value(control::update_run(&scope, &id, status)?)?
+            }
+        }
+        "orc_run_approve" => serde_json::to_value(workflow::approve_as(
             config,
             &scope,
             &string(input, "id"),
             optional(input, "gateId").as_deref(),
             input.get("resume").and_then(Value::as_bool).unwrap_or(true),
+            workflow::ApprovalActor::Orchestrator,
         )?)?,
         "orc_run_cancel" => {
             serde_json::to_value(workflow::cancel(config, &scope, &string(input, "id"))?)?
@@ -572,5 +595,13 @@ mod tests {
         assert!(catalog.iter().all(|tool| {
             tool.pointer("/inputSchema/additionalProperties") == Some(&Value::Bool(false))
         }));
+    }
+
+    #[test]
+    fn mcp_context_requires_an_explicit_session_identity() {
+        let error = active_context(std::path::Path::new("."), None)
+            .expect_err("MCP must not inherit the latest orchestrator");
+
+        assert!(error.to_string().contains("ORC_SESSION_ID is required"));
     }
 }

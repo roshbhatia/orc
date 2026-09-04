@@ -16,14 +16,26 @@ use crate::{
     config::Config,
     daemon,
     domain::{
-        AgentConfig, BindingStatus, CompletionTarget, JudgePolicy, LifecycleStatus, ProviderKind,
-        RegistrationSource, Session, SessionRole, WorkflowEdge, WorkflowNode, WorkflowRun,
-        WorkspaceState,
+        AgentConfig, BindingStatus, CompletionTarget, JudgePolicy, LifecycleStatus,
+        LifecycleSubject, ProviderBinding, ProviderKind, RegistrationSource, Session, SessionRole,
+        WorkflowEdge, WorkflowNode, WorkflowRun, WorkspaceState,
     },
     provider, state,
 };
 
 const MAX_NODE_OUTPUT_BYTES: usize = 1024 * 1024;
+
+fn require_transition(
+    subject: LifecycleSubject,
+    current: LifecycleStatus,
+    next: LifecycleStatus,
+) -> Result<()> {
+    if current.can_transition_to(subject, next) {
+        Ok(())
+    } else {
+        bail!("invalid {subject} lifecycle transition: {current} -> {next}")
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Contract {
@@ -118,7 +130,26 @@ pub fn read_workspace(scope: &Path) -> Result<WorkspaceState> {
 
 pub fn register(scope: &Path, mut contract: Contract, link: SessionLink) -> Result<Session> {
     let environment_id = env::var("ORC_SESSION_ID").ok();
-    register_for_caller(scope, &mut contract, link, environment_id.as_deref())
+    register_for_caller(scope, &mut contract, link, environment_id.as_deref(), None)
+}
+
+pub fn register_managed(
+    config: &Config,
+    scope: &Path,
+    mut contract: Contract,
+    mut link: SessionLink,
+) -> Result<Session> {
+    let providers = provider::discover(config)?;
+    let lifecycle_bindings = provider::launch_lifecycle_bindings(&providers, "pending")?;
+    let environment_id = env::var("ORC_SESSION_ID").ok();
+    link.source = RegistrationSource::Managed;
+    register_for_caller(
+        scope,
+        &mut contract,
+        link,
+        environment_id.as_deref(),
+        Some(lifecycle_bindings),
+    )
 }
 
 fn register_for_caller(
@@ -126,6 +157,7 @@ fn register_for_caller(
     contract: &mut Contract,
     link: SessionLink,
     environment_id: Option<&str>,
+    lifecycle_bindings: Option<Vec<ProviderBinding>>,
 ) -> Result<Session> {
     let scope = state::resolve_scope(scope)?;
     let native_id = link.native_id.unwrap_or_else(inferred_native_id);
@@ -135,20 +167,20 @@ fn register_for_caller(
         let caller = environment_id
             .map(|caller_id| {
                 workspace
-                    .sessions
-                    .iter()
-                    .find(|session| {
-                        session.id == caller_id
-                            && session.status.active()
-                            && session.status != LifecycleStatus::Terminating
+                    .current_session_for(Some(caller_id))
+                    .or_else(|| {
+                        workspace.sessions.iter().find(|session| {
+                            session.id == caller_id
+                                && session.registration == RegistrationSource::Managed
+                                && session.status == LifecycleStatus::Disconnected
+                        })
                     })
                     .cloned()
                     .with_context(|| format!("inactive or unknown Orc session: {caller_id}"))
             })
             .transpose()?;
         let refreshes_caller = caller.as_ref().is_some_and(|caller| {
-            explicit_id.as_deref() == Some(caller.id.as_str())
-                || (caller.harness == contract.harness && caller.native_id == native_id)
+            explicit_id.as_deref() == Some(caller.id.as_str()) || caller.native_id == native_id
         });
         let base_id = registration_base_id(
             workspace,
@@ -156,15 +188,47 @@ fn register_for_caller(
             refreshes_caller.then_some(environment_id).flatten(),
             &inferred_id,
         );
-        let current = workspace
+        let explicit_match = explicit_id.as_deref().and_then(|id| {
+            workspace
+                .sessions
+                .iter()
+                .find(|session| session.status != LifecycleStatus::Archived && session.id == id)
+        });
+        let native_match = workspace
             .sessions
             .iter()
-            .find(|session| {
-                session.status != LifecycleStatus::Archived
-                    && (session.id == base_id
-                        || (session.harness == contract.harness && session.native_id == native_id))
+            .filter(|session| {
+                session.status != LifecycleStatus::Archived && session.native_id == native_id
+            })
+            .max_by_key(|session| session.updated_at);
+        if let (Some(explicit_match), Some(native_match)) = (explicit_match, native_match)
+            && explicit_match.id != native_match.id
+        {
+            bail!(
+                "session id {} and native session {} identify different Orc sessions",
+                explicit_match.id,
+                native_id
+            );
+        }
+        let current = explicit_match
+            .or(native_match)
+            .or_else(|| {
+                workspace.sessions.iter().find(|session| {
+                    session.status != LifecycleStatus::Archived && session.id == base_id
+                })
             })
             .cloned();
+        if let Some(existing) = current.as_ref()
+            && explicit_id.as_deref() == Some(existing.id.as_str())
+            && existing.native_id != native_id
+            && existing.registration != RegistrationSource::Managed
+            && !refreshes_caller
+        {
+            bail!(
+                "session id {} already belongs to another native session",
+                existing.id
+            );
+        }
         if let Some(caller) = caller.as_ref()
             && caller.role != SessionRole::Orchestrator
             && !refreshes_caller
@@ -207,14 +271,84 @@ fn register_for_caller(
             && link.run_id.is_none()
             && link.node_id.is_none()
             && active_orchestrator.is_none()
+            && !workspace.sessions.iter().any(|session| {
+                session.role == SessionRole::Orchestrator
+                    && session.status != LifecycleStatus::Archived
+                    && current
+                        .as_ref()
+                        .is_none_or(|current| session.id != current.id)
+            })
         {
             contract.role = SessionRole::Orchestrator;
         }
         let role = governed.map_or(contract.role, |session| session.role);
+        if role == SessionRole::Orchestrator
+            && let Some(existing) = workspace.sessions.iter().find(|session| {
+                session.role == SessionRole::Orchestrator
+                    && session.status != LifecycleStatus::Archived
+                    && current
+                        .as_ref()
+                        .is_none_or(|current| session.id != current.id)
+                    && session.native_id != native_id
+            })
+        {
+            bail!(
+                "workspace already has orchestrator {}; use `orc session adopt` to replace it",
+                existing.id
+            );
+        }
+        let requested_run_id = governed
+            .and_then(|session| session.run_id.clone())
+            .or_else(|| link.run_id.clone());
+        let run_orchestrator = requested_run_id.as_deref().and_then(|run_id| {
+            workspace
+                .runs
+                .iter()
+                .find(|run| run.id == run_id)
+                .and_then(|run| run.orchestrator_id.clone())
+        });
+        let explicit_parent = explicit_parent
+            .map(|parent_id| {
+                if workspace.sessions.iter().any(|session| {
+                    session.id == parent_id
+                        && session.status.active()
+                        && session.status != LifecycleStatus::Terminating
+                }) {
+                    return Ok(parent_id);
+                }
+                let archived_orchestrator = workspace.sessions.iter().any(|session| {
+                    session.id == parent_id
+                        && session.role == SessionRole::Orchestrator
+                        && session.status == LifecycleStatus::Archived
+                });
+                if archived_orchestrator {
+                    return run_orchestrator
+                        .clone()
+                        .or_else(|| active_orchestrator.clone())
+                        .context("the replaced orchestrator has no active successor");
+                }
+                bail!("inactive or unknown parent Orc session: {parent_id}")
+            })
+            .transpose()?;
+        if let (Some(parent_id), Some(orchestrator_id)) =
+            (explicit_parent.as_deref(), run_orchestrator.as_deref())
+            && parent_id != orchestrator_id
+            && !workspace.sessions.iter().any(|session| {
+                session.id == parent_id
+                    && session.run_id.as_deref() == requested_run_id.as_deref()
+                    && session.status.active()
+                    && session.status != LifecycleStatus::Terminating
+            })
+        {
+            bail!(
+                "parent session {parent_id} does not own workflow run {}",
+                requested_run_id.as_deref().unwrap_or_default()
+            );
+        }
         let parent_id = governed
             .and_then(|session| session.parent_id.clone())
             .or_else(|| {
-                explicit_parent.or_else(|| {
+                explicit_parent.or(run_orchestrator).or_else(|| {
                     (role != SessionRole::Orchestrator)
                         .then_some(active_orchestrator)
                         .flatten()
@@ -223,7 +357,22 @@ fn register_for_caller(
         let now = Utc::now();
         let session_native_id =
             governed.map_or_else(|| native_id.clone(), |session| session.native_id.clone());
-        let session = Session {
+        let mut initial_bindings = lifecycle_bindings.clone().unwrap_or_default();
+        for binding in &mut initial_bindings {
+            binding.r#ref = Some(id.clone());
+        }
+        let session_providers = current
+            .as_ref()
+            .map(|session| session.providers.clone())
+            .filter(|bindings| !bindings.is_empty())
+            .unwrap_or(initial_bindings);
+        let registration = governed.map_or(link.source, |session| session.registration);
+        if registration == RegistrationSource::Managed && session_providers.is_empty() {
+            bail!(
+                "managed session registration requires an unambiguous lifecycle owner; use Orc's managed launch path"
+            );
+        }
+        let mut session = Session {
             id,
             native_id: session_native_id.clone(),
             trace_id: governed
@@ -274,12 +423,9 @@ fn register_for_caller(
                     link.provider_ref
                         .or_else(|| env::var("ORC_PROVIDER_REF").ok())
                 }),
-            providers: current
-                .as_ref()
-                .map(|session| session.providers.clone())
-                .unwrap_or_default(),
+            providers: session_providers,
             directory: scope.display().to_string(),
-            registration: governed.map_or(link.source, |session| session.registration),
+            registration,
             status: governed.map_or(LifecycleStatus::Working, |session| session.status),
             runtime_timeout_seconds: governed.map_or(link.runtime_timeout_seconds, |session| {
                 session.runtime_timeout_seconds
@@ -301,6 +447,55 @@ fn register_for_caller(
                 .unwrap_or(now),
             updated_at: now,
         };
+        if session.status == LifecycleStatus::Disconnected {
+            session.status = LifecycleStatus::Working;
+            session.termination_reason = None;
+            session.termination_cause = None;
+            session.termination_attempt_at = None;
+            session.termination_operation_id = None;
+        }
+        let mut duplicate_ids = workspace
+            .sessions
+            .iter_mut()
+            .filter(|candidate| {
+                candidate.id != session.id
+                    && candidate.native_id == session.native_id
+                    && candidate.status != LifecycleStatus::Archived
+                    && candidate.status != LifecycleStatus::Terminating
+            })
+            .map(|candidate| {
+                candidate.status = LifecycleStatus::Archived;
+                candidate.updated_at = now;
+                candidate.id.clone()
+            })
+            .collect::<Vec<_>>();
+        if session.role == SessionRole::Orchestrator {
+            duplicate_ids.extend(
+                workspace
+                    .sessions
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.role == SessionRole::Orchestrator
+                            && candidate.status == LifecycleStatus::Archived
+                            && candidate.id != session.id
+                    })
+                    .map(|candidate| candidate.id.clone()),
+            );
+            duplicate_ids.sort();
+            duplicate_ids.dedup();
+        }
+        reparent_active_descendants(workspace, &duplicate_ids, &session.id);
+        for run in &mut workspace.runs {
+            if run.status.active()
+                && run
+                    .orchestrator_id
+                    .as_ref()
+                    .is_some_and(|id| duplicate_ids.contains(id))
+            {
+                run.orchestrator_id = Some(session.id.clone());
+                run.updated_at = now;
+            }
+        }
         workspace
             .sessions
             .retain(|candidate| candidate.id != session.id);
@@ -335,15 +530,35 @@ pub fn adopt(scope: &Path, mut contract: Contract, native_id: Option<String>) ->
     let scope = state::resolve_scope(scope)?;
     let now = Utc::now();
     state::update(&scope, |workspace| {
-        let replaced_orchestrators = workspace
+        let native_id = native_id.clone().unwrap_or_else(inferred_native_id);
+        if let Some(terminating) = workspace.sessions.iter().find(|session| {
+            session.role == SessionRole::Orchestrator
+                && session.status == LifecycleStatus::Terminating
+        }) {
+            bail!(
+                "orchestrator transition is already in progress: {}",
+                terminating.id
+            );
+        }
+        if let Some(owner) = workspace.sessions.iter().find(|session| {
+            session.native_id == native_id
+                && session.role != SessionRole::Orchestrator
+                && session.status != LifecycleStatus::Archived
+        }) {
+            bail!(
+                "native session {} already belongs to {}; choose another session or archive it first",
+                native_id,
+                owner.id
+            );
+        }
+        let mut replaced_orchestrators = workspace
             .sessions
             .iter()
-            .filter(|session| {
-                session.role == SessionRole::Orchestrator
-                    && session.status != LifecycleStatus::Archived
-            })
+            .filter(|session| session.role == SessionRole::Orchestrator)
             .map(|session| session.id.clone())
             .collect::<Vec<_>>();
+        replaced_orchestrators.sort();
+        replaced_orchestrators.dedup();
         for session in &mut workspace.sessions {
             if session.role == SessionRole::Orchestrator
                 && session.status != LifecycleStatus::Terminating
@@ -353,7 +568,6 @@ pub fn adopt(scope: &Path, mut contract: Contract, native_id: Option<String>) ->
                 session.updated_at = now;
             }
         }
-        let native_id = native_id.clone().unwrap_or_else(inferred_native_id);
         let session = Session {
             id: format!(
                 "{}-{}",
@@ -403,6 +617,7 @@ pub fn adopt(scope: &Path, mut contract: Contract, native_id: Option<String>) ->
             }
         }
         workspace.sessions.insert(0, session.clone());
+        workspace.active = true;
         Ok(session)
     })
 }
@@ -413,7 +628,9 @@ fn reparent_active_descendants(
     new_orchestrator: &str,
 ) {
     for session in &mut workspace.sessions {
-        if session.status.active()
+        if (session.status.active()
+            || (session.registration == RegistrationSource::Managed
+                && session.status == LifecycleStatus::Disconnected))
             && session.status != LifecycleStatus::Terminating
             && session
                 .parent_id
@@ -427,6 +644,12 @@ fn reparent_active_descendants(
 }
 
 pub fn update_session(scope: &Path, id: &str, status: LifecycleStatus) -> Result<Session> {
+    if matches!(
+        status,
+        LifecycleStatus::Cancelled | LifecycleStatus::Terminating
+    ) {
+        bail!("session cancellation must use the provider termination operation");
+    }
     let scope = state::resolve_scope(scope)?;
     state::update(&scope, |workspace| {
         let session = workspace
@@ -444,6 +667,7 @@ pub fn update_session(scope: &Path, id: &str, status: LifecycleStatus) -> Result
         if session.status == LifecycleStatus::Cancelled && session.termination_reason.is_some() {
             bail!("session was terminated and must be registered as a new session: {id}");
         }
+        require_transition(LifecycleSubject::Session, session.status, status)?;
         session.status = status;
         let now = Utc::now();
         if status.active() {
@@ -486,7 +710,8 @@ pub fn keepalive(scope: &Path, id: &str) -> Result<Session> {
 }
 
 pub fn terminate(config: &Config, scope: &Path, id: &str, reason: &str) -> Result<Session> {
-    terminate_with_heartbeat(config, scope, id, reason, None, None)
+    let scope = state::resolve_scope(scope)?;
+    terminate_resolved(config, &scope, id, reason, None, None)
 }
 
 pub fn terminate_expired(
@@ -497,7 +722,32 @@ pub fn terminate_expired(
     observed_heartbeat: Option<Option<chrono::DateTime<Utc>>>,
     observed_claim: Option<&str>,
 ) -> Result<Session> {
-    terminate_with_heartbeat(
+    let scope = state::resolve_scope(scope)?;
+    terminate_resolved(
+        config,
+        &scope,
+        id,
+        reason,
+        observed_heartbeat,
+        observed_claim,
+    )
+}
+
+pub(crate) fn terminate_expired_persisted_scope(
+    config: &Config,
+    scope: &Path,
+    id: &str,
+    reason: &str,
+    observed_heartbeat: Option<Option<chrono::DateTime<Utc>>>,
+    observed_claim: Option<&str>,
+) -> Result<Session> {
+    if !scope.is_absolute() {
+        bail!(
+            "persisted workspace scope must be absolute: {}",
+            scope.display()
+        );
+    }
+    terminate_resolved(
         config,
         scope,
         id,
@@ -507,7 +757,7 @@ pub fn terminate_expired(
     )
 }
 
-fn terminate_with_heartbeat(
+fn terminate_resolved(
     config: &Config,
     scope: &Path,
     id: &str,
@@ -515,16 +765,15 @@ fn terminate_with_heartbeat(
     expected_heartbeat: Option<Option<chrono::DateTime<Utc>>>,
     expected_claim: Option<&str>,
 ) -> Result<Session> {
-    let scope = state::resolve_scope(scope)?;
-    let snapshot = state::read(&scope)?;
+    let snapshot = state::read(scope)?;
     let session = selected_session(&snapshot, id)?.clone();
     if !terminable(&session) {
         return Ok(session);
     }
     let providers = provider::discover(config)?;
-    let bindings = provider::discover_bindings(config, &providers, &scope, &session, false);
+    let bindings = provider::discover_bindings(config, &providers, scope, &session, false);
     if !bindings.is_empty() {
-        state::update(&scope, |workspace| {
+        state::update(scope, |workspace| {
             let selected = workspace
                 .sessions
                 .iter_mut()
@@ -545,17 +794,16 @@ fn terminate_with_heartbeat(
             Ok(())
         })?;
     }
-    let session = selected_session(&state::read(&scope)?, id)?.clone();
+    let session = selected_session(&state::read(scope)?, id)?.clone();
     let operation_id =
         termination_operation_id(expected_claim, session.termination_operation_id.as_deref());
     let termination_cause =
         persisted_termination_cause(session.termination_cause.as_deref(), reason);
     let claim = format!("termination pending {operation_id}");
-    let Some(_termination_guard) =
-        TerminationGuard::acquire(&scope, id, config.provider_timeout())?
+    let Some(_termination_guard) = TerminationGuard::acquire(scope, id, config.provider_timeout())?
     else {
         let message = "another managed-session termination owns this lock shard";
-        state::update(&scope, |workspace| {
+        state::update(scope, |workspace| {
             let selected = workspace
                 .sessions
                 .iter_mut()
@@ -576,7 +824,7 @@ fn terminate_with_heartbeat(
         })?;
         bail!(message);
     };
-    let claimed_status = state::update(&scope, |workspace| {
+    let claimed_status = state::update(scope, |workspace| {
         let selected = workspace
             .sessions
             .iter_mut()
@@ -608,37 +856,55 @@ fn terminate_with_heartbeat(
         Ok(Some(claimed_status))
     })?;
     let Some(claimed_status) = claimed_status else {
-        return selected_session(&state::read(&scope)?, id).cloned();
+        return selected_session(&state::read(scope)?, id).cloned();
     };
     let result = (|| {
-        let mut request =
-            provider::action_request(provider::Action::Stop, &scope, Some(&session), "right");
-        request["operationId"] = serde_json::Value::String(operation_id.clone());
-        let plan = provider::resolve_plan(config, &providers, provider::Action::Stop, request)
-            .or_else(|stop_error| {
-                let mut request = provider::action_request(
-                    provider::Action::Cancel,
-                    &scope,
-                    Some(&session),
-                    "right",
-                );
+        let actions = [
+            (
+                provider::Action::Stop,
+                provider::Capability::SessionStop,
+                "session stop",
+            ),
+            (
+                provider::Action::Cancel,
+                provider::Capability::ExecutionCancel,
+                "execution cancel",
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, capability, _)| lifecycle_action_owned(&providers, &session, *capability))
+        .collect::<Vec<_>>();
+        if actions.is_empty() {
+            bail!("no provider can stop or cancel this active agent");
+        }
+        let mut failures = Vec::new();
+        for (action, _, label) in actions {
+            let outcome = (|| {
+                let mut request = provider::action_request(action, scope, Some(&session), "right");
                 request["operationId"] = serde_json::Value::String(operation_id.clone());
-                provider::resolve_plan(config, &providers, provider::Action::Cancel, request)
-                    .with_context(|| format!("session stop unavailable: {stop_error:#}"))
-            })
-            .context("no provider can stop or cancel this active agent")?;
-        let result = provider::run_plan_with_timeout(&plan, &scope, config.provider_timeout())?;
-        if !plan.accepts(result.code) {
-            bail!(
-                "stop provider exited with {}: {}",
-                result.code,
-                result.stderr.trim()
-            );
+                let plan = provider::resolve_plan(config, &providers, action, request)?;
+                let result =
+                    provider::run_plan_with_timeout(&plan, scope, config.provider_timeout())?;
+                if !plan.accepts(result.code) {
+                    bail!(
+                        "provider exited with {}: {}",
+                        result.code,
+                        result.stderr.trim()
+                    );
+                }
+                Ok(())
+            })();
+            if let Err(error) = outcome {
+                failures.push(format!("{label}: {error:#}"));
+            }
+        }
+        if !failures.is_empty() {
+            bail!("session termination failed: {}", failures.join("; "));
         }
         Ok(())
     })();
     if let Err(error) = result {
-        state::update(&scope, |workspace| {
+        state::update(scope, |workspace| {
             let selected = workspace
                 .sessions
                 .iter_mut()
@@ -653,7 +919,7 @@ fn terminate_with_heartbeat(
         })?;
         return Err(error);
     }
-    state::update(&scope, |workspace| {
+    state::update(scope, |workspace| {
         let session = workspace
             .sessions
             .iter_mut()
@@ -665,6 +931,24 @@ fn terminate_with_heartbeat(
             session.updated_at = Utc::now();
         }
         Ok(session.clone())
+    })
+}
+
+fn lifecycle_action_owned(
+    providers: &[provider::Manifest],
+    session: &Session,
+    capability: provider::Capability,
+) -> bool {
+    session.providers.iter().any(|binding| {
+        binding.status == BindingStatus::Active
+            && binding
+                .r#ref
+                .as_deref()
+                .is_some_and(|reference| !reference.is_empty())
+            && providers
+                .iter()
+                .find(|candidate| candidate.name == binding.provider)
+                .is_some_and(|provider| provider.supports(capability))
     })
 }
 
@@ -967,7 +1251,28 @@ fn apply_enrichment(
     goal: Option<&str>,
 ) {
     let liveness = reconciled_liveness(&session.providers, bindings);
-    session.providers = bindings.to_vec();
+    let mut reconciled_bindings = bindings.to_vec();
+    for previous in session
+        .providers
+        .iter()
+        .filter(|binding| provider::is_launch_ownership(binding))
+    {
+        let conclusive = bindings.iter().any(|binding| {
+            binding.provider == previous.provider
+                && binding.kind == previous.kind
+                && matches!(
+                    binding.status,
+                    BindingStatus::Active | BindingStatus::Unavailable
+                )
+        });
+        if !conclusive {
+            reconciled_bindings.retain(|binding| {
+                binding.provider != previous.provider || binding.kind != previous.kind
+            });
+            reconciled_bindings.push(previous.clone());
+        }
+    }
+    session.providers = reconciled_bindings;
     if let Some(is_live) = liveness
         && session.status != LifecycleStatus::Terminating
     {
@@ -994,40 +1299,34 @@ fn reconciled_liveness(
     previous: &[crate::domain::ProviderBinding],
     current: &[crate::domain::ProviderBinding],
 ) -> Option<bool> {
-    for kind in [
-        crate::domain::ProviderKind::Persistence,
-        crate::domain::ProviderKind::Display,
-    ] {
-        let previously_live = previous
-            .iter()
-            .filter(|binding| binding.kind == kind && is_live_binding(binding))
-            .collect::<Vec<_>>();
-        if !previously_live.is_empty() {
-            let matching = current
-                .iter()
-                .filter(|binding| {
-                    binding.kind == kind
-                        && previously_live
-                            .iter()
-                            .any(|previous| previous.provider == binding.provider)
-                })
-                .collect::<Vec<_>>();
-            return (!matching.is_empty()).then(|| matching.into_iter().any(is_live_binding));
-        }
-        if current
-            .iter()
-            .any(|binding| binding.kind == kind && is_live_binding(binding))
-        {
-            return Some(true);
-        }
+    if current.iter().any(is_live_binding) {
+        return Some(true);
     }
-    None
+    let previously_live = previous
+        .iter()
+        .filter(|binding| is_live_binding(binding))
+        .collect::<Vec<_>>();
+    if previously_live.is_empty() {
+        return None;
+    }
+    previously_live
+        .iter()
+        .all(|previous| {
+            current.iter().any(|binding| {
+                binding.provider == previous.provider
+                    && binding.kind == previous.kind
+                    && binding.status == BindingStatus::Unavailable
+            })
+        })
+        .then_some(false)
 }
 
 fn is_live_binding(binding: &crate::domain::ProviderBinding) -> bool {
     matches!(
         binding.kind,
-        crate::domain::ProviderKind::Persistence | crate::domain::ProviderKind::Display
+        crate::domain::ProviderKind::Persistence
+            | crate::domain::ProviderKind::Display
+            | crate::domain::ProviderKind::Execution
     ) && binding.status == crate::domain::BindingStatus::Active
         && binding
             .r#ref
@@ -1136,6 +1435,9 @@ pub fn set_run_agent(
 }
 
 pub fn update_run(scope: &Path, run_id: &str, status: LifecycleStatus) -> Result<WorkflowRun> {
+    if status == LifecycleStatus::Terminating || !status.active() {
+        bail!("terminal run state must be set by a workflow lifecycle operation");
+    }
     let scope = state::resolve_scope(scope)?;
     state::update(&scope, |workspace| {
         let run = workspace
@@ -1146,6 +1448,7 @@ pub fn update_run(scope: &Path, run_id: &str, status: LifecycleStatus) -> Result
         if run.status == LifecycleStatus::Terminating && status != LifecycleStatus::Terminating {
             return Ok(run.clone());
         }
+        require_transition(LifecycleSubject::Run, run.status, status)?;
         run.status = status;
         run.updated_at = Utc::now();
         Ok(run.clone())
@@ -1170,8 +1473,14 @@ pub fn upsert_node(scope: &Path, run_id: &str, spec: NodeSpec) -> Result<Workflo
             .iter_mut()
             .find(|run| run.id == run_id)
             .with_context(|| format!("unknown run: {run_id}"))?;
-        if run.status == LifecycleStatus::Terminating {
-            bail!("run is terminating");
+        if run.status == LifecycleStatus::Terminating || !run.status.active() {
+            bail!("run is not mutable while {}", run.status);
+        }
+        if !status.valid_for(LifecycleSubject::Node) {
+            bail!("invalid node lifecycle state: {status}");
+        }
+        if let Some(current) = run.nodes.iter().find(|candidate| candidate.id == id) {
+            require_transition(LifecycleSubject::Node, current.status, status)?;
         }
         let node = WorkflowNode {
             id: id.clone(),
@@ -1202,8 +1511,10 @@ pub fn upsert_node(scope: &Path, run_id: &str, spec: NodeSpec) -> Result<Workflo
         };
         run.nodes.retain(|candidate| candidate.id != id);
         run.nodes.push(node.clone());
-        run.edges
-            .retain(|edge| edge.to != id || edge.relationship != "depends_on");
+        run.edges.retain(|edge| {
+            (edge.to != id || edge.relationship != "depends_on")
+                && (edge.from != id || edge.relationship != "reviewed_by")
+        });
         run.edges
             .extend(depends_on.iter().map(|dependency| WorkflowEdge {
                 from: dependency.clone(),
@@ -1235,6 +1546,9 @@ pub fn update_node(
             .iter_mut()
             .find(|run| run.id == run_id)
             .with_context(|| format!("unknown run: {run_id}"))?;
+        if !run.status.active() {
+            bail!("run is not mutable while {}", run.status);
+        }
         let node = run
             .nodes
             .iter_mut()
@@ -1244,6 +1558,7 @@ pub fn update_node(
         {
             return Ok(node.clone());
         }
+        require_transition(LifecycleSubject::Node, node.status, status)?;
         node.status = status;
         node.updated_at = Utc::now();
         run.updated_at = Utc::now();
@@ -1283,6 +1598,9 @@ pub fn report_node(
             .iter_mut()
             .find(|run| run.id == run_id)
             .with_context(|| format!("unknown run: {run_id}"))?;
+        if !run.status.active() {
+            bail!("run is not mutable while {}", run.status);
+        }
         let node = run
             .nodes
             .iter_mut()
@@ -1312,6 +1630,7 @@ pub fn report_node(
                 report.status
             );
         }
+        require_transition(LifecycleSubject::Node, node.status, report.status)?;
         node.status = report.status;
         if report.output.is_some() {
             node.output.clone_from(&report.output);
@@ -1503,38 +1822,40 @@ pub fn launch(
         .current_session()
         .map(|session| session.id.clone());
     let native_id = Uuid::new_v4().to_string();
-    let session = register(
-        &scope,
-        Contract {
-            harness: harness.clone(),
-            model: model.clone(),
-            role: if parent.is_some() {
-                SessionRole::Worker
-            } else {
-                SessionRole::Orchestrator
-            },
-            title: harness.clone(),
-            purpose: parent.as_ref().map_or_else(
-                || format!("{harness} orchestrator"),
-                |_| format!("Child {harness} session"),
-            ),
-            goal: format!("Run {harness}"),
-            ..Contract::default()
+    let contract = Contract {
+        harness: harness.clone(),
+        model: model.clone(),
+        role: if parent.is_some() {
+            SessionRole::Worker
+        } else {
+            SessionRole::Orchestrator
         },
-        SessionLink {
-            native_id: Some(native_id.clone()),
-            parent_id: parent,
-            provider_ref: managed.clone(),
-            runtime_timeout_seconds: lease.runtime_timeout_seconds,
-            idle_timeout_seconds: lease.idle_timeout_seconds,
-            source: if managed.is_some() {
-                RegistrationSource::Managed
-            } else {
-                RegistrationSource::Connected
-            },
-            ..SessionLink::default()
+        title: harness.clone(),
+        purpose: parent.as_ref().map_or_else(
+            || format!("{harness} orchestrator"),
+            |_| format!("Child {harness} session"),
+        ),
+        goal: format!("Run {harness}"),
+        ..Contract::default()
+    };
+    let link = SessionLink {
+        native_id: Some(native_id.clone()),
+        parent_id: parent,
+        provider_ref: managed.clone(),
+        runtime_timeout_seconds: lease.runtime_timeout_seconds,
+        idle_timeout_seconds: lease.idle_timeout_seconds,
+        source: if managed.is_some() {
+            RegistrationSource::Managed
+        } else {
+            RegistrationSource::Connected
         },
-    )?;
+        ..SessionLink::default()
+    };
+    let session = if managed.is_some() {
+        register_managed(config, &scope, contract, link)?
+    } else {
+        register(&scope, contract, link)?
+    };
     let supervised = managed.is_some();
     let mut command = vec![harness];
     command.extend(args);
@@ -1640,6 +1961,9 @@ fn finalize_managed_launch(config: &Config, scope: &Path, session_id: &str) -> R
             apply_enrichment(selected, &bindings, None, None);
             if !still_active {
                 selected.status = LifecycleStatus::Done;
+                selected
+                    .providers
+                    .retain(|binding| !provider::is_launch_ownership(binding));
                 selected.updated_at = Utc::now();
             }
         }
@@ -1699,11 +2023,27 @@ pub fn require_id(id: Option<String>) -> Result<String> {
 }
 
 pub fn ensure_active_context(scope: &Path) -> Result<(WorkspaceState, Session)> {
+    let session_id = env::var("ORC_SESSION_ID").ok();
     let state = read_workspace(scope)?;
     let session = state
-        .current_session()
+        .current_session_for(session_id.as_deref())
         .cloned()
         .context("Orc requires a registered session in an active scope")?;
+    if !state.active {
+        bail!("Orc scope is idle");
+    }
+    Ok((state, session))
+}
+
+pub fn ensure_active_context_for(
+    scope: &Path,
+    session_id: &str,
+) -> Result<(WorkspaceState, Session)> {
+    let state = read_workspace(scope)?;
+    let session = state
+        .current_session_for(Some(session_id))
+        .cloned()
+        .with_context(|| format!("inactive or unknown Orc session: {session_id}"))?;
     if !state.active {
         bail!("Orc scope is idle");
     }
@@ -1790,6 +2130,43 @@ JSON
 esac
 "#;
 
+    const MISSING_SCOPE_STOP_PROVIDER: &str = r#"#!/bin/sh
+request=$(cat)
+pwd > '{{ invoked }}'
+case "$request" in
+  *session.stop*)
+    cat <<'JSON'
+{"version":"orc.provider/v1","command":["sh","-c","pwd > '{{ executed }}'"],"cwd":"{{ missing }}"}
+JSON
+    ;;
+  *) printf '%s\n' 'null' ;;
+esac
+"#;
+
+    const COMPOSED_TERMINATION_PROVIDER: &str = r#"#!/bin/sh
+request=$(cat)
+case "$request" in
+  *session.stop*) capability=session.stop ;;
+  *execution.cancel*) capability=execution.cancel ;;
+  *) exit 2 ;;
+esac
+cat <<JSON
+{"version":"orc.provider/v1","command":[{{ executable_json }},"$capability"],"successCodes":[0]}
+JSON
+"#;
+
+    const TERMINATION_RECORDER: &str = r#"#!/bin/sh
+printf '%s\n' "$1" >> '{{ log }}'
+"#;
+
+    const TERMINATION_PROVIDER_MANIFEST: &str = r#"version: orc.provider/v1
+name: {{ name }}
+kind: {{ kind }}
+command: {{ command }}
+actions:
+  {{ capability }}: Terminate owned work
+"#;
+
     const PROVIDER_MANIFEST: &str = r#"version: orc.provider/v1
 name: {{ name }}
 command: {{ command }}
@@ -1841,6 +2218,90 @@ actions:
             status,
             label: provider.into(),
         }
+    }
+
+    fn register(scope: &Path, mut contract: Contract, link: SessionLink) -> Result<Session> {
+        if link.source == RegistrationSource::Managed {
+            return register_for_caller(
+                scope,
+                &mut contract,
+                link,
+                None,
+                Some(vec![binding(
+                    "test-owner",
+                    ProviderKind::Persistence,
+                    BindingStatus::Active,
+                )]),
+            );
+        }
+        super::register(scope, contract, link)
+    }
+
+    #[test]
+    fn unmanaged_registration_cannot_create_a_managed_session() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+
+        let error = super::register(
+            &scope,
+            Contract::default(),
+            SessionLink {
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect_err("reject managed registration without lifecycle ownership");
+
+        assert!(error.to_string().contains("lifecycle owner"));
+    }
+
+    #[test]
+    fn managed_registration_persists_its_lifecycle_owner() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let scope_directory = directory.path().join("scope");
+        let provider_directory = directory.path().join("providers");
+        fs::create_dir_all(&scope_directory).expect("scope");
+        fs::create_dir_all(&provider_directory).expect("providers");
+        let scope = fs::canonicalize(scope_directory).expect("canonical scope");
+        fs::write(
+            provider_directory.join("owner.yaml"),
+            r#"version: orc.provider/v1
+name: owner
+description: Test lifecycle owner
+kind: harness
+command: "true"
+actions:
+  session.launch: Launch a session
+  session.stop: Stop a session
+"#,
+        )
+        .expect("provider");
+        let config = Config {
+            providers: crate::config::ProviderConfig {
+                directory: provider_directory,
+                ..crate::config::ProviderConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let session = register_managed(
+            &config,
+            &scope,
+            Contract::default(),
+            SessionLink {
+                native_id: Some("managed-native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("managed session");
+
+        assert_eq!(session.registration, RegistrationSource::Managed);
+        assert_eq!(session.providers.len(), 1);
+        assert_eq!(session.providers[0].provider, "owner");
+        assert_eq!(
+            session.providers[0].r#ref.as_deref(),
+            Some(session.id.as_str())
+        );
     }
 
     #[test]
@@ -2066,6 +2527,7 @@ actions:
         .expect("provider manifest");
         let mut config = Config::default();
         config.providers.directory = provider_directory;
+        let deadline = std::time::Instant::now() + config.provider_timeout();
         let worker_config = config.clone();
         let worker_scope = scope.clone();
         let worker = std::thread::spawn(move || {
@@ -2079,7 +2541,6 @@ actions:
                 Vec::new(),
             )
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while !resolving.exists() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -2181,6 +2642,7 @@ actions:
         .expect("provider manifest");
         let mut config = Config::default();
         config.providers.directory = provider_directory;
+        let deadline = std::time::Instant::now() + config.provider_timeout();
         let worker_config = config.clone();
         let worker_scope = scope.clone();
         let launch_worker = std::thread::spawn(move || {
@@ -2194,7 +2656,6 @@ actions:
                 Vec::new(),
             )
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while !spawned.exists() {
             if launch_worker.is_finished() {
                 let result = launch_worker.join().expect("launch thread");
@@ -2344,6 +2805,7 @@ actions:
                 ..SessionLink::default()
             },
             Some(&worker.id),
+            None,
         )
         .expect_err("managed child registration must fail");
 
@@ -2395,6 +2857,11 @@ actions:
                 ..SessionLink::default()
             },
             Some(&orchestrator.id),
+            Some(vec![binding(
+                "test-owner",
+                ProviderKind::Persistence,
+                BindingStatus::Active,
+            )]),
         )
         .expect("managed child");
 
@@ -2411,6 +2878,19 @@ actions:
     fn connected_worker_cannot_promote_its_own_registration() {
         let directory = tempfile::tempdir().expect("scope");
         let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let root = register(
+            &scope,
+            Contract {
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some("root".into()),
+                native_id: Some("root-native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("root");
         let worker = register(
             &scope,
             Contract {
@@ -2421,7 +2901,7 @@ actions:
             SessionLink {
                 id: Some("worker".into()),
                 native_id: Some("worker-native".into()),
-                parent_id: Some("root".into()),
+                parent_id: Some(root.id),
                 source: RegistrationSource::Connected,
                 ..SessionLink::default()
             },
@@ -2443,12 +2923,447 @@ actions:
                 ..SessionLink::default()
             },
             Some(&worker.id),
+            None,
         )
         .expect("refresh worker");
 
         assert_eq!(refreshed.role, SessionRole::Worker);
         assert_eq!(refreshed.harness, "worker-harness");
         assert_eq!(refreshed.native_id, "worker-native");
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn registering_one_native_session_under_another_harness_reuses_the_root() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let first = register(
+            &scope,
+            Contract {
+                harness: "codex".into(),
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("native-session".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("first registration");
+
+        let second = register(
+            &scope,
+            Contract {
+                harness: "claude".into(),
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("native-session".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("same native registration");
+
+        let workspace = read_workspace(&scope).expect("workspace");
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.harness, "claude");
+        assert_eq!(
+            workspace
+                .active_sessions()
+                .filter(|session| session.role == SessionRole::Orchestrator)
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn explicit_id_cannot_replace_another_native_session() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let root = register(
+            &scope,
+            Contract {
+                harness: "root-harness".into(),
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some("root".into()),
+                native_id: Some("root-native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("root registration");
+
+        let error = register(
+            &scope,
+            Contract {
+                harness: "worker-harness".into(),
+                role: SessionRole::Worker,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some(root.id.clone()),
+                native_id: Some("different-native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect_err("explicit id collision");
+
+        assert!(error.to_string().contains("another native session"));
+        let current = read_workspace(&scope).expect("workspace");
+        assert_eq!(current.sessions.len(), 1);
+        assert_eq!(current.sessions[0].native_id, "root-native");
+        assert_eq!(current.sessions[0].role, SessionRole::Orchestrator);
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn cancelled_status_requires_provider_termination() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let session = register(
+            &scope,
+            Contract {
+                harness: "codex".into(),
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("native-session".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("registration");
+
+        let error = update_session(&scope, &session.id, LifecycleStatus::Cancelled)
+            .expect_err("cancellation must invoke a provider");
+
+        assert!(error.to_string().contains("provider termination"));
+        assert_eq!(
+            selected_session(&read_workspace(&scope).expect("workspace"), &session.id)
+                .expect("session")
+                .status,
+            LifecycleStatus::Working
+        );
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn disconnected_managed_session_can_refresh_its_registration() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let root = register(
+            &scope,
+            Contract {
+                harness: "codex".into(),
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("root-native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("root registration");
+        let child = register(
+            &scope,
+            Contract {
+                harness: "pi".into(),
+                role: SessionRole::Worker,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("child-native".into()),
+                parent_id: Some(root.id),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect("child registration");
+        update_session(&scope, &child.id, LifecycleStatus::Disconnected)
+            .expect("disconnect managed session");
+        let mut contract = Contract {
+            harness: "pi".into(),
+            role: SessionRole::Worker,
+            ..Contract::default()
+        };
+
+        let refreshed = register_for_caller(
+            &scope,
+            &mut contract,
+            SessionLink {
+                native_id: Some("child-native".into()),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+            Some(&child.id),
+            None,
+        )
+        .expect("refresh disconnected child");
+
+        assert_eq!(refreshed.id, child.id);
+        assert_eq!(refreshed.status, LifecycleStatus::Working);
+        assert!(refreshed.termination_reason.is_none());
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn registering_a_second_orchestrator_requires_adoption() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let first = register(
+            &scope,
+            Contract {
+                harness: "codex".into(),
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("native-a".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("first orchestrator");
+
+        let error = register(
+            &scope,
+            Contract {
+                harness: "claude".into(),
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("native-b".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect_err("replacement requires adoption");
+
+        assert!(error.to_string().contains("orc session adopt"));
+        let workspace = read_workspace(&scope).expect("workspace");
+        assert_eq!(
+            workspace
+                .active_sessions()
+                .filter(|session| session.role == SessionRole::Orchestrator)
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![first.id.as_str()]
+        );
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn disconnected_orchestrator_still_requires_an_adoption_transition() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let first = register(
+            &scope,
+            Contract {
+                harness: "codex".into(),
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("native-a".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("first orchestrator");
+        update_session(&scope, &first.id, LifecycleStatus::Disconnected)
+            .expect("disconnect orchestrator");
+
+        let error = register(
+            &scope,
+            Contract {
+                harness: "claude".into(),
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("native-b".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect_err("disconnected root still owns the workspace");
+
+        assert!(error.to_string().contains("orc session adopt"));
+        let workspace = read_workspace(&scope).expect("workspace");
+        assert_eq!(
+            workspace
+                .sessions
+                .iter()
+                .filter(|session| {
+                    session.role == SessionRole::Orchestrator
+                        && session.status != LifecycleStatus::Archived
+                })
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn adopted_session_refreshes_through_its_archived_environment_id() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let old = register(
+            &scope,
+            Contract {
+                harness: "codex".into(),
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("native-session".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("old incarnation");
+        let adopted = adopt(
+            &scope,
+            Contract {
+                harness: "codex".into(),
+                ..Contract::default()
+            },
+            Some("native-session".into()),
+        )
+        .expect("adopt session");
+        state::update(&scope, |workspace| {
+            let mut resumable = session(
+                "resumable-descendant",
+                SessionRole::Researcher,
+                LifecycleStatus::Disconnected,
+            );
+            resumable.registration = RegistrationSource::Managed;
+            resumable.parent_id = Some(old.id.clone());
+            let mut terminal = session(
+                "terminal-descendant",
+                SessionRole::Verifier,
+                LifecycleStatus::Failed,
+            );
+            terminal.registration = RegistrationSource::Managed;
+            terminal.parent_id = Some(old.id.clone());
+            workspace.sessions.extend([resumable, terminal]);
+            Ok(())
+        })
+        .expect("add descendants of the archived root");
+        let mut refreshed_contract = Contract {
+            harness: "codex".into(),
+            role: SessionRole::Orchestrator,
+            title: "refreshed".into(),
+            ..Contract::default()
+        };
+
+        let refreshed = register_for_caller(
+            &scope,
+            &mut refreshed_contract,
+            SessionLink {
+                native_id: Some("native-session".into()),
+                ..SessionLink::default()
+            },
+            Some(&old.id),
+            None,
+        )
+        .expect("refresh adopted incarnation");
+
+        assert_eq!(refreshed.id, adopted.id);
+        assert_eq!(refreshed.native_id, "native-session");
+        let workspace = read_workspace(&scope).expect("workspace");
+        assert_eq!(
+            workspace
+                .active_sessions()
+                .filter(|session| session.role == SessionRole::Orchestrator)
+                .count(),
+            1
+        );
+        assert_eq!(
+            workspace
+                .sessions
+                .iter()
+                .find(|session| session.id == "resumable-descendant")
+                .expect("resumable descendant")
+                .parent_id
+                .as_deref(),
+            Some(adopted.id.as_str())
+        );
+        assert_eq!(
+            workspace
+                .sessions
+                .iter()
+                .find(|session| session.id == "terminal-descendant")
+                .expect("terminal descendant")
+                .parent_id
+                .as_deref(),
+            Some(old.id.as_str())
+        );
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn adoption_cannot_reuse_an_active_child_native_id() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let root = register(
+            &scope,
+            Contract {
+                harness: "codex".into(),
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("root-native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("root registration");
+        let child = register(
+            &scope,
+            Contract {
+                harness: "pi".into(),
+                role: SessionRole::Worker,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("child-native".into()),
+                parent_id: Some(root.id.clone()),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect("child registration");
+
+        let error = adopt(
+            &scope,
+            Contract {
+                harness: "claude".into(),
+                ..Contract::default()
+            },
+            Some(child.native_id.clone()),
+        )
+        .expect_err("child identity cannot become the orchestrator");
+
+        assert!(error.to_string().contains("already belongs"));
+        let workspace = read_workspace(&scope).expect("workspace");
+        assert_eq!(
+            workspace
+                .active_sessions()
+                .find(|session| session.role == SessionRole::Orchestrator)
+                .expect("orchestrator")
+                .id,
+            root.id
+        );
+        assert_eq!(
+            workspace
+                .active_sessions()
+                .find(|session| session.id == child.id)
+                .expect("child")
+                .parent_id
+                .as_deref(),
+            Some(root.id.as_str())
+        );
         let _ = std::fs::remove_file(state::path(&scope));
     }
 
@@ -2584,6 +3499,180 @@ actions:
         let _ = std::fs::remove_file(state::path(&scope));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn termination_runs_persistence_stop_and_execution_cancel() {
+        let directory = tempfile::tempdir().expect("termination fixture");
+        let scope_directory = directory.path().join("scope");
+        let provider_directory = directory.path().join("providers");
+        fs::create_dir_all(&scope_directory).expect("scope");
+        fs::create_dir_all(&provider_directory).expect("providers");
+        let scope = fs::canonicalize(scope_directory).expect("canonical scope");
+        let log = directory.path().join("terminations");
+        let recorder = directory.path().join("record-termination.sh");
+        fs::write(
+            &recorder,
+            render_fixture(
+                TERMINATION_RECORDER,
+                serde_json::json!({ "log": log.display().to_string() }),
+            ),
+        )
+        .expect("termination recorder");
+        fs::set_permissions(&recorder, fs::Permissions::from_mode(0o755))
+            .expect("recorder executable");
+        let provider = directory.path().join("termination-provider.sh");
+        fs::write(
+            &provider,
+            render_fixture(
+                COMPOSED_TERMINATION_PROVIDER,
+                serde_json::json!({
+                    "executable_json": serde_json::to_string(&recorder.display().to_string())
+                        .expect("serialize recorder path"),
+                }),
+            ),
+        )
+        .expect("termination provider");
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o755))
+            .expect("provider executable");
+        for (name, kind, capability) in [
+            ("persistence", "persistence", "session.stop"),
+            ("executor", "execution", "execution.cancel"),
+        ] {
+            fs::write(
+                provider_directory.join(format!("{name}.yaml")),
+                render_fixture(
+                    TERMINATION_PROVIDER_MANIFEST,
+                    serde_json::json!({
+                        "name": name,
+                        "kind": kind,
+                        "command": provider.display().to_string(),
+                        "capability": capability,
+                    }),
+                ),
+            )
+            .expect("provider manifest");
+        }
+        let linked = register(
+            &scope,
+            Contract::default(),
+            SessionLink {
+                id: Some("managed".into()),
+                native_id: Some("managed-native".into()),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect("managed session");
+        state::update(&scope, |workspace| {
+            workspace.sessions[0].providers = vec![
+                binding(
+                    "persistence",
+                    ProviderKind::Persistence,
+                    BindingStatus::Active,
+                ),
+                binding("executor", ProviderKind::Execution, BindingStatus::Active),
+            ];
+            Ok(())
+        })
+        .expect("record lifecycle owners");
+        let mut config = Config::default();
+        config.providers.directory = provider_directory;
+
+        let terminated = terminate(&config, &scope, &linked.id, "operator request")
+            .expect("terminate composed session");
+
+        assert_eq!(terminated.status, LifecycleStatus::Cancelled);
+        assert_eq!(
+            fs::read_to_string(log).expect("termination log"),
+            "session.stop\nexecution.cancel\n"
+        );
+        let _ = fs::remove_file(state::path(&scope));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_scope_termination_survives_a_deleted_workspace_directory() {
+        let directory = tempfile::tempdir().expect("termination fixture");
+        let scope_directory = directory.path().join("scope");
+        let provider_directory = directory.path().join("providers");
+        fs::create_dir_all(&scope_directory).expect("scope");
+        fs::create_dir_all(&provider_directory).expect("providers");
+        let scope = fs::canonicalize(&scope_directory).expect("canonical scope");
+        let provider = directory.path().join("provider.sh");
+        let invoked = directory.path().join("provider-cwd");
+        let executed = directory.path().join("plan-cwd");
+        fs::write(
+            &provider,
+            render_fixture(
+                MISSING_SCOPE_STOP_PROVIDER,
+                serde_json::json!({
+                    "invoked": invoked.display().to_string(),
+                    "executed": executed.display().to_string(),
+                    "missing": scope.display().to_string(),
+                }),
+            ),
+        )
+        .expect("provider script");
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o755))
+            .expect("provider executable");
+        fs::write(
+            provider_directory.join("provider.yaml"),
+            render_fixture(
+                PROVIDER_MANIFEST,
+                serde_json::json!({
+                    "name": "owner",
+                    "command": provider.display().to_string(),
+                    "actions": [{
+                        "capability": "session.stop",
+                        "description": "Stop the owned session",
+                    }],
+                }),
+            ),
+        )
+        .expect("provider manifest");
+        let linked = register(
+            &scope,
+            Contract::default(),
+            SessionLink {
+                id: Some("managed".into()),
+                native_id: Some("managed-native".into()),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect("managed session");
+        state::update(&scope, |workspace| {
+            workspace.sessions[0].providers = vec![binding(
+                "owner",
+                ProviderKind::Persistence,
+                BindingStatus::Active,
+            )];
+            Ok(())
+        })
+        .expect("record provider owner");
+        fs::remove_dir(&scope).expect("remove workspace directory");
+        let mut config = Config::default();
+        config.providers.directory = provider_directory;
+
+        let stopped = terminate_expired_persisted_scope(
+            &config,
+            &scope,
+            &linked.id,
+            "idle timeout exceeded",
+            Some(linked.heartbeat_at),
+            None,
+        )
+        .expect("terminate from persisted state");
+
+        assert_eq!(stopped.status, LifecycleStatus::Cancelled);
+        for recorded in [invoked, executed] {
+            let cwd = fs::read_to_string(recorded).expect("record stable cwd");
+            assert!(Path::new(cwd.trim()).is_dir());
+            assert_ne!(Path::new(cwd.trim()), scope);
+        }
+        let _ = fs::remove_file(state::path(&scope));
+    }
+
     #[test]
     fn lifecycle_update_cannot_override_a_termination_claim() {
         let directory = tempfile::tempdir().expect("scope");
@@ -2656,6 +3745,177 @@ actions:
             .expect_err("completed termination must remain terminal");
 
         assert!(error.to_string().contains("was terminated"));
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn public_lifecycle_updates_cannot_revive_terminal_work() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let orchestrator = register(
+            &scope,
+            Contract {
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("state-machine-root".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("register orchestrator");
+        let run = create_run(
+            &scope,
+            "state machine".into(),
+            "reject invalid transitions".into(),
+            "terminal work stays terminal".into(),
+            Some(orchestrator.id.clone()),
+            None,
+            None,
+        )
+        .expect("create run");
+        let node = upsert_node(
+            &scope,
+            &run.id,
+            NodeSpec {
+                id: "work".into(),
+                contract: Contract::default(),
+                session_id: None,
+                status: LifecycleStatus::Queued,
+                attempt: 0,
+                depends_on: Vec::new(),
+                execution: None,
+                judge_policy: JudgePolicy::Llm,
+            },
+        )
+        .expect("create node");
+
+        assert!(
+            update_run(&scope, &run.id, LifecycleStatus::Cancelled)
+                .expect_err("cancellation needs provider evidence")
+                .to_string()
+                .contains("workflow lifecycle operation")
+        );
+        assert_eq!(
+            read_workspace(&scope)
+                .expect("unchanged workspace")
+                .runs
+                .into_iter()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run remains registered")
+                .status,
+            LifecycleStatus::Queued
+        );
+
+        state::update(&scope, |workspace| {
+            let selected = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            selected.status = LifecycleStatus::Done;
+            Ok(())
+        })
+        .expect("force terminal run fixture");
+        assert!(
+            update_node(&scope, &run.id, &node.id, LifecycleStatus::Working)
+                .expect_err("terminal parent run")
+                .to_string()
+                .contains("run is not mutable")
+        );
+        state::update(&scope, |workspace| {
+            let selected = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            selected.status = LifecycleStatus::Queued;
+            Ok(())
+        })
+        .expect("restore active fixture");
+
+        update_session(&scope, &orchestrator.id, LifecycleStatus::Done).expect("finish session");
+        update_node(&scope, &run.id, &node.id, LifecycleStatus::Done).expect("finish node");
+        state::update(&scope, |workspace| {
+            let selected = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            selected.status = LifecycleStatus::Done;
+            Ok(())
+        })
+        .expect("finish run");
+
+        assert!(
+            update_session(&scope, &orchestrator.id, LifecycleStatus::Working)
+                .expect_err("terminal session")
+                .to_string()
+                .contains("invalid session lifecycle transition")
+        );
+        assert!(
+            update_run(&scope, &run.id, LifecycleStatus::Working)
+                .expect_err("terminal run")
+                .to_string()
+                .contains("invalid run lifecycle transition")
+        );
+        assert!(
+            update_node(&scope, &run.id, &node.id, LifecycleStatus::Working)
+                .expect_err("terminal node")
+                .to_string()
+                .contains("run is not mutable")
+        );
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn repeated_node_upserts_replace_review_edges() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let run = create_run(
+            &scope,
+            "review edges".into(),
+            "replace stale review relationships".into(),
+            "one current review edge".into(),
+            None,
+            None,
+            None,
+        )
+        .expect("create run");
+        for reviewer in ["first-reviewer", "second-reviewer"] {
+            upsert_node(
+                &scope,
+                &run.id,
+                NodeSpec {
+                    id: "work".into(),
+                    contract: Contract {
+                        review_by: Some(reviewer.into()),
+                        ..Contract::default()
+                    },
+                    session_id: None,
+                    status: LifecycleStatus::Queued,
+                    attempt: 0,
+                    depends_on: Vec::new(),
+                    execution: None,
+                    judge_policy: JudgePolicy::Llm,
+                },
+            )
+            .expect("upsert node");
+        }
+
+        let current = read_workspace(&scope).expect("workspace");
+        let run = current
+            .runs
+            .iter()
+            .find(|candidate| candidate.id == run.id)
+            .expect("run");
+        let review_edges = run
+            .edges
+            .iter()
+            .filter(|edge| edge.from == "work" && edge.relationship == "reviewed_by")
+            .collect::<Vec<_>>();
+        assert_eq!(review_edges.len(), 1);
+        assert_eq!(review_edges[0].to, "second-reviewer");
         let _ = std::fs::remove_file(state::path(&scope));
     }
 
@@ -2771,12 +4031,141 @@ actions:
             LifecycleStatus::Done,
         );
         finished_child.parent_id = Some(root.id.clone());
-        workspace.sessions = vec![root, active_child, finished_child];
+        let mut resumable_child = session(
+            "resumable-child",
+            SessionRole::Researcher,
+            LifecycleStatus::Disconnected,
+        );
+        resumable_child.registration = RegistrationSource::Managed;
+        resumable_child.parent_id = Some(root.id.clone());
+        let mut failed_child =
+            session("failed-child", SessionRole::Critic, LifecycleStatus::Failed);
+        failed_child.registration = RegistrationSource::Managed;
+        failed_child.parent_id = Some(root.id.clone());
+        workspace.sessions = vec![
+            root,
+            active_child,
+            finished_child,
+            resumable_child,
+            failed_child,
+        ];
 
         reparent_active_descendants(&mut workspace, &["old-root".into()], "new-root");
 
         assert_eq!(workspace.sessions[1].parent_id.as_deref(), Some("new-root"));
         assert_eq!(workspace.sessions[2].parent_id.as_deref(), Some("old-root"));
+        assert_eq!(workspace.sessions[3].parent_id.as_deref(), Some("new-root"));
+        assert_eq!(workspace.sessions[4].parent_id.as_deref(), Some("old-root"));
+    }
+
+    #[test]
+    fn registration_remaps_a_stale_orchestrator_parent_after_adoption() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let old = register(
+            &scope,
+            Contract {
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some("old-root".into()),
+                native_id: Some("old-native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("old root");
+        let run = create_run(
+            &scope,
+            "adoption-race".into(),
+            "keep the run attached".into(),
+            "a managed child".into(),
+            Some(old.id.clone()),
+            None,
+            None,
+        )
+        .expect("run");
+        let replacement = adopt(
+            &scope,
+            Contract {
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            Some("replacement-native".into()),
+        )
+        .expect("replacement root");
+
+        let child = register(
+            &scope,
+            Contract::default(),
+            SessionLink {
+                native_id: Some("late-child".into()),
+                parent_id: Some(old.id),
+                run_id: Some(run.id),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect("late child");
+
+        assert_eq!(child.parent_id.as_deref(), Some(replacement.id.as_str()));
+    }
+
+    #[test]
+    fn registration_rejects_conflicting_explicit_and_native_identities() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let root = register(
+            &scope,
+            Contract {
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some("root".into()),
+                native_id: Some("root-native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("root");
+        let child = register(
+            &scope,
+            Contract::default(),
+            SessionLink {
+                id: Some("child".into()),
+                native_id: Some("child-native".into()),
+                parent_id: Some(root.id.clone()),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect("child");
+
+        let error = register(
+            &scope,
+            Contract::default(),
+            SessionLink {
+                id: Some(root.id.clone()),
+                native_id: Some(child.native_id.clone()),
+                ..SessionLink::default()
+            },
+        )
+        .expect_err("identities must not be merged");
+
+        assert!(
+            error
+                .to_string()
+                .contains("identify different Orc sessions")
+        );
+        let workspace = read_workspace(&scope).expect("workspace");
+        assert_eq!(workspace.sessions.len(), 2);
+        assert!(
+            workspace
+                .sessions
+                .iter()
+                .all(|session| session.status != LifecycleStatus::Archived)
+        );
+        let _ = std::fs::remove_file(state::path(&scope));
     }
 
     #[test]
@@ -2799,7 +4188,6 @@ actions:
             },
         )
         .unwrap();
-        update_session(&scope, &old.id, LifecycleStatus::Disconnected).unwrap();
         let child = register(
             &scope,
             Contract {
@@ -2815,6 +4203,7 @@ actions:
             },
         )
         .unwrap();
+        update_session(&scope, &old.id, LifecycleStatus::Disconnected).unwrap();
 
         let new = adopt(
             &scope,
@@ -2887,6 +4276,29 @@ actions:
     }
 
     #[test]
+    fn reconciliation_preserves_launch_ownership_until_binding_is_conclusive() {
+        let mut selected = session("session", SessionRole::Worker, LifecycleStatus::Working);
+        let mut reservation = binding(
+            "persistence-a",
+            ProviderKind::Persistence,
+            BindingStatus::Active,
+        );
+        reservation.label = "Launch ownership: persistence-a".into();
+        selected.providers = vec![reservation.clone()];
+        let mut available = binding(
+            "persistence-a",
+            ProviderKind::Persistence,
+            BindingStatus::Available,
+        );
+        available.r#ref = None;
+
+        apply_enrichment(&mut selected, &[available], None, None);
+
+        assert_eq!(selected.providers, vec![reservation]);
+        assert_eq!(selected.status, LifecycleStatus::Working);
+    }
+
+    #[test]
     fn reconciliation_disconnects_a_session_that_loses_its_live_binding() {
         let mut selected = session(
             "session",
@@ -2945,6 +4357,87 @@ actions:
         let remaining_display = binding("display-a", ProviderKind::Display, BindingStatus::Active);
 
         apply_enrichment(&mut selected, &[remaining_display], None, None);
+
+        assert_eq!(selected.status, LifecycleStatus::Working);
+    }
+
+    #[test]
+    fn active_display_overrides_unavailable_persistence_evidence() {
+        let mut selected = session(
+            "session",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+        );
+        selected.providers = vec![
+            binding(
+                "persistence-a",
+                ProviderKind::Persistence,
+                BindingStatus::Active,
+            ),
+            binding("display-a", ProviderKind::Display, BindingStatus::Active),
+        ];
+        let unavailable = binding(
+            "persistence-a",
+            ProviderKind::Persistence,
+            BindingStatus::Unavailable,
+        );
+        let display = binding("display-a", ProviderKind::Display, BindingStatus::Active);
+
+        apply_enrichment(&mut selected, &[unavailable, display], None, None);
+
+        assert_eq!(selected.status, LifecycleStatus::Working);
+    }
+
+    #[test]
+    fn active_execution_overrides_unavailable_persistence_evidence() {
+        let mut selected = session(
+            "session",
+            SessionRole::Implementer,
+            LifecycleStatus::Working,
+        );
+        selected.providers = vec![binding(
+            "persistence-a",
+            ProviderKind::Persistence,
+            BindingStatus::Active,
+        )];
+        let unavailable = binding(
+            "persistence-a",
+            ProviderKind::Persistence,
+            BindingStatus::Unavailable,
+        );
+        let execution = binding(
+            "execution-a",
+            ProviderKind::Execution,
+            BindingStatus::Active,
+        );
+
+        apply_enrichment(&mut selected, &[unavailable, execution], None, None);
+
+        assert_eq!(selected.status, LifecycleStatus::Working);
+    }
+
+    #[test]
+    fn reconciliation_requires_all_known_live_bindings_to_be_unavailable() {
+        let mut selected = session(
+            "session",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+        );
+        selected.providers = vec![
+            binding(
+                "persistence-a",
+                ProviderKind::Persistence,
+                BindingStatus::Active,
+            ),
+            binding("display-a", ProviderKind::Display, BindingStatus::Active),
+        ];
+        let unavailable = binding(
+            "persistence-a",
+            ProviderKind::Persistence,
+            BindingStatus::Unavailable,
+        );
+
+        apply_enrichment(&mut selected, &[unavailable], None, None);
 
         assert_eq!(selected.status, LifecycleStatus::Working);
     }

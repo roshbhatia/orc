@@ -56,6 +56,19 @@ pub enum LifecycleStatus {
     Skipped,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LifecycleSubject {
+    Session,
+    Run,
+    Node,
+}
+
+impl std::fmt::Display for LifecycleSubject {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", format!("{self:?}").to_lowercase())
+    }
+}
+
 impl LifecycleStatus {
     pub fn active(self) -> bool {
         !matches!(
@@ -67,6 +80,93 @@ impl LifecycleStatus {
                 | Self::Archived
                 | Self::Skipped
         )
+    }
+
+    pub fn valid_for(self, subject: LifecycleSubject) -> bool {
+        match subject {
+            LifecycleSubject::Session => !matches!(self, Self::Skipped),
+            LifecycleSubject::Run => !matches!(self, Self::Disconnected | Self::Skipped),
+            LifecycleSubject::Node => !matches!(self, Self::Disconnected | Self::Archived),
+        }
+    }
+
+    pub fn can_transition_to(self, subject: LifecycleSubject, next: Self) -> bool {
+        if self == next {
+            return self.valid_for(subject);
+        }
+        if !self.valid_for(subject) || !next.valid_for(subject) {
+            return false;
+        }
+        match subject {
+            LifecycleSubject::Session => match self {
+                Self::Pending => matches!(
+                    next,
+                    Self::Queued | Self::Working | Self::Cancelled | Self::Archived
+                ),
+                Self::Queued | Self::Working | Self::Waiting | Self::Blocked => matches!(
+                    next,
+                    Self::Queued
+                        | Self::Working
+                        | Self::Waiting
+                        | Self::Blocked
+                        | Self::Failed
+                        | Self::Done
+                        | Self::Cancelled
+                        | Self::Disconnected
+                        | Self::Terminating
+                        | Self::Archived
+                ),
+                Self::Disconnected => matches!(
+                    next,
+                    Self::Working | Self::Failed | Self::Terminating | Self::Archived
+                ),
+                Self::Terminating => {
+                    matches!(next, Self::Failed | Self::Cancelled | Self::Archived)
+                }
+                Self::Failed | Self::Done | Self::Cancelled => matches!(next, Self::Archived),
+                Self::Archived | Self::Skipped => false,
+            },
+            LifecycleSubject::Run => match self {
+                Self::Pending => matches!(next, Self::Queued | Self::Cancelled | Self::Archived),
+                Self::Queued | Self::Working | Self::Waiting | Self::Blocked => matches!(
+                    next,
+                    Self::Queued
+                        | Self::Working
+                        | Self::Waiting
+                        | Self::Blocked
+                        | Self::Failed
+                        | Self::Done
+                        | Self::Cancelled
+                        | Self::Terminating
+                        | Self::Archived
+                ),
+                Self::Failed => matches!(next, Self::Queued | Self::Archived),
+                Self::Terminating => {
+                    matches!(next, Self::Failed | Self::Cancelled | Self::Archived)
+                }
+                Self::Done | Self::Cancelled => matches!(next, Self::Archived),
+                Self::Disconnected | Self::Archived | Self::Skipped => false,
+            },
+            LifecycleSubject::Node => match self {
+                Self::Pending => matches!(next, Self::Queued | Self::Cancelled | Self::Skipped),
+                Self::Queued | Self::Working | Self::Waiting | Self::Blocked => matches!(
+                    next,
+                    Self::Queued
+                        | Self::Working
+                        | Self::Waiting
+                        | Self::Blocked
+                        | Self::Failed
+                        | Self::Done
+                        | Self::Cancelled
+                        | Self::Skipped
+                        | Self::Terminating
+                ),
+                Self::Failed => matches!(next, Self::Queued),
+                Self::Terminating => matches!(next, Self::Failed | Self::Cancelled),
+                Self::Done | Self::Cancelled | Self::Skipped => false,
+                Self::Disconnected | Self::Archived => false,
+            },
+        }
     }
 }
 
@@ -338,12 +438,23 @@ pub enum RunMode {
     Background,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateAuthority {
+    #[default]
+    User,
+    OrchestratorThenUser,
+    Orchestrator,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingGate {
     pub id: String,
     pub before: String,
     pub reason: String,
+    #[serde(default)]
+    pub authority: GateAuthority,
     pub recommendation: Option<String>,
     pub created_at: DateTime<Utc>,
 }
@@ -441,13 +552,27 @@ impl WorkspaceState {
         self.current_session_for(requested.as_deref())
     }
 
-    fn current_session_for(&self, requested: Option<&str>) -> Option<&Session> {
+    pub(crate) fn current_session_for(&self, requested: Option<&str>) -> Option<&Session> {
         if let Some(id) = requested {
-            return self.sessions.iter().find(|session| {
+            if let Some(session) = self.sessions.iter().find(|session| {
                 session.id == id
                     && session.status.active()
                     && session.status != LifecycleStatus::Terminating
-            });
+            }) {
+                return Some(session);
+            }
+            let native_id = &self
+                .sessions
+                .iter()
+                .find(|session| session.id == id)?
+                .native_id;
+            return self
+                .active_sessions()
+                .filter(|session| {
+                    session.native_id == *native_id
+                        && session.status != LifecycleStatus::Terminating
+                })
+                .max_by_key(|session| session.updated_at);
         }
         self.active_sessions()
             .filter(|session| {
@@ -533,6 +658,32 @@ mod tests {
     }
 
     #[test]
+    fn archived_incarnation_resolves_to_the_active_native_session() {
+        let mut workspace = WorkspaceState::empty("/tmp".into());
+        let archived = session(
+            "archived",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Archived,
+            1,
+        );
+        let mut active = session(
+            "active",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+            2,
+        );
+        active.native_id = archived.native_id.clone();
+        workspace.sessions = vec![active, archived];
+
+        assert_eq!(
+            workspace
+                .current_session_for(Some("archived"))
+                .map(|session| session.id.as_str()),
+            Some("active")
+        );
+    }
+
+    #[test]
     fn missing_environment_session_does_not_inherit_orchestrator_authority() {
         let mut workspace = WorkspaceState::empty("/tmp".into());
         workspace.sessions = vec![session(
@@ -563,5 +714,44 @@ mod tests {
 
         assert!(workspace.current_session_for(Some("terminating")).is_none());
         assert!(workspace.current_session_for(None).is_none());
+    }
+
+    #[test]
+    fn lifecycle_state_machines_reject_invalid_subject_states() {
+        assert!(!LifecycleStatus::Disconnected.valid_for(LifecycleSubject::Run));
+        assert!(!LifecycleStatus::Archived.valid_for(LifecycleSubject::Node));
+        assert!(!LifecycleStatus::Skipped.valid_for(LifecycleSubject::Session));
+    }
+
+    #[test]
+    fn lifecycle_state_machines_do_not_revive_terminal_work() {
+        assert!(
+            !LifecycleStatus::Done
+                .can_transition_to(LifecycleSubject::Run, LifecycleStatus::Working)
+        );
+        assert!(
+            !LifecycleStatus::Cancelled
+                .can_transition_to(LifecycleSubject::Session, LifecycleStatus::Working)
+        );
+        assert!(
+            !LifecycleStatus::Skipped
+                .can_transition_to(LifecycleSubject::Node, LifecycleStatus::Queued)
+        );
+    }
+
+    #[test]
+    fn lifecycle_state_machines_keep_explicit_recovery_paths() {
+        assert!(
+            LifecycleStatus::Disconnected
+                .can_transition_to(LifecycleSubject::Session, LifecycleStatus::Working)
+        );
+        assert!(
+            LifecycleStatus::Failed
+                .can_transition_to(LifecycleSubject::Run, LifecycleStatus::Queued)
+        );
+        assert!(
+            LifecycleStatus::Failed
+                .can_transition_to(LifecycleSubject::Node, LifecycleStatus::Queued)
+        );
     }
 }

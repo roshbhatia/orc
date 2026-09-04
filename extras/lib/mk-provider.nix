@@ -1,4 +1,5 @@
 {
+  bash,
   lib,
   makeWrapper,
   shellcheck,
@@ -13,6 +14,7 @@
   script,
 }:
 let
+  providerRuntimeInputs = [ bash ] ++ runtimeInputs;
   adapter = stdenvNoCC.mkDerivation {
     pname = "orc-provider-${name}-adapter";
     version = "0.10.0";
@@ -37,7 +39,8 @@ let
       chmod 0555 "$out/bin/orc-provider-${name}" "$out/lib/provider.sh"
       patchShebangs "$out/bin/orc-provider-${name}"
       wrapProgram "$out/bin/orc-provider-${name}" \
-        --prefix PATH : ${lib.makeBinPath runtimeInputs}
+        --prefix PATH : ${lib.makeBinPath providerRuntimeInputs} \
+        --set ORC_PROVIDER_SELF "$out/bin/orc-provider-${name}"
     '';
   };
 in
@@ -45,7 +48,8 @@ symlinkJoin {
   name = "orc-provider-${name}";
   paths = [ adapter ] ++ commandPackages;
   passthru = {
-    inherit adapter commandPackages runtimeInputs;
+    inherit adapter commandPackages;
+    runtimeInputs = providerRuntimeInputs;
     providerName = name;
   };
   meta.mainProgram = "orc-provider-${name}";

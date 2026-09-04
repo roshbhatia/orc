@@ -20,6 +20,10 @@ implements those capabilities. Shared protocol response helpers live under
 Each provider package contains its ready-to-install manifest under
 `share/orc/providers` and exposes any fixed command dependency. A missing
 dynamic harness command returns a provider decline instead of breaking Orc.
-Consumers can install one `provider-*` output, the `extras` bundle with every
-provider, or `full` with core and every provider. Use `orc provider validate`
-to test adapters without opening the dashboard or launching a harness.
+Consumers can install one `provider-*` output, the default bundle with every
+provider, or `full` with core and every provider. The extras flake owns all
+external product inputs. The root Orc flake remains provider-neutral. Use
+`orc provider validate` to test adapters without opening the dashboard or
+launching a harness. Each packaged adapter supplies its own Bash and command
+dependencies. Validation therefore works under a clean process environment;
+the parent Orc process does not need provider commands on its `PATH`.

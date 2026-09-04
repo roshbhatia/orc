@@ -6,8 +6,12 @@ provider_library=${ORC_PROVIDER_LIB:-"$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")
 source "$provider_library"
 
 zmx_record() {
-  local target field candidate pid created
+  local target records field candidate pid created
   target=$1
+  if ! records=$(zmx list); then
+    printf 'orc-provider-zmx: cannot inspect Zmx sessions\n' >&2
+    return 2
+  fi
   while IFS=$'\t' read -r -a fields; do
     candidate=
     pid=
@@ -24,7 +28,7 @@ zmx_record() {
       printf '%s\t%s\t%s\n' "$pid" "$created" "$candidate"
       return 0
     fi
-  done < <(zmx list 2> /dev/null)
+  done <<< "$records"
   return 1
 }
 
@@ -33,7 +37,19 @@ if [[ ${1:-} == stop ]]; then
   expected_pid=${3:?zmx session pid is required}
   expected_created=${4:?zmx session birth time is required}
   : "${5:?Orc operation ID is required}"
-  IFS=$'\t' read -r current_pid current_created current_name <<< "$(zmx_record "$name" || true)"
+  if ! command -v zmx > /dev/null; then
+    printf 'orc-provider-zmx: zmx is unavailable while stopping %s\n' "$name" >&2
+    exit 2
+  fi
+  record_status=0
+  record=$(zmx_record "$name") || record_status=$?
+  if ((record_status == 2)); then
+    exit 2
+  fi
+  if ((record_status == 1)); then
+    exit 0
+  fi
+  IFS=$'\t' read -r current_pid current_created current_name <<< "$record"
   if [[ $current_pid != "$expected_pid" || $current_created != "$expected_created" ]]; then
     exit 0
   fi
@@ -45,7 +61,7 @@ provider_init "zmx"
 
 case "$capability" in
   provider.validate)
-    validate_dependency "zmx"
+    validate_manifest_requirements
     ;;
   session.bind)
     existing_ref=$(jq -r '
@@ -67,28 +83,49 @@ case "$capability" in
       existing_created=
     fi
     if [[ -n $existing_ref ]] && command -v zmx > /dev/null; then
-      IFS=$'\t' read -r current_pid current_created current_name <<< "$(zmx_record "$existing_name" || true)"
-      if [[ -n $current_pid && (-z $existing_pid || ($current_pid == "$existing_pid" && $current_created == "$existing_created")) ]]; then
+      record_status=0
+      record=$(zmx_record "$existing_name") || record_status=$?
+      if ((record_status == 2)); then
+        exit 2
+      fi
+      if ((record_status == 0)); then
+        IFS=$'\t' read -r current_pid current_created current_name <<< "$record"
+      fi
+      if ((record_status == 0)) && [[ -n $current_pid && (-z $existing_pid || ($current_pid == "$existing_pid" && $current_created == "$existing_created")) ]]; then
         existing_session=true
       fi
     fi
     if [[ $rebind_current == true ]] && current_session_matches && [[ -n ${ZMX_SESSION:-} ]]; then
       zmx_session=$ZMX_SESSION
-      IFS=$'\t' read -r current_pid current_created current_name <<< "$(zmx_record "$zmx_session" || true)"
-      if [[ -n $current_pid ]]; then
+      record_status=0
+      record=$(zmx_record "$zmx_session") || record_status=$?
+      if ((record_status == 2)); then
+        exit 2
+      fi
+      if ((record_status == 0)); then
+        IFS=$'\t' read -r current_pid current_created current_name <<< "$record"
         emit_binding "persistence" "active" "$current_name@$current_pid@$current_created" "Zmx session $current_name"
       else
         emit_binding "persistence" "available" "" "Zmx on next launch"
       fi
     elif [[ $existing_session == true ]]; then
       emit_binding "persistence" "active" "$current_name@$current_pid@$current_created" "Zmx session $current_name"
-    elif managed_name=$(jq -r '.session.id // empty' <<< "$request") &&
-      [[ -n $managed_name ]] &&
-      IFS=$'\t' read -r current_pid current_created current_name <<< "$(zmx_record "$managed_name" || true)" &&
-      [[ -n $current_pid ]]; then
-      emit_binding "persistence" "active" "$current_name@$current_pid@$current_created" "Zmx session $current_name"
     else
-      emit_binding "persistence" "available" "" "Zmx on next launch"
+      managed_name=$(jq -r '.session.id // empty' <<< "$request")
+      record_status=1
+      if [[ -n $managed_name ]]; then
+        record_status=0
+        record=$(zmx_record "$managed_name") || record_status=$?
+        if ((record_status == 2)); then
+          exit 2
+        fi
+      fi
+      if ((record_status == 0)); then
+        IFS=$'\t' read -r current_pid current_created current_name <<< "$record"
+        emit_binding "persistence" "active" "$current_name@$current_pid@$current_created" "Zmx session $current_name"
+      else
+        emit_binding "persistence" "available" "" "Zmx on next launch"
+      fi
     fi
     ;;
   session.persist)
@@ -98,11 +135,14 @@ case "$capability" in
       exit 0
     fi
     provider_ref=$(jq -r '
-      first(
-        .session.providers[]?
-        | select(.provider == "zmx" and .kind == "persistence" and .status == "active")
-        | .ref
-      ) // .session.providerRef // empty
+      if .action == "launch" then empty
+      else
+        first(
+          .session.providers[]?
+          | select(.provider == "zmx" and .kind == "persistence" and .status == "active")
+          | .ref
+        ) // .session.providerRef // empty
+      end
     ' <<< "$request")
     if [[ -n $provider_ref ]]; then
       provider_identity=${provider_ref%@*}
@@ -155,11 +195,16 @@ case "$capability" in
       provider_pid=${provider_identity##*@}
       provider_name=${provider_identity%@*}
       if [[ $provider_name == "$provider_identity" ]]; then
-        IFS=$'\t' read -r provider_pid provider_created provider_name <<< "$(zmx_record "$provider_ref" || true)"
-        if [[ -z $provider_pid ]]; then
+        record_status=0
+        record=$(zmx_record "$provider_ref") || record_status=$?
+        if ((record_status == 2)); then
+          exit 2
+        fi
+        if ((record_status == 1)); then
           emit_plan "$scope" '{}' true
           exit 0
         fi
+        IFS=$'\t' read -r provider_pid provider_created provider_name <<< "$record"
       fi
       umask 077
       mkdir -p "$operation_directory"
@@ -167,7 +212,8 @@ case "$capability" in
       printf '%s\t%s\t%s\t%s\n' "$operation_id" "$provider_name" "$provider_pid" "$provider_created" > "$temporary"
       mv "$temporary" "$operation_path"
     fi
-    emit_plan "$scope" '{}' "$0" stop "$provider_name" "$provider_pid" "$provider_created" "$operation_id"
+    provider_self=${ORC_PROVIDER_SELF:-$0}
+    emit_plan "$scope" '{}' "$provider_self" stop "$provider_name" "$provider_pid" "$provider_created" "$operation_id"
     ;;
   *) unsupported_capability ;;
 esac

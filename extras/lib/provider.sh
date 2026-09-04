@@ -94,15 +94,67 @@ emit_validation() {
     }'
 }
 
-validate_dependency() {
-  local command_name executable
-  command_name=$1
-  executable=$(command -v "$command_name" || true)
-  if [[ -z $executable ]]; then
-    emit_validation "failed" "dependency" "$command_name is unavailable"
-  else
-    emit_validation "ok" "dependency" "$command_name is available at $executable"
+validate_manifest_requirements() {
+  local checks validation_status requirement executable check_status message
+  checks='[]'
+  validation_status=ok
+
+  while IFS= read -r requirement; do
+    executable=$(command -v "$requirement" || true)
+    if [[ -n $executable ]]; then
+      check_status=ok
+      message="$requirement is available at $executable"
+    else
+      check_status=failed
+      message="$requirement is unavailable"
+      validation_status=failed
+    fi
+    checks=$(jq -c \
+      --arg name "command:$requirement" \
+      --arg status "$check_status" \
+      --arg message "$message" \
+      '. + [{name: $name, status: $status, message: $message}]' <<< "$checks")
+  done < <(jq -r '.manifest.requires.commands[]?' <<< "$request")
+
+  while IFS= read -r requirement; do
+    if [[ -n ${!requirement+x} ]]; then
+      check_status=ok
+      message="$requirement is set"
+    else
+      check_status=failed
+      message="$requirement is not set"
+      validation_status=failed
+    fi
+    checks=$(jq -c \
+      --arg name "environment:$requirement" \
+      --arg status "$check_status" \
+      --arg message "$message" \
+      '. + [{name: $name, status: $status, message: $message}]' <<< "$checks")
+  done < <(jq -r '.manifest.requires.environment[]?' <<< "$request")
+
+  while IFS= read -r requirement; do
+    if [[ -e $requirement ]]; then
+      check_status=ok
+      message="$requirement exists"
+    else
+      check_status=failed
+      message="$requirement is missing"
+      validation_status=failed
+    fi
+    checks=$(jq -c \
+      --arg name "path:$requirement" \
+      --arg status "$check_status" \
+      --arg message "$message" \
+      '. + [{name: $name, status: $status, message: $message}]' <<< "$checks")
+  done < <(jq -r '.manifest.requires.paths[]?' <<< "$request")
+
+  if [[ $checks == '[]' ]]; then
+    checks='[{"name":"requirements","status":"ok","message":"no requirements declared"}]'
   fi
+  jq -n \
+    --arg status "$validation_status" \
+    --argjson checks "$checks" \
+    '{version: "orc.provider/v1", status: $status, checks: $checks}'
 }
 
 read_command() {

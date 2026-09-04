@@ -17,10 +17,11 @@ use minijinja::Environment;
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    config::Config,
+    config::{self, Config},
     control::{self, Contract, SessionLink},
     daemon,
     domain::{
@@ -28,10 +29,14 @@ use crate::{
         RegistrationSource, RunMode, Session, SessionRole, WorkflowEdge, WorkflowNode, WorkflowRun,
         WorkspaceState,
     },
-    preferences::{self, AutonomyMode},
     provider::{self, Action, CommandPlan},
     state,
 };
+
+pub use crate::domain::GateAuthority;
+
+#[cfg(test)]
+use crate::preferences;
 
 const MAX_WORKFLOW_LOG_BYTES: u64 = 1024 * 1024;
 const MAX_RETRY_ATTEMPTS: u32 = 100;
@@ -47,11 +52,9 @@ pub enum ApprovalMode {
     Autonomous,
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GateAuthority {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApprovalActor {
     User,
-    OrchestratorThenUser,
     Orchestrator,
 }
 
@@ -60,12 +63,8 @@ pub struct ApprovalGate {
     pub id: String,
     pub before: String,
     pub reason: String,
-    #[serde(default = "default_gate_authority")]
+    #[serde(default)]
     pub authority: GateAuthority,
-}
-
-fn default_gate_authority() -> GateAuthority {
-    GateAuthority::User
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize)]
@@ -340,6 +339,12 @@ pub fn validate(definition: &Definition, base: &Path) -> Result<()> {
         if step.name.is_empty() {
             bail!("a step has no name");
         }
+        if step.role == SessionRole::Orchestrator {
+            bail!(
+                "step {} cannot use the orchestrator role; the orchestrator owns the workflow",
+                step.name
+            );
+        }
         if step.retry.attempts > MAX_RETRY_ATTEMPTS {
             bail!(
                 "step {} retry attempts exceed the limit of {MAX_RETRY_ATTEMPTS}",
@@ -381,6 +386,27 @@ pub fn validate(definition: &Definition, base: &Path) -> Result<()> {
             if !all.contains(dependency.as_str()) {
                 bail!("{} depends on unknown step {dependency}", step.name);
             }
+        }
+        if let Some(reviewer) = step.review_by.as_deref() {
+            if reviewer == step.name {
+                bail!("step {} cannot review itself", step.name);
+            }
+            let reviewer_step = definition
+                .steps
+                .iter()
+                .find(|candidate| candidate.name == reviewer)
+                .with_context(|| format!("{} names unknown reviewer {reviewer}", step.name))?;
+            if !matches!(
+                reviewer_step.role,
+                SessionRole::Critic | SessionRole::Judge | SessionRole::Verifier
+            ) {
+                bail!("reviewer {reviewer} must use the critic, judge, or verifier role");
+            }
+        } else if step.completion == CompletionTarget::Judge {
+            bail!(
+                "step {} reports to a judge but does not name review_by",
+                step.name
+            );
         }
         for route in &step.routes {
             if route.to != "$end" && route.to != "self" && !all.contains(route.to.as_str()) {
@@ -437,7 +463,7 @@ pub fn validate(definition: &Definition, base: &Path) -> Result<()> {
         .steps
         .iter()
         .find(|step| step.name == definition.entry_point)
-        && !entry.depends_on.is_empty()
+        && !effective_dependencies(definition, entry).is_empty()
     {
         bail!("entry point {} cannot have dependencies", entry.name);
     }
@@ -601,6 +627,190 @@ pub fn save(config: &Config, scope: &Path, definition: &Definition) -> Result<Pa
     Ok(target)
 }
 
+fn definition_revision(definition: &Definition) -> Result<String> {
+    let encoded = serde_json::to_vec(definition).context("serialize workflow revision")?;
+    Ok(format!("sha256:{}", hex::encode(Sha256::digest(encoded))))
+}
+
+fn materialized_definition_path(scope: &Path, run_id: &str) -> PathBuf {
+    config::state_home()
+        .join("orc/runs")
+        .join(state::scope_key(scope))
+        .join(format!("{run_id}.yaml"))
+}
+
+fn materialize_definition_snapshot(
+    scope: &Path,
+    run_id: &str,
+    definition: &Definition,
+) -> Result<PathBuf> {
+    let path = materialized_definition_path(scope, run_id);
+    fs::create_dir_all(path.parent().context("run definition path has no parent")?)?;
+    fs::write(&path, serde_yaml::to_string(definition)?)
+        .with_context(|| format!("write materialized workflow {}", path.display()))?;
+    Ok(path)
+}
+
+fn pin_relative_workflow_references(definition: &mut Definition, source: &Path) -> Result<()> {
+    let base = source.parent().unwrap_or(Path::new("."));
+    for step in definition
+        .steps
+        .iter_mut()
+        .filter(|step| matches!(step.r#type, StepKind::Workflow))
+    {
+        let Some(reference) = step.workflow.as_deref() else {
+            continue;
+        };
+        if reference.starts_with('.') {
+            step.workflow = Some(
+                fs::canonicalize(base.join(reference))
+                    .with_context(|| format!("resolve sub-workflow {reference}"))?
+                    .display()
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn commit_run_definition(config: &Config, path: &Path, definition: &Definition) -> Result<()> {
+    if config.workflows.auto_commit
+        && fs::canonicalize(&config.workflows.repository)
+            .is_ok_and(|repository| path.starts_with(repository))
+    {
+        commit(
+            config,
+            &format!("feat: update {} workflow", definition.name),
+        )?;
+    }
+    Ok(())
+}
+
+fn update_run_definition<T>(
+    config: &Config,
+    scope: &Path,
+    run_id: &str,
+    path: &Path,
+    previous_revision: &str,
+    definition: &Definition,
+    transform: impl FnOnce(&mut WorkflowRun) -> Result<T>,
+) -> Result<T> {
+    validate(definition, path.parent().unwrap_or(Path::new(".")))?;
+    let encoded = serde_yaml::to_string(definition)?;
+    let revision = definition_revision(definition)?;
+    let result = state::update(scope, |workspace| {
+        let run = workspace
+            .runs
+            .iter_mut()
+            .find(|run| run.id == run_id)
+            .with_context(|| format!("unknown run: {run_id}"))?;
+        if run.revision.as_deref() != Some(previous_revision) {
+            bail!("workflow run changed concurrently; reload it before editing");
+        }
+        let result = transform(run)?;
+        fs::write(path, encoded).with_context(|| format!("write workflow {}", path.display()))?;
+        apply_definition_revision(run, &revision);
+        run.updated_at = Utc::now();
+        Ok(result)
+    })?;
+    commit_run_definition(config, path, definition)?;
+    Ok(result)
+}
+
+fn apply_definition_revision(run: &mut WorkflowRun, revision: &str) -> bool {
+    if run.revision.as_deref() == Some(revision) {
+        return false;
+    }
+    run.revision = Some(revision.to_owned());
+    run.pending_gates.clear();
+    run.approved_gates.clear();
+    run.updated_at = Utc::now();
+    true
+}
+
+fn require_unstarted_node<'a>(
+    run: &'a WorkflowRun,
+    node_id: &str,
+    operation: &str,
+) -> Result<&'a WorkflowNode> {
+    let node = run
+        .nodes
+        .iter()
+        .find(|node| node.id == node_id)
+        .with_context(|| format!("unknown node: {node_id}"))?;
+    if node.attempt != 0
+        || node.session_id.is_some()
+        || !matches!(
+            node.status,
+            LifecycleStatus::Pending | LifecycleStatus::Queued | LifecycleStatus::Waiting
+        )
+    {
+        bail!(
+            "cannot {operation} node {node_id} after it has started; restart-from-node is not implemented"
+        );
+    }
+    Ok(node)
+}
+
+fn reset_unstarted_nodes(run: &mut WorkflowRun, node_ids: &BTreeSet<String>) -> Result<()> {
+    for node_id in node_ids {
+        require_unstarted_node(run, node_id, "change")?;
+    }
+    for node in run
+        .nodes
+        .iter_mut()
+        .filter(|node| node_ids.contains(&node.id))
+    {
+        if node.status == LifecycleStatus::Waiting {
+            node.status = LifecycleStatus::Queued;
+        }
+        node.retry_after = None;
+        node.updated_at = Utc::now();
+        node.record_activity("contract", "unstarted stage contract changed");
+    }
+    run.pending_gates.clear();
+    run.approved_gates.clear();
+    if run
+        .current_node
+        .as_ref()
+        .is_some_and(|node_id| node_ids.contains(node_id))
+    {
+        run.current_node = None;
+    }
+    Ok(())
+}
+
+fn downstream_nodes(definition: &Definition, root: &str) -> BTreeSet<String> {
+    let mut result = BTreeSet::from([root.to_owned()]);
+    loop {
+        let discovered = definition
+            .steps
+            .iter()
+            .filter(|step| {
+                step.depends_on.iter().any(|dependency| {
+                    result.contains(dependency)
+                        || definition.parallel.iter().any(|group| {
+                            group.name == *dependency
+                                && group.agents.iter().any(|member| result.contains(member))
+                        })
+                }) || definition.steps.iter().any(|source| {
+                    result.contains(&source.name)
+                        && source.review_by.as_deref() == Some(step.name.as_str())
+                }) || definition.steps.iter().any(|source| {
+                    result.contains(&source.name)
+                        && source.routes.iter().any(|route| route.to == step.name)
+                })
+            })
+            .map(|step| step.name.clone())
+            .collect::<Vec<_>>();
+        let before = result.len();
+        result.extend(discovered);
+        if result.len() == before {
+            return result;
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct NodeEdit {
     pub goal: Option<String>,
@@ -625,6 +835,13 @@ fn run_definition(scope: &Path, run_id: &str) -> Result<(WorkflowRun, PathBuf, D
         .map(PathBuf::from)
         .context("this run has no versioned workflow definition")?;
     let definition = load(&path)?;
+    let revision = definition_revision(&definition)?;
+    if run.revision.as_deref() != Some(revision.as_str()) {
+        bail!(
+            "workflow run definition changed outside Orc; restore revision {} or create a new run",
+            run.revision.as_deref().unwrap_or("unknown")
+        );
+    }
     Ok((run, path, definition))
 }
 
@@ -635,7 +852,12 @@ pub fn edit_run_node(
     node_id: &str,
     edit: NodeEdit,
 ) -> Result<WorkflowNode> {
-    let (_, _, mut definition) = run_definition(scope, run_id)?;
+    let (original_run, definition_path, mut definition) = run_definition(scope, run_id)?;
+    let previous_revision = original_run
+        .revision
+        .as_deref()
+        .context("run has no revision")?;
+    let affected = downstream_nodes(&definition, node_id);
     let step = definition
         .steps
         .iter_mut()
@@ -662,44 +884,52 @@ pub fn edit_run_node(
     if let Some(value) = edit.judge_policy {
         step.judge_policy = value;
     }
-    save(config, scope, &definition)?;
-
     let step = definition
         .steps
         .iter()
         .find(|step| step.name == node_id)
-        .expect("edited step remains");
-    state::update(&state::resolve_scope(scope)?, |workspace| {
-        let run = workspace
-            .runs
-            .iter_mut()
-            .find(|run| run.id == run_id)
-            .with_context(|| format!("unknown run: {run_id}"))?;
-        let node = run
-            .nodes
-            .iter_mut()
-            .find(|node| node.id == node_id)
-            .with_context(|| format!("unknown node: {node_id}"))?;
-        node.goal.clone_from(&step.goal);
-        node.expected_output.clone_from(&step.expected_output);
-        node.success_criteria.clone_from(&step.success_criteria);
-        if let Some(value) = &step.runtime.harness {
-            node.harness.clone_from(value);
-        }
-        node.model.clone_from(&step.runtime.model);
-        node.execution.clone_from(&step.runtime.execution);
-        node.judge_policy = step.judge_policy;
-        node.updated_at = Utc::now();
-        run.updated_at = Utc::now();
-        Ok(node.clone())
-    })
+        .expect("edited step remains")
+        .clone();
+    let scope = state::resolve_scope(scope)?;
+    update_run_definition(
+        config,
+        &scope,
+        run_id,
+        &definition_path,
+        previous_revision,
+        &definition,
+        |run| {
+            reset_unstarted_nodes(run, &affected)?;
+            let node = run
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == node_id)
+                .with_context(|| format!("unknown node: {node_id}"))?;
+            node.goal.clone_from(&step.goal);
+            node.expected_output.clone_from(&step.expected_output);
+            node.success_criteria.clone_from(&step.success_criteria);
+            if let Some(value) = &step.runtime.harness {
+                node.harness.clone_from(value);
+            }
+            node.model.clone_from(&step.runtime.model);
+            node.execution.clone_from(&step.runtime.execution);
+            node.judge_policy = step.judge_policy;
+            node.updated_at = Utc::now();
+            Ok(node.clone())
+        },
+    )
 }
 
 pub fn delete_run_node(config: &Config, scope: &Path, run_id: &str, node_id: &str) -> Result<()> {
-    let (_, _, mut definition) = run_definition(scope, run_id)?;
+    let (original_run, definition_path, mut definition) = run_definition(scope, run_id)?;
+    let previous_revision = original_run
+        .revision
+        .as_deref()
+        .context("run has no revision")?;
     if !definition.steps.iter().any(|step| step.name == node_id) {
         bail!("unknown node: {node_id}");
     }
+    let affected = downstream_nodes(&definition, node_id);
     definition.steps.retain(|step| step.name != node_id);
     for step in &mut definition.steps {
         step.depends_on.retain(|dependency| dependency != node_id);
@@ -726,19 +956,22 @@ pub fn delete_run_node(config: &Config, scope: &Path, run_id: &str, node_id: &st
             .map(|step| step.name.clone())
             .unwrap_or_default();
     }
-    save(config, scope, &definition)?;
-    state::update(&state::resolve_scope(scope)?, |workspace| {
-        let run = workspace
-            .runs
-            .iter_mut()
-            .find(|run| run.id == run_id)
-            .with_context(|| format!("unknown run: {run_id}"))?;
-        run.nodes.retain(|node| node.id != node_id);
-        run.edges
-            .retain(|edge| edge.from != node_id && edge.to != node_id);
-        run.updated_at = Utc::now();
-        Ok(())
-    })
+    let scope = state::resolve_scope(scope)?;
+    update_run_definition(
+        config,
+        &scope,
+        run_id,
+        &definition_path,
+        previous_revision,
+        &definition,
+        |run| {
+            reset_unstarted_nodes(run, &affected)?;
+            run.nodes.retain(|node| node.id != node_id);
+            run.edges
+                .retain(|edge| edge.from != node_id && edge.to != node_id);
+            Ok(())
+        },
+    )
 }
 
 pub fn set_run_dependency(
@@ -752,7 +985,11 @@ pub fn set_run_dependency(
     if node_id == dependency {
         bail!("a node cannot depend on itself");
     }
-    let (_, _, mut definition) = run_definition(scope, run_id)?;
+    let (original_run, definition_path, mut definition) = run_definition(scope, run_id)?;
+    let previous_revision = original_run
+        .revision
+        .as_deref()
+        .context("run has no revision")?;
     if !definition.steps.iter().any(|step| step.name == dependency) {
         bail!("unknown dependency: {dependency}");
     }
@@ -766,31 +1003,35 @@ pub fn set_run_dependency(
         step.depends_on.push(dependency.into());
     }
     let _ = plan(config, scope, &definition)?;
-    save(config, scope, &definition)?;
-    state::update(&state::resolve_scope(scope)?, |workspace| {
-        let run = workspace
-            .runs
-            .iter_mut()
-            .find(|run| run.id == run_id)
-            .with_context(|| format!("unknown run: {run_id}"))?;
-        run.edges
-            .retain(|edge| !(edge.to == node_id && edge.relationship == "depends_on"));
-        run.edges.extend(
-            definition
-                .steps
-                .iter()
-                .find(|step| step.name == node_id)
-                .into_iter()
-                .flat_map(|step| step.depends_on.iter())
-                .map(|from| WorkflowEdge {
-                    from: from.clone(),
-                    to: node_id.into(),
-                    relationship: "depends_on".into(),
-                }),
-        );
-        run.updated_at = Utc::now();
-        Ok(())
-    })
+    let affected = downstream_nodes(&definition, node_id);
+    let scope = state::resolve_scope(scope)?;
+    update_run_definition(
+        config,
+        &scope,
+        run_id,
+        &definition_path,
+        previous_revision,
+        &definition,
+        |run| {
+            reset_unstarted_nodes(run, &affected)?;
+            run.edges
+                .retain(|edge| !(edge.to == node_id && edge.relationship == "depends_on"));
+            run.edges.extend(
+                definition
+                    .steps
+                    .iter()
+                    .find(|step| step.name == node_id)
+                    .into_iter()
+                    .flat_map(|step| step.depends_on.iter())
+                    .map(|from| WorkflowEdge {
+                        from: from.clone(),
+                        to: node_id.into(),
+                        relationship: "depends_on".into(),
+                    }),
+            );
+            Ok(())
+        },
+    )
 }
 
 pub fn init(config: &Config, scope: &Path, name: &str, harness: Option<&str>) -> Result<PathBuf> {
@@ -906,27 +1147,22 @@ pub struct PlannedStep {
     pub depends_on: Vec<String>,
 }
 
-pub fn plan(config: &Config, scope: &Path, definition: &Definition) -> Result<Plan> {
-    let revision = config
-        .workflows
-        .repository
-        .join(".git")
-        .exists()
-        .then(|| {
-            run_git(
-                &config.workflows.repository,
-                ["rev-parse", "--short", "HEAD"],
-            )
-            .ok()
-        })
-        .flatten()
-        .map(|value| value.trim().to_owned());
-    let gates: BTreeSet<_> = definition
+fn approval_required(definition: &Definition, step: &Step) -> bool {
+    let explicitly_gated = definition
         .approval
         .gates
         .iter()
-        .map(|gate| gate.before.as_str())
-        .collect();
+        .any(|gate| gate.before == step.name);
+    matches!(step.r#type, StepKind::HumanGate)
+        || match definition.approval.mode {
+            ApprovalMode::Autonomous => false,
+            ApprovalMode::ApprovalGated => step.requires_approval || explicitly_gated,
+            ApprovalMode::Supervised => true,
+        }
+}
+
+pub fn plan(_config: &Config, _scope: &Path, definition: &Definition) -> Result<Plan> {
+    let revision = Some(definition_revision(definition)?);
     let steps = definition
         .steps
         .iter()
@@ -949,24 +1185,19 @@ pub fn plan(config: &Config, scope: &Path, definition: &Definition) -> Result<Pl
                 .clone()
                 .or_else(|| definition.defaults.runtime.execution.clone()),
             judge_policy: step.judge_policy,
-            approval_required: match definition.approval.mode {
-                ApprovalMode::Autonomous => false,
-                ApprovalMode::ApprovalGated => true,
-                ApprovalMode::Supervised => {
-                    step.requires_approval || gates.contains(step.name.as_str())
-                }
-            },
-            depends_on: step.depends_on.clone(),
+            approval_required: approval_required(definition, step),
+            depends_on: effective_dependencies(definition, step),
         })
         .collect::<Vec<_>>();
     let mut unresolved: BTreeSet<_> = steps.iter().map(|step| step.name.clone()).collect();
-    let mut resolved = definition
-        .parallel
-        .iter()
-        .map(|group| group.name.clone())
-        .collect::<BTreeSet<_>>();
+    let mut resolved = BTreeSet::new();
     let mut waves = Vec::new();
     while !unresolved.is_empty() {
+        for group in &definition.parallel {
+            if group.agents.iter().all(|member| resolved.contains(member)) {
+                resolved.insert(group.name.clone());
+            }
+        }
         let wave: Vec<_> = unresolved
             .iter()
             .filter(|name| {
@@ -996,7 +1227,6 @@ pub fn plan(config: &Config, scope: &Path, definition: &Definition) -> Result<Pl
             unresolved.into_iter().collect::<Vec<_>>().join(", ")
         );
     }
-    let _ = scope;
     Ok(Plan {
         name: definition.name.clone(),
         revision,
@@ -1027,7 +1257,8 @@ fn materialize_with_parent(
     let scope = state::resolve_scope(scope)?;
     let definition_path = fs::canonicalize(definition_path)
         .with_context(|| format!("resolve workflow definition {}", definition_path.display()))?;
-    let definition = load(&definition_path)?;
+    let mut definition = load(&definition_path)?;
+    pin_relative_workflow_references(&mut definition, &definition_path)?;
     let planned = plan(config, &scope, &definition)?;
     let snapshot = state::read(&scope)?;
     let orchestrator = snapshot
@@ -1036,6 +1267,7 @@ fn materialize_with_parent(
     require_orchestrator(orchestrator)?;
     let now = Utc::now();
     let run_id = format!("run-{}", &Uuid::new_v4().to_string()[..12]);
+    let materialized_definition = materialize_definition_snapshot(&scope, &run_id, &definition)?;
     let entry_members = definition
         .parallel
         .iter()
@@ -1115,10 +1347,7 @@ fn materialize_with_parent(
                 .map(|route| WorkflowEdge {
                     from: step.name.clone(),
                     to: route.to.clone(),
-                    relationship: route
-                        .when
-                        .as_ref()
-                        .map_or_else(|| "routes".into(), |when| format!("when {when}")),
+                    relationship: route_relationship(&definition, step, route),
                 }),
         );
     }
@@ -1148,7 +1377,7 @@ fn materialize_with_parent(
         status: LifecycleStatus::Queued,
         orchestrator_id: Some(orchestrator.id.clone()),
         parent_run_id: parent_run_id.map(str::to_owned),
-        definition: Some(definition_path.display().to_string()),
+        definition: Some(materialized_definition.display().to_string()),
         revision: planned.revision,
         checkpoint: None,
         mode,
@@ -1211,30 +1440,22 @@ fn require_orchestrator(session: &Session) -> Result<()> {
     Ok(())
 }
 
-fn required_gate(
-    definition: &Definition,
-    step: &Step,
-    run: &WorkflowRun,
-    autonomy: AutonomyMode,
-) -> Option<PendingGate> {
+fn required_gate(definition: &Definition, step: &Step, run: &WorkflowRun) -> Option<PendingGate> {
     let explicit = definition
         .approval
         .gates
         .iter()
         .find(|gate| gate.before == step.name);
-    let required = matches!(step.r#type, StepKind::HumanGate)
-        || match autonomy {
-            AutonomyMode::Supervised => true,
-            AutonomyMode::ApprovalGated => step.requires_approval || explicit.is_some(),
-            AutonomyMode::Autonomous => false,
-        };
-    if !required {
+    if !approval_required(definition, step) {
         return None;
     }
     let id = explicit
         .map(|gate| gate.id.clone())
         .unwrap_or_else(|| format!("{}:{}", definition.name, step.name));
-    if run.approved_gates.contains(&id) {
+    if run
+        .approved_gates
+        .contains(&gate_approval_key(&id, run.revision.as_deref()))
+    {
         return None;
     }
     Some(PendingGate {
@@ -1244,9 +1465,14 @@ fn required_gate(
             || format!("Approve {} before execution", step.name),
             |gate| gate.reason.clone(),
         ),
+        authority: explicit.map_or(GateAuthority::User, |gate| gate.authority),
         recommendation: None,
         created_at: Utc::now(),
     })
+}
+
+fn gate_approval_key(id: &str, revision: Option<&str>) -> String {
+    revision.map_or_else(|| id.to_owned(), |revision| format!("{revision}:{id}"))
 }
 
 fn dependency_succeeded(run: &WorkflowRun, dependency: &str) -> bool {
@@ -1310,9 +1536,23 @@ fn definition_dependency_succeeded(
 }
 
 fn runtime_dependencies_done(definition: &Definition, run: &WorkflowRun, step: &Step) -> bool {
-    step.depends_on
+    effective_dependencies(definition, step)
         .iter()
         .all(|dependency| definition_dependency_succeeded(definition, run, dependency))
+}
+
+fn effective_dependencies(definition: &Definition, step: &Step) -> Vec<String> {
+    let mut dependencies = step.depends_on.clone();
+    dependencies.extend(
+        definition
+            .steps
+            .iter()
+            .filter(|candidate| candidate.review_by.as_deref() == Some(step.name.as_str()))
+            .map(|candidate| candidate.name.clone()),
+    );
+    dependencies.sort();
+    dependencies.dedup();
+    dependencies
 }
 
 fn route_context(definition: &Definition, run: &WorkflowRun, source: &str) -> serde_json::Value {
@@ -1408,6 +1648,24 @@ fn selected_route<'a>(
     Ok(None)
 }
 
+fn is_review_feedback(definition: &Definition, reviewer: &str, target: &str) -> bool {
+    definition
+        .steps
+        .iter()
+        .any(|step| step.name == target && step.review_by.as_deref() == Some(reviewer))
+}
+
+fn route_relationship(definition: &Definition, source: &Step, route: &Route) -> String {
+    if is_review_feedback(definition, &source.name, &route.to) {
+        "feedback".into()
+    } else {
+        route
+            .when
+            .as_ref()
+            .map_or_else(|| "routes".into(), |when| format!("when {when}"))
+    }
+}
+
 fn iteration_count(run: &WorkflowRun) -> u32 {
     run.nodes
         .iter()
@@ -1458,6 +1716,30 @@ fn activate_target(run: &mut WorkflowRun, definition: &Definition, target: &str)
             node.retry_after = None;
             node.updated_at = Utc::now();
         }
+    }
+}
+
+fn prepare_feedback_review(
+    run: &mut WorkflowRun,
+    definition: &Definition,
+    reviewer: &str,
+    target: &str,
+) {
+    if !is_review_feedback(definition, reviewer, target) {
+        return;
+    }
+    if let Some(node) = run
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == reviewer && node.status == LifecycleStatus::Done)
+    {
+        node.status = LifecycleStatus::Pending;
+        node.retry_after = None;
+        node.updated_at = Utc::now();
+        node.record_activity(
+            "feedback",
+            format!("requested another review after {target}"),
+        );
     }
 }
 
@@ -1525,7 +1807,10 @@ fn advance_state(run: &mut WorkflowRun, definition: &Definition) -> Result<bool>
                 break;
             }
             Some("self") => activate_target(run, definition, &source),
-            Some(target) => activate_target(run, definition, target),
+            Some(target) => {
+                activate_target(run, definition, target);
+                prepare_feedback_review(run, definition, &source, target);
+            }
             None => {}
         }
     }
@@ -1555,7 +1840,7 @@ fn advance_state(run: &mut WorkflowRun, definition: &Definition) -> Result<bool>
             .steps
             .iter()
             .filter(|step| {
-                !step.depends_on.is_empty()
+                !effective_dependencies(definition, step).is_empty()
                     && !routed_targets.contains(step.name.as_str())
                     && !group_members.contains(step.name.as_str())
                     && run
@@ -1655,6 +1940,7 @@ fn fail_run_with_reason(
         run.current_node = None;
         run.process_id = None;
         run.execution_nonce = None;
+        run.pending_gates.clear();
         run.updated_at = Utc::now();
         Ok(run.clone())
     })
@@ -1761,6 +2047,60 @@ fn run_cancelled(
 
 const EXECUTION_LEASE_ENV: &str = "ORC_EXECUTION_LEASE";
 const EXECUTION_RECOVERY_ENV: &str = "ORC_EXECUTION_RECOVERY";
+const DISPLAY_DIRECTION_ENV: &str = "ORC_DISPLAY_DIRECTION";
+const DEFAULT_DISPLAY_DIRECTION: &str = "right";
+
+fn validate_display_direction(direction: &str) -> Result<()> {
+    if matches!(direction, "right" | "left" | "top" | "bottom") {
+        return Ok(());
+    }
+    bail!("display direction must be right, left, top, or bottom")
+}
+
+fn display_direction_path(scope: &Path, run_id: &str) -> PathBuf {
+    crate::config::state_home()
+        .join("orc/run-preferences")
+        .join(state::scope_key(scope))
+        .join(format!("{}.direction", state::scope_key(Path::new(run_id))))
+}
+
+fn write_display_direction(scope: &Path, run_id: &str, direction: &str) -> Result<()> {
+    validate_display_direction(direction)?;
+    let path = display_direction_path(scope, run_id);
+    fs::create_dir_all(
+        path.parent()
+            .context("display direction has no directory")?,
+    )?;
+    fs::write(&path, direction)
+        .with_context(|| format!("write display direction {}", path.display()))
+}
+
+fn read_display_direction(scope: &Path, run_id: &str) -> Result<String> {
+    let path = display_direction_path(scope, run_id);
+    let direction = match fs::read_to_string(&path) {
+        Ok(direction) => direction,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DEFAULT_DISPLAY_DIRECTION.into());
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read display direction {}", path.display()));
+        }
+    };
+    validate_display_direction(&direction)?;
+    Ok(direction)
+}
+
+fn execution_display_direction(scope: &Path, run_id: &str) -> Result<String> {
+    match std::env::var(DISPLAY_DIRECTION_ENV) {
+        Ok(direction) => {
+            validate_display_direction(&direction)?;
+            Ok(direction)
+        }
+        Err(std::env::VarError::NotPresent) => read_display_direction(scope, run_id),
+        Err(error) => Err(error).context("read workflow display direction"),
+    }
+}
 
 struct ExecutionLease {
     path: PathBuf,
@@ -2114,6 +2454,39 @@ struct StepExecution<'a> {
     definition: &'a Definition,
     tracker_directory: &'a Path,
     workflow_deadline: Option<DateTime<Utc>>,
+    display_direction: &'a str,
+}
+
+struct AgentLaunchRequest<'a> {
+    scope: &'a Path,
+    session: &'a Session,
+    harness: &'a str,
+    prompt: &'a str,
+    native_id: &'a str,
+    run: &'a WorkflowRun,
+    step: &'a Step,
+    direction: &'a str,
+}
+
+fn agent_launch_request(request: AgentLaunchRequest<'_>) -> serde_json::Value {
+    json!({
+        "version": "orc.provider/v1",
+        "action": "launch",
+        "scope": request.scope,
+        "direction": request.direction,
+        "session": request.session,
+        "command": [request.harness, request.prompt],
+        "prompt": request.prompt,
+        "environment": {
+            "ORC_SCOPE": request.scope,
+            "ORC_SESSION_ID": request.session.id,
+            "ORC_NATIVE_SESSION_ID": request.native_id,
+            "ORC_PARENT_SESSION_ID": request.run.orchestrator_id,
+            "ORC_RUN_ID": request.run.id,
+            "ORC_NODE_ID": request.step.name,
+        },
+        "providers": {},
+    })
 }
 
 fn execute_step(context: &StepExecution<'_>, step: &Step) -> Result<StepOutcome> {
@@ -2153,7 +2526,8 @@ Success criteria:
                 )
             });
             let native_id = Uuid::new_v4().to_string();
-            let session = control::register(
+            let session = control::register_managed(
+                config,
                 scope,
                 Contract {
                     harness: harness.clone(),
@@ -2179,22 +2553,15 @@ Success criteria:
                 },
             )?;
             assign_node_session(scope, &run.id, &step.name, &session.id)?;
-            let mut request = json!({
-                "version": "orc.provider/v1",
-                "action": "launch",
-                "scope": scope,
-                "session": session,
-                "command": [harness, prompt],
-                "prompt": prompt,
-                "environment": {
-                    "ORC_SCOPE": scope,
-                    "ORC_SESSION_ID": session.id,
-                    "ORC_NATIVE_SESSION_ID": native_id,
-                    "ORC_PARENT_SESSION_ID": run.orchestrator_id,
-                    "ORC_RUN_ID": run.id,
-                    "ORC_NODE_ID": step.name,
-                },
-                "providers": {},
+            let mut request = agent_launch_request(AgentLaunchRequest {
+                scope,
+                session: &session,
+                harness: &harness,
+                prompt: &prompt,
+                native_id: &native_id,
+                run,
+                step,
+                direction: context.display_direction,
             });
             if let Some(execution) = step.runtime.execution.as_ref().or(definition
                 .defaults
@@ -2375,7 +2742,8 @@ Success criteria:
                     Some(&step.name),
                 )?
             };
-            let (mut child, mut executor) = spawn_executor(scope, &child.id)?;
+            let (mut child, mut executor) =
+                spawn_executor_with_direction(scope, &child.id, context.display_direction)?;
             let expected_process = child.process_id;
             let expected_nonce = child.execution_nonce.clone();
             while matches!(
@@ -2513,6 +2881,7 @@ pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRu
 
 fn execute_owned(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRun> {
     let scope = state::resolve_scope(scope)?;
+    let display_direction = execution_display_direction(&scope, run_id)?;
     let initial = find_run(&scope, run_id)?;
     if !initial.status.active() || initial.status == LifecycleStatus::Terminating {
         return Ok(initial);
@@ -2530,7 +2899,6 @@ fn execute_owned(config: &Config, scope: &Path, run_id: &str) -> Result<Workflow
             provider::ProcessTrackerGuard::acquire(&tracker_directory, Duration::from_secs(5))?;
         clear_process_records(&tracker_directory)?;
     }
-    let autonomy = preferences::read(&scope)?.autonomy;
     state::update(&scope, |workspace| {
         let run = workspace
             .runs
@@ -2571,21 +2939,34 @@ fn execute_owned(config: &Config, scope: &Path, run_id: &str) -> Result<Workflow
                 .context("run has no workflow definition")?,
         );
         let definition = load(&definition_path)?;
+        let revision = definition_revision(&definition)?;
+        if run.revision.as_deref() != Some(revision.as_str()) {
+            bail!(
+                "workflow run definition changed outside Orc; restore revision {} or create a new run",
+                run.revision.as_deref().unwrap_or("unknown")
+            );
+        }
         if let Some(reason) = limit_violation(&definition, &run) {
             let failed = fail_run_with_reason(&scope, run_id, "limit", &reason)?;
             wake_parent(config, &scope, &failed)?;
             return Ok(failed);
         }
-        state::update(&scope, |workspace| {
+        let advanced = state::update(&scope, |workspace| {
             let run = workspace
                 .runs
                 .iter_mut()
                 .find(|run| run.id == run_id)
                 .with_context(|| format!("unknown run: {run_id}"))?;
-            advance_state(run, &definition)?;
+            if run.revision.as_deref() != Some(revision.as_str()) {
+                return Ok(None);
+            }
+            let changed = advance_state(run, &definition)?;
             run.updated_at = Utc::now();
-            Ok(())
+            Ok(Some(changed))
         })?;
+        if advanced.is_none() {
+            continue;
+        }
         let run = find_run(&scope, run_id)?;
         if workflow_complete(&definition, &run) {
             let completed = finish_run(&scope, run_id, LifecycleStatus::Done)?;
@@ -2659,6 +3040,9 @@ fn execute_owned(config: &Config, scope: &Path, run_id: &str) -> Result<Workflow
                     .iter_mut()
                     .find(|run| run.id == run_id)
                     .with_context(|| format!("unknown run: {run_id}"))?;
+                if run.revision.as_deref() != Some(revision.as_str()) {
+                    return Ok(None);
+                }
                 for node in run
                     .nodes
                     .iter_mut()
@@ -2668,8 +3052,11 @@ fn execute_owned(config: &Config, scope: &Path, run_id: &str) -> Result<Workflow
                     node.updated_at = Utc::now();
                     node.record_activity("skipped", "no active route reaches this stage");
                 }
-                Ok(run.clone())
+                Ok(Some(run.clone()))
             })?;
+            let Some(settled) = settled else {
+                continue;
+            };
             if workflow_complete(&definition, &settled) {
                 let completed = finish_run(&scope, run_id, LifecycleStatus::Done)?;
                 wake_parent(config, &scope, &completed)?;
@@ -2681,17 +3068,20 @@ fn execute_owned(config: &Config, scope: &Path, run_id: &str) -> Result<Workflow
         }
         if let Some(gate) = ready
             .iter()
-            .find_map(|step| required_gate(&definition, step, &run, autonomy))
+            .find_map(|step| required_gate(&definition, step, &run))
         {
             let before = gate.before.clone();
-            state::update(&scope, |workspace| {
+            let gate_recorded = state::update(&scope, |workspace| {
                 let run = workspace
                     .runs
                     .iter_mut()
                     .find(|run| run.id == run_id)
                     .context("run disappeared")?;
                 if run.status == LifecycleStatus::Terminating {
-                    return Ok(());
+                    return Ok(false);
+                }
+                if run.revision.as_deref() != Some(revision.as_str()) {
+                    return Ok(false);
                 }
                 run.pending_gates.push(gate.clone());
                 run.status = LifecycleStatus::Waiting;
@@ -2703,8 +3093,11 @@ fn execute_owned(config: &Config, scope: &Path, run_id: &str) -> Result<Workflow
                     node.updated_at = Utc::now();
                     node.record_activity("gate", gate.reason.clone());
                 }
-                Ok(())
+                Ok(true)
             })?;
+            if !gate_recorded {
+                continue;
+            }
             return state::read(&scope)?
                 .runs
                 .into_iter()
@@ -2715,14 +3108,33 @@ fn execute_owned(config: &Config, scope: &Path, run_id: &str) -> Result<Workflow
             .iter()
             .map(|step| step.name.clone())
             .collect::<Vec<_>>();
-        state::update(&scope, |workspace| {
+        let expected_attempts = run
+            .nodes
+            .iter()
+            .filter(|node| names.contains(&node.id))
+            .map(|node| (node.id.clone(), node.attempt + 1))
+            .collect::<BTreeMap<_, _>>();
+        let claimed = state::update(&scope, |workspace| {
             let run = workspace
                 .runs
                 .iter_mut()
                 .find(|run| run.id == run_id)
                 .context("run disappeared")?;
             if !run.status.active() || run.status == LifecycleStatus::Terminating {
-                return Ok(());
+                return Ok(false);
+            }
+            if run.revision.as_deref() != Some(revision.as_str())
+                || names.iter().any(|name| {
+                    run.nodes
+                        .iter()
+                        .find(|node| node.id == *name)
+                        .is_none_or(|node| {
+                            node.status != LifecycleStatus::Queued
+                                || expected_attempts.get(name) != Some(&(node.attempt + 1))
+                        })
+                })
+            {
+                return Ok(false);
             }
             run.status = LifecycleStatus::Working;
             run.current_node = names.first().cloned();
@@ -2733,8 +3145,11 @@ fn execute_owned(config: &Config, scope: &Path, run_id: &str) -> Result<Workflow
                 node.updated_at = Utc::now();
                 node.record_activity("started", format!("attempt {} started", node.attempt));
             }
-            Ok(())
+            Ok(true)
         })?;
+        if !claimed {
+            continue;
+        }
         let execution = StepExecution {
             config,
             providers: &providers,
@@ -2744,6 +3159,7 @@ fn execute_owned(config: &Config, scope: &Path, run_id: &str) -> Result<Workflow
             definition: &definition,
             tracker_directory: &tracker_directory,
             workflow_deadline: workflow_deadline(&definition, &run),
+            display_direction: &display_direction,
         };
         let wave_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let results = thread::scope(|thread_scope| {
@@ -2803,6 +3219,11 @@ fn execute_owned(config: &Config, scope: &Path, run_id: &str) -> Result<Workflow
                     .iter_mut()
                     .find(|node| node.id == *name)
                     .context("workflow node disappeared")?;
+                if node.status != LifecycleStatus::Working
+                    || expected_attempts.get(name) != Some(&node.attempt)
+                {
+                    continue;
+                }
                 match result {
                     Ok(outcome) => {
                         node.status = outcome.status;
@@ -2949,6 +3370,9 @@ fn finish_run(scope: &Path, run_id: &str, status: LifecycleStatus) -> Result<Wor
         if run.status == LifecycleStatus::Terminating {
             return Ok(run.clone());
         }
+        if !run.status.active() {
+            bail!("run cannot finish while {}", run.status);
+        }
         run.status = status;
         run.current_node = None;
         run.process_id = None;
@@ -2988,32 +3412,89 @@ pub fn approve(
     gate_id: Option<&str>,
     resume: bool,
 ) -> Result<WorkflowRun> {
+    approve_as(config, scope, run_id, gate_id, resume, ApprovalActor::User)
+}
+
+pub fn approve_as(
+    config: &Config,
+    scope: &Path,
+    run_id: &str,
+    gate_id: Option<&str>,
+    resume: bool,
+    actor: ApprovalActor,
+) -> Result<WorkflowRun> {
     let scope = state::resolve_scope(scope)?;
-    let run = state::update(&scope, |workspace| {
+    let initial = find_run(&scope, run_id)?;
+    if initial.status == LifecycleStatus::Terminating {
+        return Ok(initial);
+    }
+    let (_, _, _definition) = run_definition(&scope, run_id)?;
+    let (run, completed) = state::update(&scope, |workspace| {
         let run = workspace
             .runs
             .iter_mut()
             .find(|run| run.id == run_id)
             .with_context(|| format!("unknown run: {run_id}"))?;
         if run.status == LifecycleStatus::Terminating {
-            return Ok(run.clone());
+            return Ok((run.clone(), false));
+        }
+        if !run.status.active() {
+            bail!("run cannot approve a gate while {}", run.status);
         }
         let index = run
             .pending_gates
             .iter()
             .position(|gate| gate_id.is_none_or(|id| gate.id == id))
             .context("run has no matching pending gate")?;
-        let gate = run.pending_gates.remove(index);
-        run.approved_gates.push(gate.id);
+        let gate = run.pending_gates[index].clone();
+        let approval_key = gate_approval_key(&gate.id, run.revision.as_deref());
+        let orchestrator_key = format!("{approval_key}:orchestrator");
+        let completed = match (gate.authority, actor) {
+            (GateAuthority::User, ApprovalActor::Orchestrator) => {
+                bail!("gate {} requires user approval", gate.id)
+            }
+            (GateAuthority::Orchestrator, ApprovalActor::User) => {
+                bail!("gate {} requires orchestrator approval", gate.id)
+            }
+            (GateAuthority::OrchestratorThenUser, ApprovalActor::Orchestrator) => {
+                if !run.approved_gates.contains(&orchestrator_key) {
+                    run.approved_gates.push(orchestrator_key);
+                }
+                if let Some(node) = run.nodes.iter_mut().find(|node| node.id == gate.before) {
+                    node.record_activity(
+                        "approved",
+                        "orchestrator approved; user approval remains",
+                    );
+                }
+                run.updated_at = Utc::now();
+                false
+            }
+            (GateAuthority::OrchestratorThenUser, ApprovalActor::User) => {
+                if !run.approved_gates.contains(&orchestrator_key) {
+                    bail!(
+                        "gate {} requires orchestrator approval before user approval",
+                        gate.id
+                    );
+                }
+                run.approved_gates.retain(|key| key != &orchestrator_key);
+                true
+            }
+            _ => true,
+        };
+        if !completed {
+            return Ok((run.clone(), false));
+        }
+        run.pending_gates.remove(index);
+        run.approved_gates.push(approval_key);
         if let Some(node) = run.nodes.iter_mut().find(|node| node.id == gate.before) {
             node.status = LifecycleStatus::Queued;
             node.record_activity("approved", "gate approved");
         }
         run.status = LifecycleStatus::Queued;
         run.updated_at = Utc::now();
-        Ok(run.clone())
+        Ok((run.clone(), true))
     })?;
-    if resume {
+    if resume && completed {
         execute(config, &scope, run_id)
     } else {
         Ok(run)
@@ -3023,10 +3504,7 @@ pub fn approve(
 pub fn cancel(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRun> {
     let scope = state::resolve_scope(scope)?;
     let initial = find_run(&scope, run_id)?;
-    if matches!(
-        initial.status,
-        LifecycleStatus::Done | LifecycleStatus::Archived
-    ) {
+    if !initial.status.active() {
         return Ok(initial);
     }
     daemon::ensure_running(config)?;
@@ -3104,13 +3582,11 @@ pub fn cancel(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRun
             session.updated_at = Utc::now();
         }
         let now = Utc::now();
-        for run in workspace.runs.iter_mut().filter(|run| {
-            run_ids.contains(&run.id)
-                && !matches!(
-                    run.status,
-                    LifecycleStatus::Done | LifecycleStatus::Archived
-                )
-        }) {
+        for run in workspace
+            .runs
+            .iter_mut()
+            .filter(|run| run_ids.contains(&run.id) && run.status.active())
+        {
             for node in run.nodes.iter_mut().filter(|node| node.status.active()) {
                 node.status = LifecycleStatus::Cancelled;
                 node.updated_at = now;
@@ -3426,8 +3902,21 @@ pub fn fail(
 }
 
 pub fn spawn(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRun> {
+    let scope = state::resolve_scope(scope)?;
+    let direction = read_display_direction(&scope, run_id)?;
+    spawn_with_direction(config, &scope, run_id, &direction)
+}
+
+pub fn spawn_with_direction(
+    config: &Config,
+    scope: &Path,
+    run_id: &str,
+    direction: &str,
+) -> Result<WorkflowRun> {
+    validate_display_direction(direction)?;
     daemon::ensure_running(config)?;
-    let (run, executor) = spawn_executor(scope, run_id)?;
+    let scope = state::resolve_scope(scope)?;
+    let (run, executor) = spawn_executor_with_direction(&scope, run_id, direction)?;
     if let Some(mut executor) = executor {
         thread::spawn(move || {
             let _ = executor.wait();
@@ -3450,11 +3939,23 @@ pub(crate) fn executor_active(scope: &Path, run: &WorkflowRun) -> Result<bool> {
     Ok(record.process_id == process_id && record.nonce == nonce)
 }
 
+#[cfg(not(test))]
 fn spawn_executor(
     scope: &Path,
     run_id: &str,
 ) -> Result<(WorkflowRun, Option<std::process::Child>)> {
     let scope = state::resolve_scope(scope)?;
+    let direction = read_display_direction(&scope, run_id)?;
+    spawn_executor_with_direction(&scope, run_id, &direction)
+}
+
+fn spawn_executor_with_direction(
+    scope: &Path,
+    run_id: &str,
+    direction: &str,
+) -> Result<(WorkflowRun, Option<std::process::Child>)> {
+    let scope = state::resolve_scope(scope)?;
+    write_display_direction(&scope, run_id, direction)?;
     let initial = find_run(&scope, run_id)?;
     if !initial.status.active() || initial.status == LifecycleStatus::Terminating {
         return Ok((initial, None));
@@ -3485,7 +3986,8 @@ fn spawn_executor(
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(stderr)
-        .env(EXECUTION_LEASE_ENV, &lease.nonce);
+        .env(EXECUTION_LEASE_ENV, &lease.nonce)
+        .env(DISPLAY_DIRECTION_ENV, direction);
     if initial.process_id.is_some() {
         command.env(EXECUTION_RECOVERY_ENV, "1");
     }
@@ -3582,7 +4084,13 @@ if [ "${1:-}" = stop ]; then
   : > "$2"
   exit 0
 fi
-cat >/dev/null
+request=$(cat)
+case "$request" in
+  *session.bind*)
+    printf '%s\n' '{"version":"orc.provider/v1","binding":{"kind":"persistence","status":"active","ref":"stop-test"}}'
+    exit 0
+    ;;
+esac
 cat <<'JSON'
 {{ plan }}
 JSON
@@ -3592,6 +4100,7 @@ JSON
 name: stop-test
 command: {{ command }}
 actions:
+  session.bind: Bind a test session
   session.stop: Stop a test session
 "#;
 
@@ -3663,18 +4172,14 @@ actions:
             },
         )
         .expect("register orchestrator");
-        preferences::write(
-            &scope,
-            &preferences::WorkspacePreferences {
-                autonomy: AutonomyMode::Autonomous,
-                ..preferences::WorkspacePreferences::default()
-            },
-        )
-        .expect("write autonomous preferences");
         let definition = Definition {
             name: "concurrent".into(),
             goal: "execute one wave once".into(),
             entry_point: "wait".into(),
+            approval: ApprovalPolicy {
+                mode: ApprovalMode::Autonomous,
+                ..ApprovalPolicy::default()
+            },
             steps: vec![Step {
                 name: "wait".into(),
                 r#type: StepKind::Wait,
@@ -3700,10 +4205,12 @@ actions:
         scope: &Path,
         definition: &Definition,
     ) -> WorkflowRun {
+        let mut definition = definition.clone();
+        definition.approval.mode = ApprovalMode::Autonomous;
         let path = directory.path().join(format!("{}.yaml", definition.name));
         fs::write(
             &path,
-            serde_yaml::to_string(definition).expect("serialize workflow"),
+            serde_yaml::to_string(&definition).expect("serialize workflow"),
         )
         .expect("write workflow");
         materialize(config, scope, &path, RunMode::Foreground).expect("materialize workflow")
@@ -4109,9 +4616,247 @@ actions:
     }
 
     fn remove_fixture_state(scope: &Path, run_id: &str) {
+        let _ = fs::remove_file(materialized_definition_path(scope, run_id));
         let _ = fs::remove_file(state::path(scope));
         let _ = fs::remove_file(preferences::path(scope));
         let _ = fs::remove_file(execution_lease_path(scope, run_id));
+        let _ = fs::remove_file(display_direction_path(scope, run_id));
+    }
+
+    #[test]
+    fn launch_direction_is_persisted_and_sent_to_the_provider() {
+        let (_directory, _config, scope, run) = workflow_fixture("1ms");
+        let session = state::read(&scope).expect("workspace").sessions[0].clone();
+        let step = Step {
+            name: "worker".into(),
+            ..Step::default()
+        };
+
+        write_display_direction(&scope, &run.id, "bottom").expect("save display direction");
+        let request = agent_launch_request(AgentLaunchRequest {
+            scope: &scope,
+            session: &session,
+            harness: "codex",
+            prompt: "perform the task",
+            native_id: "native-worker",
+            run: &run,
+            step: &step,
+            direction: &read_display_direction(&scope, &run.id).expect("display direction"),
+        });
+
+        assert_eq!(request["direction"], "bottom");
+        assert_eq!(read_display_direction(&scope, &run.id).unwrap(), "bottom");
+        assert!(write_display_direction(&scope, &run.id, "diagonal").is_err());
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn external_run_edits_update_the_executed_definition_and_invalidate_gates() {
+        let (_directory, config, scope, run) = workflow_fixture("1ms");
+        let definition_path = PathBuf::from(run.definition.as_deref().expect("definition path"));
+        state::update(&scope, |workspace| {
+            let run = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            run.pending_gates.push(PendingGate {
+                id: "before-wait".into(),
+                before: "wait".into(),
+                reason: "review wait".into(),
+                authority: GateAuthority::User,
+                recommendation: None,
+                created_at: Utc::now(),
+            });
+            run.approved_gates.push("before-wait".into());
+            Ok(())
+        })
+        .expect("seed stale approvals");
+
+        edit_run_node(
+            &config,
+            &scope,
+            &run.id,
+            "wait",
+            NodeEdit {
+                goal: Some("use the edited external definition".into()),
+                ..NodeEdit::default()
+            },
+        )
+        .expect("edit external workflow node");
+
+        let definition = load(&definition_path).expect("load executed definition");
+        let current = find_run(&scope, &run.id).expect("edited run");
+        assert_eq!(
+            definition.steps[0].goal,
+            "use the edited external definition"
+        );
+        assert!(!config.workflows.repository.exists());
+        assert_ne!(current.revision, run.revision);
+        assert!(current.pending_gates.is_empty());
+        assert!(current.approved_gates.is_empty());
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn dependency_edits_invalidate_gate_approvals() {
+        let (directory, config, scope, fixture_run) = workflow_fixture("1ms");
+        let definition = Definition {
+            name: "dependency-edit".into(),
+            goal: "change a dependency safely".into(),
+            entry_point: "first".into(),
+            steps: vec![set_step("first"), set_step("second")],
+            ..Definition::default()
+        };
+        let run = materialize_definition(&directory, &config, &scope, &definition);
+        state::update(&scope, |workspace| {
+            let run = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            run.pending_gates.push(PendingGate {
+                id: "before-second".into(),
+                before: "second".into(),
+                reason: "review dependency".into(),
+                authority: GateAuthority::User,
+                recommendation: None,
+                created_at: Utc::now(),
+            });
+            run.approved_gates.push("before-second".into());
+            Ok(())
+        })
+        .expect("seed stale approvals");
+
+        set_run_dependency(&config, &scope, &run.id, "second", "first", true)
+            .expect("edit dependency");
+
+        let current = find_run(&scope, &run.id).expect("edited run");
+        assert_ne!(current.revision, run.revision);
+        assert!(current.pending_gates.is_empty());
+        assert!(current.approved_gates.is_empty());
+        remove_fixture_state(&scope, &run.id);
+        remove_fixture_state(&scope, &fixture_run.id);
+    }
+
+    #[test]
+    fn run_edits_reject_working_and_terminal_nodes() {
+        for status in [LifecycleStatus::Working, LifecycleStatus::Done] {
+            let (directory, config, scope, fixture_run) = workflow_fixture("1ms");
+            let definition = Definition {
+                name: format!("locked-{status}"),
+                goal: "protect an executed contract".into(),
+                entry_point: "first".into(),
+                steps: vec![set_step("first"), set_step("second")],
+                ..Definition::default()
+            };
+            let run = materialize_definition(&directory, &config, &scope, &definition);
+            state::update(&scope, |workspace| {
+                let node = workspace
+                    .runs
+                    .iter_mut()
+                    .find(|candidate| candidate.id == run.id)
+                    .expect("run")
+                    .nodes
+                    .iter_mut()
+                    .find(|node| node.id == "second")
+                    .expect("second node");
+                node.status = status;
+                node.attempt = 1;
+                Ok(())
+            })
+            .expect("mark node started");
+            let before = fs::read(run.definition.as_deref().expect("definition")).expect("before");
+
+            for error in [
+                edit_run_node(
+                    &config,
+                    &scope,
+                    &run.id,
+                    "second",
+                    NodeEdit {
+                        goal: Some("changed".into()),
+                        ..NodeEdit::default()
+                    },
+                )
+                .expect_err("started node cannot be edited"),
+                delete_run_node(&config, &scope, &run.id, "second")
+                    .expect_err("started node cannot be deleted"),
+                set_run_dependency(&config, &scope, &run.id, "second", "first", true)
+                    .expect_err("started node dependencies cannot change"),
+            ] {
+                assert!(error.to_string().contains("restart-from-node"));
+            }
+            assert_eq!(
+                fs::read(run.definition.as_deref().expect("definition")).expect("after"),
+                before
+            );
+            remove_fixture_state(&scope, &run.id);
+            remove_fixture_state(&scope, &fixture_run.id);
+        }
+    }
+
+    #[test]
+    fn catalog_workflow_edits_do_not_relabel_existing_runs() {
+        let (directory, config, scope, run) = workflow_fixture("1ms");
+        let catalog_path = directory.path().join("workflow.yaml");
+        let mut definition = load(&catalog_path).expect("catalog workflow");
+        definition.goal = "edited workflow goal".into();
+        fs::write(
+            &catalog_path,
+            serde_yaml::to_string(&definition).expect("serialize workflow"),
+        )
+        .expect("write workflow");
+
+        let completed = execute(&config, &scope, &run.id).expect("execute pinned run");
+
+        assert_eq!(completed.status, LifecycleStatus::Done);
+        assert_eq!(completed.goal, run.goal);
+        assert_eq!(completed.revision, run.revision);
+        assert_ne!(completed.goal, definition.goal);
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn stale_gate_cannot_be_approved_after_an_external_workflow_edit() {
+        let (_directory, config, scope, run) = workflow_fixture("1ms");
+        let definition_path = PathBuf::from(run.definition.as_deref().expect("definition path"));
+        state::update(&scope, |workspace| {
+            let run = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            run.status = LifecycleStatus::Waiting;
+            run.nodes[0].status = LifecycleStatus::Waiting;
+            run.pending_gates.push(PendingGate {
+                id: "old-gate".into(),
+                before: "wait".into(),
+                reason: "old workflow approval".into(),
+                authority: GateAuthority::User,
+                recommendation: None,
+                created_at: Utc::now(),
+            });
+            Ok(())
+        })
+        .expect("seed stale gate");
+        let mut definition = load(&definition_path).expect("workflow");
+        definition.goal = "new workflow contract".into();
+        fs::write(
+            &definition_path,
+            serde_yaml::to_string(&definition).expect("serialize workflow"),
+        )
+        .expect("write workflow");
+
+        let error = approve(&config, &scope, &run.id, Some("old-gate"), false)
+            .expect_err("reject an externally changed materialized definition");
+
+        assert!(error.to_string().contains("changed outside Orc"));
+        let current = find_run(&scope, &run.id).expect("unchanged run");
+        assert_eq!(current.revision, run.revision);
+        assert_eq!(current.pending_gates.len(), 1);
+        assert!(current.approved_gates.is_empty());
+        remove_fixture_state(&scope, &run.id);
     }
 
     #[test]
@@ -4149,6 +4894,359 @@ actions:
         let planned = plan(&config, Path::new("."), &definition).unwrap();
         assert_eq!(planned.waves[0].len(), 2);
         assert_eq!(planned.waves[1], vec!["c"]);
+    }
+
+    #[test]
+    fn workflow_stages_cannot_claim_the_orchestrator_role() {
+        let definition = Definition {
+            name: "invalid-orchestrator-stage".into(),
+            goal: "keep the orchestrator above the workflow".into(),
+            entry_point: "work".into(),
+            steps: vec![Step {
+                name: "work".into(),
+                r#type: StepKind::Set,
+                role: SessionRole::Orchestrator,
+                value: Some(json!(true)),
+                ..Step::default()
+            }],
+            ..Definition::default()
+        };
+
+        let error = validate(&definition, Path::new("."))
+            .expect_err("reject an orchestrator as a workflow stage");
+        assert!(error.to_string().contains("orchestrator owns the workflow"));
+    }
+
+    #[test]
+    fn workflow_reviewers_are_typed_and_must_exist() {
+        let definition = |review_by: &str, reviewer_role| Definition {
+            name: "review-contract".into(),
+            goal: "validate the review relationship".into(),
+            entry_point: "implement".into(),
+            steps: vec![
+                Step {
+                    name: "implement".into(),
+                    r#type: StepKind::Set,
+                    role: SessionRole::Implementer,
+                    review_by: Some(review_by.into()),
+                    value: Some(json!(true)),
+                    ..Step::default()
+                },
+                Step {
+                    name: "review".into(),
+                    r#type: StepKind::Set,
+                    role: reviewer_role,
+                    value: Some(json!(true)),
+                    ..Step::default()
+                },
+            ],
+            ..Definition::default()
+        };
+
+        let missing = validate(
+            &definition("missing", SessionRole::Verifier),
+            Path::new("."),
+        )
+        .expect_err("reject an unknown reviewer");
+        assert!(missing.to_string().contains("unknown reviewer missing"));
+
+        let wrong_role = validate(
+            &definition("review", SessionRole::Researcher),
+            Path::new("."),
+        )
+        .expect_err("reject a reviewer without a review role");
+        assert!(
+            wrong_role
+                .to_string()
+                .contains("critic, judge, or verifier")
+        );
+    }
+
+    #[test]
+    fn review_relationship_schedules_the_reviewer_after_its_subject() {
+        let definition = Definition {
+            name: "review-order".into(),
+            goal: "review completed implementation work".into(),
+            entry_point: "implement".into(),
+            steps: vec![
+                Step {
+                    name: "implement".into(),
+                    r#type: StepKind::Set,
+                    role: SessionRole::Implementer,
+                    review_by: Some("verify".into()),
+                    value: Some(json!(true)),
+                    ..Step::default()
+                },
+                Step {
+                    name: "verify".into(),
+                    r#type: StepKind::Set,
+                    role: SessionRole::Verifier,
+                    value: Some(json!(true)),
+                    ..Step::default()
+                },
+            ],
+            ..Definition::default()
+        };
+
+        validate(&definition, Path::new(".")).expect("valid review relationship");
+        let planned = plan(&Config::default(), Path::new("."), &definition).expect("plan");
+
+        assert_eq!(planned.waves, vec![vec!["implement"], vec!["verify"]]);
+        assert_eq!(planned.steps[1].depends_on, vec!["implement"]);
+    }
+
+    #[test]
+    fn reviewer_feedback_retries_the_subject_before_reviewing_again() {
+        let (directory, config, scope, _) = workflow_fixture("1ms");
+        let definition = Definition {
+            name: "review-feedback".into(),
+            goal: "repeat implementation after review feedback".into(),
+            entry_point: "implement".into(),
+            steps: vec![
+                Step {
+                    name: "implement".into(),
+                    r#type: StepKind::Set,
+                    role: SessionRole::Implementer,
+                    review_by: Some("verify".into()),
+                    value: Some(json!(true)),
+                    ..Step::default()
+                },
+                Step {
+                    name: "verify".into(),
+                    r#type: StepKind::Set,
+                    role: SessionRole::Verifier,
+                    routes: vec![Route {
+                        to: "implement".into(),
+                        when: Some("output == false".into()),
+                    }],
+                    value: Some(json!(false)),
+                    ..Step::default()
+                },
+            ],
+            ..Definition::default()
+        };
+        let mut run = materialize_definition(&directory, &config, &scope, &definition);
+
+        assert!(run.edges.iter().any(|edge| {
+            edge.from == "verify" && edge.to == "implement" && edge.relationship == "feedback"
+        }));
+        for node in &mut run.nodes {
+            node.status = LifecycleStatus::Done;
+            node.attempt = 1;
+            node.output = Some(json!(node.id != "verify"));
+        }
+
+        advance_state(&mut run, &definition).expect("apply review feedback");
+
+        let implement = run
+            .nodes
+            .iter()
+            .find(|node| node.id == "implement")
+            .expect("implementation node");
+        let verify = run
+            .nodes
+            .iter()
+            .find(|node| node.id == "verify")
+            .expect("review node");
+        assert_eq!(implement.status, LifecycleStatus::Queued);
+        assert_eq!(verify.status, LifecycleStatus::Pending);
+        assert!(verify.activity.iter().any(|event| event.kind == "feedback"));
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn plan_exposes_the_effective_approval_policy() {
+        let definition = |mode| Definition {
+            name: "approval-policy".into(),
+            goal: "expose operator intervention points".into(),
+            entry_point: "ordinary".into(),
+            approval: ApprovalPolicy {
+                mode,
+                gates: vec![ApprovalGate {
+                    id: "before-flagged".into(),
+                    before: "flagged".into(),
+                    reason: "inspect the result".into(),
+                    authority: GateAuthority::User,
+                }],
+            },
+            steps: vec![
+                Step {
+                    name: "ordinary".into(),
+                    r#type: StepKind::Set,
+                    value: Some(json!(true)),
+                    ..Step::default()
+                },
+                Step {
+                    name: "flagged".into(),
+                    r#type: StepKind::Set,
+                    requires_approval: true,
+                    value: Some(json!(true)),
+                    ..Step::default()
+                },
+                Step {
+                    name: "human".into(),
+                    r#type: StepKind::HumanGate,
+                    ..Step::default()
+                },
+            ],
+            ..Definition::default()
+        };
+        let approvals = |mode| {
+            plan(&Config::default(), Path::new("."), &definition(mode))
+                .expect("plan approval policy")
+                .steps
+                .into_iter()
+                .map(|step| step.approval_required)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(approvals(ApprovalMode::Supervised), vec![true, true, true]);
+        assert_eq!(
+            approvals(ApprovalMode::ApprovalGated),
+            vec![false, true, true]
+        );
+        assert_eq!(
+            approvals(ApprovalMode::Autonomous),
+            vec![false, false, true]
+        );
+    }
+
+    #[test]
+    fn execution_uses_the_approval_policy_exposed_by_the_plan() {
+        let (_directory, _config, scope, run) = workflow_fixture("1ms");
+        for mode in [
+            ApprovalMode::Supervised,
+            ApprovalMode::ApprovalGated,
+            ApprovalMode::Autonomous,
+        ] {
+            let definition = Definition {
+                name: "approval-policy".into(),
+                goal: "use one approval policy".into(),
+                entry_point: "ordinary".into(),
+                approval: ApprovalPolicy {
+                    mode,
+                    gates: vec![ApprovalGate {
+                        id: "before-flagged".into(),
+                        before: "flagged".into(),
+                        reason: "inspect the result".into(),
+                        authority: GateAuthority::User,
+                    }],
+                },
+                steps: vec![
+                    set_step("ordinary"),
+                    Step {
+                        name: "flagged".into(),
+                        requires_approval: true,
+                        ..set_step("flagged")
+                    },
+                    Step {
+                        name: "human".into(),
+                        r#type: StepKind::HumanGate,
+                        ..Step::default()
+                    },
+                ],
+                ..Definition::default()
+            };
+            let planned = plan(&Config::default(), Path::new("."), &definition)
+                .expect("plan approval policy");
+            let executed = definition
+                .steps
+                .iter()
+                .map(|step| required_gate(&definition, step, &run).is_some())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                planned
+                    .steps
+                    .iter()
+                    .map(|step| step.approval_required)
+                    .collect::<Vec<_>>(),
+                executed
+            );
+        }
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn orchestrator_cannot_approve_a_user_gate() {
+        let (_directory, config, scope, run) = workflow_fixture("1ms");
+        state::update(&scope, |workspace| {
+            let run = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            run.status = LifecycleStatus::Waiting;
+            run.nodes[0].status = LifecycleStatus::Waiting;
+            run.pending_gates.push(PendingGate {
+                id: "user-only".into(),
+                before: "wait".into(),
+                reason: "user decision".into(),
+                authority: GateAuthority::User,
+                recommendation: None,
+                created_at: Utc::now(),
+            });
+            Ok(())
+        })
+        .expect("record user gate");
+
+        let error = approve_as(
+            &config,
+            &scope,
+            &run.id,
+            Some("user-only"),
+            false,
+            ApprovalActor::Orchestrator,
+        )
+        .expect_err("orchestrator must not approve a user gate");
+
+        assert!(error.to_string().contains("requires user approval"));
+        let current = find_run(&scope, &run.id).expect("pending run");
+        assert_eq!(current.pending_gates[0].authority, GateAuthority::User);
+        assert_eq!(current.status, LifecycleStatus::Waiting);
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn dual_authority_gate_requires_orchestrator_then_user() {
+        let (_directory, config, scope, run) = workflow_fixture("1ms");
+        state::update(&scope, |workspace| {
+            let run = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            run.status = LifecycleStatus::Waiting;
+            run.nodes[0].status = LifecycleStatus::Waiting;
+            run.pending_gates.push(PendingGate {
+                id: "dual".into(),
+                before: "wait".into(),
+                reason: "two approvals".into(),
+                authority: GateAuthority::OrchestratorThenUser,
+                recommendation: None,
+                created_at: Utc::now(),
+            });
+            Ok(())
+        })
+        .expect("record dual gate");
+
+        approve_as(
+            &config,
+            &scope,
+            &run.id,
+            Some("dual"),
+            false,
+            ApprovalActor::Orchestrator,
+        )
+        .expect("orchestrator approval");
+        let intermediate = find_run(&scope, &run.id).expect("intermediate run");
+        assert_eq!(intermediate.pending_gates.len(), 1);
+        assert_eq!(intermediate.status, LifecycleStatus::Waiting);
+
+        let approved =
+            approve(&config, &scope, &run.id, Some("dual"), false).expect("user approval");
+        assert!(approved.pending_gates.is_empty());
+        assert_eq!(approved.status, LifecycleStatus::Queued);
+        remove_fixture_state(&scope, &run.id);
     }
 
     #[test]
@@ -4291,6 +5389,41 @@ steps:
 
         let error = plan(&Config::default(), Path::new("."), &definition).unwrap_err();
         assert!(error.to_string().contains("dependency cycle"));
+    }
+
+    #[test]
+    fn plan_rejects_a_cycle_through_parallel_group_completion() {
+        let definition = Definition {
+            name: "parallel-cycle".into(),
+            goal: "reject cycles through a parallel group".into(),
+            entry_point: "start".into(),
+            steps: vec![
+                set_step("start"),
+                Step {
+                    name: "member".into(),
+                    depends_on: vec!["after".into()],
+                    ..set_step("member")
+                },
+                Step {
+                    name: "after".into(),
+                    depends_on: vec!["workers".into()],
+                    ..set_step("after")
+                },
+            ],
+            parallel: vec![ParallelGroup {
+                name: "workers".into(),
+                agents: vec!["member".into()],
+                ..ParallelGroup::default()
+            }],
+            ..Definition::default()
+        };
+
+        let error = plan(&Config::default(), Path::new("."), &definition)
+            .expect_err("group completion must participate in cycle detection");
+
+        assert!(error.to_string().contains("dependency cycle"));
+        assert!(error.to_string().contains("member"));
+        assert!(error.to_string().contains("after"));
     }
 
     #[test]
@@ -4490,20 +5623,24 @@ steps:
 
     #[test]
     fn retry_backoff_delays_the_next_attempt() {
-        let (_directory, config, scope, run) = workflow_fixture("1ms");
-        let definition_path = PathBuf::from(run.definition.as_deref().expect("definition path"));
-        let mut definition = load(&definition_path).expect("load workflow");
-        definition.steps[0].r#type = StepKind::Script;
-        definition.steps[0].command = vec!["sh".into(), "-c".into(), "exit 1".into()];
-        definition.steps[0].retry = RetryPolicy {
-            attempts: 1,
-            backoff_seconds: 1,
+        let (directory, config, scope, fixture_run) = workflow_fixture("1ms");
+        let definition = Definition {
+            name: "retry-backoff".into(),
+            goal: "delay the retry".into(),
+            entry_point: "fail".into(),
+            steps: vec![Step {
+                name: "fail".into(),
+                r#type: StepKind::Script,
+                command: vec!["sh".into(), "-c".into(), "exit 1".into()],
+                retry: RetryPolicy {
+                    attempts: 1,
+                    backoff_seconds: 1,
+                },
+                ..Step::default()
+            }],
+            ..Definition::default()
         };
-        fs::write(
-            &definition_path,
-            serde_yaml::to_string(&definition).expect("serialize workflow"),
-        )
-        .expect("write workflow");
+        let run = materialize_definition(&directory, &config, &scope, &definition);
 
         let started = Instant::now();
         let failed = execute(&config, &scope, &run.id).expect("execute retries");
@@ -4512,6 +5649,7 @@ steps:
         assert_eq!(failed.status, LifecycleStatus::Failed);
         assert_eq!(failed.nodes[0].attempt, 2);
         remove_fixture_state(&scope, &run.id);
+        remove_fixture_state(&scope, &fixture_run.id);
     }
 
     #[test]
@@ -4540,37 +5678,37 @@ steps:
 
     #[test]
     fn fatal_parallel_failure_suppresses_retry_backoff() {
-        let (_directory, config, scope, run) = workflow_fixture("1ms");
-        let definition_path = PathBuf::from(run.definition.as_deref().expect("definition path"));
-        let mut definition = load(&definition_path).expect("load workflow");
-        definition.steps[0].r#type = StepKind::Script;
-        definition.steps[0].command = vec!["sh".into(), "-c".into(), "exit 1".into()];
-        definition.steps[0].retry = RetryPolicy {
-            attempts: 1,
-            backoff_seconds: 60,
+        let (directory, config, scope, fixture_run) = workflow_fixture("1ms");
+        let failing_step = |name: &str, retry| Step {
+            name: name.into(),
+            r#type: StepKind::Script,
+            command: vec!["sh".into(), "-c".into(), "exit 1".into()],
+            retry,
+            ..Step::default()
         };
-        let mut fatal_step = definition.steps[0].clone();
-        fatal_step.name = "fatal".into();
-        fatal_step.retry = RetryPolicy::default();
-        definition.steps.push(fatal_step);
-        fs::write(
-            &definition_path,
-            serde_yaml::to_string(&definition).expect("serialize workflow"),
-        )
-        .expect("write workflow");
-        state::update(&scope, |workspace| {
-            let run = workspace
-                .runs
-                .iter_mut()
-                .find(|candidate| candidate.id == run.id)
-                .expect("run");
-            let mut fatal_node = run.nodes[0].clone();
-            fatal_node.id = "fatal".into();
-            fatal_node.name = "fatal".into();
-            run.nodes.push(fatal_node);
-            Ok(())
-        })
-        .expect("add fatal node");
+        let definition = Definition {
+            name: "fatal-parallel".into(),
+            goal: "stop retry backoff after a fatal peer failure".into(),
+            entry_point: "workers".into(),
+            steps: vec![
+                failing_step(
+                    "retrying",
+                    RetryPolicy {
+                        attempts: 1,
+                        backoff_seconds: 60,
+                    },
+                ),
+                failing_step("fatal", RetryPolicy::default()),
+            ],
+            parallel: vec![ParallelGroup {
+                name: "workers".into(),
+                agents: vec!["retrying".into(), "fatal".into()],
+                failure_mode: FailureMode::FailFast,
+                ..ParallelGroup::default()
+            }],
+            ..Definition::default()
+        };
+        let run = materialize_definition(&directory, &config, &scope, &definition);
 
         let started = Instant::now();
         let failed = execute(&config, &scope, &run.id).expect("execute parallel failures");
@@ -4578,6 +5716,7 @@ steps:
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(failed.status, LifecycleStatus::Failed);
         remove_fixture_state(&scope, &run.id);
+        remove_fixture_state(&scope, &fixture_run.id);
     }
 
     #[test]
@@ -4624,8 +5763,12 @@ steps:
 
         let finished = finish_run(&scope, &run.id, LifecycleStatus::Done).expect("finish run");
         let started = set_process(&scope, &run.id, 42, "nonce", None).expect("set process");
-        let updated =
-            control::update_run(&scope, &run.id, LifecycleStatus::Done).expect("ignore run update");
+        let updated = state::read(&scope)
+            .expect("read terminating run")
+            .runs
+            .into_iter()
+            .find(|candidate| candidate.id == run.id)
+            .expect("terminating run");
         let reported = control::report_node(
             &scope,
             &run.id,
@@ -4649,6 +5792,42 @@ steps:
         assert_eq!(reported.status, LifecycleStatus::Terminating);
         assert_eq!(approved.status, LifecycleStatus::Terminating);
         assert!(started.process_id.is_none());
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn failed_run_cannot_be_revived_by_a_stale_gate() {
+        let (_directory, config, scope, run) = workflow_fixture("1ms");
+        state::update(&scope, |workspace| {
+            let run = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            run.status = LifecycleStatus::Failed;
+            run.pending_gates.push(PendingGate {
+                id: "stale-approval".into(),
+                before: "wait".into(),
+                reason: "stale gate".into(),
+                authority: GateAuthority::User,
+                recommendation: None,
+                created_at: Utc::now(),
+            });
+            Ok(())
+        })
+        .expect("create terminal run with stale gate");
+
+        let error = approve(&config, &scope, &run.id, None, false)
+            .expect_err("terminal run must not revive");
+
+        assert!(error.to_string().contains("cannot approve"));
+        let current = state::read(&scope)
+            .expect("read run")
+            .runs
+            .into_iter()
+            .find(|candidate| candidate.id == run.id)
+            .expect("failed run");
+        assert_eq!(current.status, LifecycleStatus::Failed);
         remove_fixture_state(&scope, &run.id);
     }
 
@@ -4755,7 +5934,7 @@ steps:
                 parent_id: run.orchestrator_id.clone(),
                 run_id: Some(run.id.clone()),
                 node_id: Some("wait".into()),
-                source: RegistrationSource::Managed,
+                source: RegistrationSource::Connected,
                 ..SessionLink::default()
             },
         )
@@ -4773,8 +5952,22 @@ steps:
                 id: "approval".into(),
                 before: "wait".into(),
                 reason: "test".into(),
+                authority: GateAuthority::User,
                 recommendation: None,
                 created_at: Utc::now(),
+            });
+            let session = workspace
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == linked.id)
+                .expect("linked session");
+            session.registration = RegistrationSource::Managed;
+            session.providers.push(crate::domain::ProviderBinding {
+                provider: "stop-test".into(),
+                kind: crate::domain::ProviderKind::Persistence,
+                r#ref: Some("stop-test".into()),
+                status: crate::domain::BindingStatus::Active,
+                label: "test stop ownership".into(),
             });
             Ok(())
         })
@@ -4799,6 +5992,7 @@ steps:
     fn cancel_reconciles_descendant_runs() {
         let (_directory, config, scope, run) = workflow_fixture("1s");
         let child_id = format!("run-{}", Uuid::new_v4());
+        let failed_child_id = format!("run-{}", Uuid::new_v4());
         state::update(&scope, |workspace| {
             let mut child = workspace
                 .runs
@@ -4810,6 +6004,17 @@ steps:
             child.parent_run_id = Some(run.id.clone());
             child.status = LifecycleStatus::Working;
             workspace.runs.push(child);
+            let mut failed_child = workspace
+                .runs
+                .iter()
+                .find(|candidate| candidate.id == run.id)
+                .cloned()
+                .expect("parent run");
+            failed_child.id.clone_from(&failed_child_id);
+            failed_child.parent_run_id = Some(run.id.clone());
+            failed_child.status = LifecycleStatus::Failed;
+            failed_child.nodes[0].status = LifecycleStatus::Failed;
+            workspace.runs.push(failed_child);
             Ok(())
         })
         .expect("add child run");
@@ -4826,8 +6031,16 @@ steps:
                 .status,
             LifecycleStatus::Cancelled
         );
+        let failed_child = workspace
+            .runs
+            .iter()
+            .find(|candidate| candidate.id == failed_child_id)
+            .expect("failed child run");
+        assert_eq!(failed_child.status, LifecycleStatus::Failed);
+        assert_eq!(failed_child.nodes[0].status, LifecycleStatus::Failed);
         remove_fixture_state(&scope, &run.id);
         remove_fixture_state(&scope, &child_id);
+        remove_fixture_state(&scope, &failed_child_id);
     }
 
     #[test]
@@ -4848,6 +6061,29 @@ steps:
 
         assert_eq!(result.status, LifecycleStatus::Done);
         assert_eq!(result.updated_at, completed.updated_at);
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn cancel_preserves_a_failed_run() {
+        let (_directory, config, scope, run) = workflow_fixture("1ms");
+        let failed = state::update(&scope, |workspace| {
+            let run = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            run.status = LifecycleStatus::Failed;
+            run.nodes[0].status = LifecycleStatus::Failed;
+            Ok(run.clone())
+        })
+        .expect("fail run");
+
+        let result = cancel(&config, &scope, &run.id).expect("cancel failed run");
+
+        assert_eq!(result.status, LifecycleStatus::Failed);
+        assert_eq!(result.nodes[0].status, LifecycleStatus::Failed);
+        assert_eq!(result.updated_at, failed.updated_at);
         remove_fixture_state(&scope, &run.id);
     }
 }

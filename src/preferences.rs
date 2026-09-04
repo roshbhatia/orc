@@ -61,7 +61,13 @@ pub struct WorkspacePreferences {
     pub inspector_tab: String,
     pub inspector_dock: String,
     pub inspector_percent: u16,
+    pub active_run: Option<String>,
     pub selected_item: Option<String>,
+    pub graph_selected_item: Option<String>,
+    pub graph_pan_x: f64,
+    pub graph_pan_y: f64,
+    pub graph_zoom: f64,
+    pub display_direction: String,
 }
 
 impl Default for WorkspacePreferences {
@@ -73,7 +79,13 @@ impl Default for WorkspacePreferences {
             inspector_tab: "summary".into(),
             inspector_dock: "bottom".into(),
             inspector_percent: 28,
+            active_run: None,
             selected_item: None,
+            graph_selected_item: None,
+            graph_pan_x: 0.0,
+            graph_pan_y: 0.0,
+            graph_zoom: 1.0,
+            display_direction: "right".into(),
         }
     }
 }

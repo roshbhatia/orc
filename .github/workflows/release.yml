@@ -8,21 +8,62 @@ permissions:
   contents: write
 
 jobs:
+  verify-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Match the tag to Cargo.toml
+        run: |
+          package_version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "orc") | .version')
+          test "$GITHUB_REF_NAME" = "v$package_version"
+
   build:
+    needs: verify-tag
     strategy:
+      fail-fast: false
       matrix:
-        runner: [ubuntu-latest, macos-latest]
+        include:
+          - runner: ubuntu-latest
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+          - runner: macos-15
+            system: aarch64-darwin
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
       - uses: cachix/install-nix-action@v31
+      - name: Run required checks
+        run: |
+          nix develop --accept-flake-config --command cargo fmt --check
+          nix develop --accept-flake-config --command cargo clippy --all-targets -- -D warnings
+          nix develop --accept-flake-config --command ./hack/generate.sh --check
+          nix flake check --accept-flake-config --print-build-logs
+          nix flake check --accept-flake-config --print-build-logs ./extras
       - run: |
-          nix build --accept-flake-config --print-build-logs .#core --out-link result-core
-          nix build --accept-flake-config --print-build-logs .#extras --out-link result-extras
-      - run: |
+          cargo build --locked --release
+          archive="orc-${{ runner.os }}-${{ runner.arch }}"
           mkdir -p dist
-          tar -czf "dist/orc-${{ runner.os }}-${{ runner.arch }}.tar.gz" -C result-core .
-          tar -czf "dist/orc-providers-${{ runner.os }}-${{ runner.arch }}.tar.gz" -C result-extras .
+          mkdir -p \
+            "$archive/bin" \
+            "$archive/share/bash-completion/completions" \
+            "$archive/share/fish/vendor_completions.d" \
+            "$archive/share/nushell/vendor/autoload" \
+            "$archive/share/orc" \
+            "$archive/share/zsh/site-functions"
+          install -m 0755 target/release/orc "$archive/bin/orc"
+          install -m 0644 LICENSE README.md "$archive/"
+          target/release/orc completion bash > "$archive/share/bash-completion/completions/orc"
+          target/release/orc completion fish > "$archive/share/fish/vendor_completions.d/orc.fish"
+          target/release/orc completion nu > "$archive/share/nushell/vendor/autoload/orc.nu"
+          target/release/orc completion zsh > "$archive/share/zsh/site-functions/_orc"
+          for schema in config provider state workflow; do
+            target/release/orc schema "$schema" > "$archive/share/orc/$schema.schema.json"
+          done
+          tar -czf "dist/$archive.tar.gz" "$archive"
+          (cd dist && shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256")
       - uses: actions/upload-artifact@v7
         with:
           name: orc-${{ runner.os }}-${{ runner.arch }}
@@ -36,6 +77,12 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --repo "$GITHUB_REPOSITORY"
+      - name: Create or update release
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --repo "$GITHUB_REPOSITORY"
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
