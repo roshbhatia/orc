@@ -221,6 +221,13 @@ handling, output capture, and status persistence. The local provider exposes
 the stable operation ID to each command as `ORC_OPERATION_ID`; a command with
 side effects must persist a receipt before acknowledging delivery.
 
+A one-shot stage can omit `spec.actions.execution.cancel` when its ensure
+command returns `Succeeded` or `Failed`. A stage that can return `Pending` or
+`Running` must select a provider that accepts `execution.cancel`. The local
+provider requires that stage to define an `execution.cancel` command. Admission
+validates action commands, environments, providers, inputs, and dependency
+shapes before Orc writes desired state.
+
 `orc watch` emits JSON lines and always stops at the requested event count or
 timeout. The maximum timeout is one hour. See
 [`examples/control-plane.yaml`](examples/control-plane.yaml) and the generated

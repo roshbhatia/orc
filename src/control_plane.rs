@@ -529,17 +529,61 @@ fn validate_provider_inputs(
 ) -> Result<()> {
     let context = resource.key().to_string();
     validate_optional_nonempty_string(object, "provider", &context)?;
-    validate_inputs(object, &context)
+    validate_inputs(object, &context)?;
+    validate_actions(object, &context)
 }
 
 fn validate_execution_fields(object: &serde_json::Map<String, Value>, context: &str) -> Result<()> {
     validate_optional_nonempty_string(object, "provider", context)?;
     validate_inputs(object, context)?;
+    validate_actions(object, context)?;
     validate_string_array(object, "dependsOn", context)?;
     if let Some(desired_state) = object.get("desiredState") {
         match desired_state.as_str() {
             Some("running" | "cancelled") => {}
             _ => bail!("{context} spec.desiredState must be running or cancelled"),
+        }
+    }
+    Ok(())
+}
+
+fn validate_actions(object: &serde_json::Map<String, Value>, context: &str) -> Result<()> {
+    let Some(actions) = object.get("actions") else {
+        return Ok(());
+    };
+    let actions = actions
+        .as_object()
+        .with_context(|| format!("{context} spec.actions must be an object"))?;
+    for (capability, action) in actions {
+        if capability.trim().is_empty() {
+            bail!("{context} spec.actions keys must be nonempty");
+        }
+        let action = action
+            .as_object()
+            .with_context(|| format!("{context} spec.actions.{capability} must be an object"))?;
+        let command = action
+            .get("command")
+            .and_then(Value::as_array)
+            .filter(|command| !command.is_empty())
+            .with_context(|| {
+                format!(
+                    "{context} spec.actions.{capability}.command must be a nonempty string array"
+                )
+            })?;
+        if command
+            .iter()
+            .any(|argument| argument.as_str().is_none_or(str::is_empty))
+        {
+            bail!("{context} spec.actions.{capability}.command must be a nonempty string array");
+        }
+        validate_optional_nonempty_string(action, "cwd", context)?;
+        if let Some(environment) = action.get("environment") {
+            let environment = environment.as_object().with_context(|| {
+                format!("{context} spec.actions.{capability}.environment must be an object")
+            })?;
+            if environment.values().any(|value| !value.is_string()) {
+                bail!("{context} spec.actions.{capability}.environment values must be strings");
+            }
         }
     }
     Ok(())
@@ -1272,6 +1316,7 @@ fn reconcile_runs(store: &mut ControlStore) -> Result<bool> {
             .map(Resource::key)
             .collect::<Vec<_>>();
         for key in retired {
+            let terminal = store.resource(&key).is_some_and(execution_is_terminal);
             store.resource_version += 1;
             let resource_version = store.resource_version;
             let execution = store
@@ -1281,6 +1326,9 @@ fn reconcile_runs(store: &mut ControlStore) -> Result<bool> {
             execution.metadata.generation += 1;
             execution.metadata.resource_version = resource_version;
             execution.metadata.updated_at = Utc::now();
+            if terminal {
+                execution.status.observed_generation = execution.metadata.generation;
+            }
             store.emit(
                 "Normal",
                 "Pruned",
@@ -1359,6 +1407,13 @@ fn desired_state(resource: &Resource) -> &str {
         .unwrap_or("running")
 }
 
+fn execution_is_terminal(resource: &Resource) -> bool {
+    matches!(
+        resource.status.phase.as_str(),
+        "Succeeded" | "Failed" | "Cancelled"
+    )
+}
+
 fn dependency_ready(store: &ControlStore, resource: &Resource) -> bool {
     resource
         .spec
@@ -1380,9 +1435,8 @@ fn dependency_ready(store: &ControlStore, resource: &Resource) -> bool {
 fn action_for(resource: &Resource) -> Option<Capability> {
     match resource.kind {
         ResourceKind::Execution => match desired_state(resource) {
-            "cancelled" if resource.status.phase != "Cancelled" => {
-                Some(Capability::ExecutionCancel)
-            }
+            "cancelled" if execution_is_terminal(resource) => None,
+            "cancelled" => Some(Capability::ExecutionCancel),
             _ if resource.status.phase == "Failed" => Some(Capability::ExecutionEnsure),
             _ if resource.status.observed_generation < resource.metadata.generation => {
                 Some(Capability::ExecutionEnsure)
@@ -2201,18 +2255,12 @@ mod tests {
             false,
         )
         .unwrap();
-        let reconciled = reconcile_with(scope.path(), 8, false, |capability, request| {
-            assert_eq!(capability, Capability::ExecutionCancel);
-            assert_eq!(request["resource"]["status"]["phase"], "Succeeded");
-            assert_eq!(request["resource"]["spec"]["desiredState"], "cancelled");
-            Ok(ActionOutput {
-                provider: "fake".into(),
-                value: json!({"phase": "Cancelled"}),
-            })
+        let reconciled = reconcile_with(scope.path(), 8, false, |_, _| {
+            panic!("a completed one-shot stage must not require cancellation")
         })
         .unwrap();
 
-        assert_eq!(reconciled.actions.len(), 1);
+        assert!(reconciled.actions.is_empty());
         let after = list(
             scope.path(),
             Some(ResourceKind::Execution),
@@ -2221,8 +2269,9 @@ mod tests {
         .unwrap()
         .remove(0);
         assert_eq!(after.spec["desiredState"], "cancelled");
-        assert_eq!(after.status.phase, "Cancelled");
+        assert_eq!(after.status.phase, "Succeeded");
         assert_eq!(after.metadata.generation, before.metadata.generation + 1);
+        assert_eq!(after.status.observed_generation, after.metadata.generation);
         assert_eq!(after.metadata.field_owners, before.metadata.field_owners);
         assert_eq!(
             list(scope.path(), Some(ResourceKind::Run), Some("release-1")).unwrap()[0]
@@ -2240,6 +2289,68 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| event.reason == "Pruned")
+        );
+    }
+
+    #[test]
+    fn removed_failed_stage_preserves_its_terminal_outcome() {
+        let scope = scope();
+        apply(
+            scope.path(),
+            vec![
+                resource(
+                    ResourceKind::Workflow,
+                    "release",
+                    json!({"stages": [{"name": "build"}]}),
+                ),
+                resource(
+                    ResourceKind::Run,
+                    "release-1",
+                    json!({"workflowRef": "release"}),
+                ),
+            ],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+        reconcile_with(scope.path(), 1, false, |_, _| {
+            Ok(ActionOutput {
+                provider: "fake".into(),
+                value: json!({"phase": "Failed", "message": "build failed"}),
+            })
+        })
+        .unwrap();
+        apply(
+            scope.path(),
+            vec![resource(
+                ResourceKind::Workflow,
+                "release",
+                json!({"stages": []}),
+            )],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+        let reconciled = reconcile_with(scope.path(), 8, false, |_, _| {
+            panic!("failed terminal work must not require cancellation")
+        })
+        .unwrap();
+
+        assert!(reconciled.actions.is_empty());
+        let execution = list(
+            scope.path(),
+            Some(ResourceKind::Execution),
+            Some("release-1-build"),
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(execution.spec["desiredState"], "cancelled");
+        assert_eq!(execution.status.phase, "Failed");
+        assert_eq!(
+            execution.status.observed_generation,
+            execution.metadata.generation
         );
     }
 

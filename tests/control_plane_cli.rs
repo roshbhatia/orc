@@ -127,6 +127,102 @@ fn apply_dry_run_does_not_create_cli_state() {
 
 #[cfg(unix)]
 #[test]
+fn completed_local_one_shot_retires_without_a_cancel_action() {
+    let state = TempDir::new().unwrap();
+    let scope = TempDir::new().unwrap();
+    let providers = state.path().join("providers");
+    fs::create_dir_all(&providers).unwrap();
+    let provider = Path::new(env!("CARGO_MANIFEST_DIR")).join("extras/local/provider.sh");
+    fs::write(
+        providers.join("local.yaml"),
+        format!(
+            r#"version: orc.provider/v1
+name: local
+command: {}
+actions:
+  execution.ensure: Ensure local desired state
+  execution.cancel: Cancel local desired state
+"#,
+            provider.display()
+        ),
+    )
+    .unwrap();
+    let resources = scope.path().join("resources.yaml");
+    let write_workflow = |stages: &str| {
+        fs::write(
+            &resources,
+            format!(
+                r#"apiVersion: orc.dev/v1alpha1
+kind: Workflow
+metadata:
+  name: release
+spec:
+  stages: {stages}
+---
+apiVersion: orc.dev/v1alpha1
+kind: Run
+metadata:
+  name: release-1
+spec:
+  workflowRef: release
+"#
+            ),
+        )
+        .unwrap();
+    };
+    let invoke = || {
+        Command::new(env!("CARGO_BIN_EXE_orc"))
+            .env("XDG_STATE_HOME", state.path())
+            .env("XDG_CONFIG_HOME", state.path().join("config"))
+            .env("ORC_PROVIDER_DIR", &providers)
+            .env_remove("ORC_SESSION_ID")
+            .args([
+                "apply",
+                "-f",
+                resources.to_str().unwrap(),
+                "--scope",
+                scope.path().to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+    };
+
+    write_workflow(
+        r#"
+    - name: build
+      provider: local
+      command:
+        - /bin/sh
+        - -c
+        - |
+          printf '%s\n' '{"phase":"Succeeded"}'"#,
+    );
+    let created = invoke();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    write_workflow("[]");
+    let retired = invoke();
+    assert!(
+        retired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retired.stderr)
+    );
+    let execution = command(
+        state.path(),
+        scope.path(),
+        &["get", "execution", "release-1-build", "-o", "json"],
+    );
+    let execution = String::from_utf8_lossy(&execution.stdout);
+    assert!(execution.contains("\"desiredState\": \"cancelled\""));
+    assert!(execution.contains("\"phase\": \"Succeeded\""));
+}
+
+#[cfg(unix)]
+#[test]
 fn provider_reconcile_and_event_delivery_are_idempotent() {
     use std::os::unix::fs::PermissionsExt;
 

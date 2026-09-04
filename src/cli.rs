@@ -986,14 +986,8 @@ pub fn run() -> Result<u8> {
                 args.force_conflicts,
                 args.dry_run,
             )?;
-            let should_reconcile = !args.dry_run
-                && !args.no_reconcile
-                && result.changes.iter().any(|change| {
-                    matches!(
-                        change.resource.kind,
-                        ResourceKind::Run | ResourceKind::Session | ResourceKind::Execution
-                    )
-                });
+            let should_reconcile =
+                !args.dry_run && !args.no_reconcile && !result.changes.is_empty();
             print_changes(&result.changes, args.source.json)?;
             if should_reconcile {
                 let reconciled =
