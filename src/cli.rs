@@ -14,7 +14,7 @@ use rs_utils::{
 };
 
 use crate::{
-    VERSION,
+    VERSION, animation,
     config::{self, Config},
     control::{self, Contract, SessionLease, SessionLink},
     daemon,
@@ -79,6 +79,11 @@ enum Commands {
         #[command(subcommand)]
         command: ProviderCommand,
     },
+    #[command(about = "Validate and inspect terminal animations")]
+    Animation {
+        #[command(subcommand)]
+        command: AnimationCommand,
+    },
     #[command(about = "Manage versioned workflow definitions")]
     Workflow {
         #[command(subcommand)]
@@ -128,6 +133,32 @@ struct TuiArgs {
     scope: ScopeArgs,
     #[arg(long, hide = true)]
     loading_preview: bool,
+}
+
+#[derive(Subcommand)]
+enum AnimationCommand {
+    #[command(about = "Validate the resolved animation configuration")]
+    Validate {
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Render one deterministic animation sample")]
+    Inspect {
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        #[arg(long, default_value_t = 0)]
+        elapsed_ms: u64,
+        #[arg(long, default_value_t = 80)]
+        width: u16,
+        #[arg(long, default_value_t = 24)]
+        height: u16,
+        #[arg(long)]
+        reduced_motion: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Clone, Args)]
@@ -564,6 +595,7 @@ struct GuideArgs {
 #[derive(Clone, Copy, ValueEnum)]
 enum SchemaTarget {
     Config,
+    Animation,
     Provider,
     Workflow,
     State,
@@ -700,7 +732,7 @@ pub fn run() -> Result<u8> {
     match command {
         Commands::Tui(args) => {
             if args.loading_preview {
-                tui::preview_loading()?;
+                tui::preview_loading(&config, &args.scope.scope)?;
             } else {
                 require_orchestrator_or_operator(&args.scope.scope)?;
                 tui::run(config, &args.scope.scope)?;
@@ -1169,6 +1201,7 @@ pub fn run() -> Result<u8> {
                 }
             }
         },
+        Commands::Animation { command } => animation_command(&config, command)?,
         Commands::Workflow { command } => workflow_command(&config, command)?,
         Commands::Launch(args) => {
             require_orchestrator_or_operator(&args.scope.scope)?;
@@ -1236,6 +1269,9 @@ pub fn run() -> Result<u8> {
         Commands::Schema { schema } => {
             let value = match schema {
                 SchemaTarget::Config => config::schema(),
+                SchemaTarget::Animation => {
+                    serde_json::from_str(&rs_utils::animation::AnimationConfig::json_schema()?)?
+                }
                 SchemaTarget::Provider => provider::schema(),
                 SchemaTarget::Workflow => workflow::schema(),
                 SchemaTarget::State => {
@@ -1419,11 +1455,55 @@ fn completion(shell: CompletionTargetShell) {
     generate_completion(&mut Cli::command(), "orc", shell, &mut io::stdout());
 }
 
+fn animation_command(config: &Config, command: AnimationCommand) -> Result<()> {
+    match command {
+        AnimationCommand::Validate { file, json } => {
+            let loaded = animation::load(config, file.as_deref())?;
+            let inspection = animation::inspect(&loaded, 0, u16::MAX, u16::MAX, false);
+            if json {
+                print_json(&inspection)?;
+            } else {
+                println!(
+                    "valid · {} · {}x{}",
+                    inspection.source, inspection.width, inspection.height
+                );
+                if let Some(warning) = inspection.warning {
+                    eprintln!("warning: {warning}");
+                }
+            }
+        }
+        AnimationCommand::Inspect {
+            file,
+            elapsed_ms,
+            width,
+            height,
+            reduced_motion,
+            json,
+        } => {
+            let loaded = animation::load(config, file.as_deref())?;
+            let inspection = animation::inspect(&loaded, elapsed_ms, width, height, reduced_motion);
+            if json {
+                print_json(&inspection)?;
+            } else {
+                if let Some(warning) = &inspection.warning {
+                    eprintln!("warning: {warning}");
+                }
+                print!("{}", inspection.content);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn generate_artifacts(root: &std::path::Path, check: bool) -> Result<()> {
     let mode = if check { Mode::Check } else { Mode::Write };
 
     let schemas = [
         ("orc.schema.json", config::schema()),
+        (
+            "terminal.animation.v1.schema.json",
+            serde_json::from_str(&rs_utils::animation::AnimationConfig::json_schema()?)?,
+        ),
         ("provider.schema.json", provider::schema()),
         ("workflow.schema.json", workflow::schema()),
         (

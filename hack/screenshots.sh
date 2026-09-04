@@ -4,13 +4,32 @@ set -euo pipefail
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
 
+screenshot_bin=${ORC_SCREENSHOT_BIN:-}
+provider_dir=${ORC_PROVIDER_DIR:-${ORC_PROVIDERS_DIRECTORY:-}}
+for variable in ${!ORC_@}; do
+  unset "$variable"
+done
+
 fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
 
 mkdir -p "$repo_dir/docs"
-mkdir -p "$fixture/state"
+mkdir -p \
+  "$fixture/cache" \
+  "$fixture/config" \
+  "$fixture/data" \
+  "$fixture/runtime" \
+  "$fixture/state"
+chmod 700 "$fixture/runtime"
 
-if [[ -z ${ORC_SCREENSHOT_BIN:-} ]]; then
+export XDG_CACHE_HOME="$fixture/cache"
+export XDG_CONFIG_HOME="$fixture/config"
+export XDG_DATA_DIRS="$fixture/data"
+export XDG_DATA_HOME="$fixture/data"
+export XDG_RUNTIME_DIR="$fixture/runtime"
+export XDG_STATE_HOME="$fixture/state"
+
+if [[ -z $screenshot_bin ]]; then
   package=$(
     nix build \
       --accept-flake-config \
@@ -19,16 +38,51 @@ if [[ -z ${ORC_SCREENSHOT_BIN:-} ]]; then
       --print-out-paths \
       ./extras#full
   )
-  export ORC_PROVIDER_DIR="$package/share/orc/providers"
-  export ORC_SCREENSHOT_BIN="$package/bin/orc"
+  provider_dir="$package/share/orc/providers"
+  screenshot_bin="$package/bin/orc"
 fi
-if [[ -z ${ORC_PROVIDER_DIR:-} ]]; then
+if [[ -z $provider_dir ]]; then
   printf 'ORC_PROVIDER_DIR is required when ORC_SCREENSHOT_BIN is set\n' >&2
   exit 2
 fi
-export PATH="$(dirname "$ORC_SCREENSHOT_BIN"):$PATH"
+export ORC_PROVIDER_DIR="$provider_dir"
+export ORC_SCREENSHOT_BIN="$screenshot_bin"
+screenshot_bin_dir=$(dirname "$ORC_SCREENSHOT_BIN")
+export PATH="$screenshot_bin_dir:$PATH"
 export ORC_SCREENSHOT_SCOPE="$repo_dir/examples/provider-migration"
-export XDG_STATE_HOME="$fixture/state"
+
+animation="$fixture/animations.yaml"
+cat > "$animation" << 'YAML'
+version: terminal.animation/v1
+animations:
+  loading:
+    full:
+      dimensions: { width: 25, height: 3 }
+      playback: ping_pong
+      easing: ease_in_out
+      fps: 5
+      frames:
+        - { content: "user-owned Orc animation\n⚔ ······················\nassembling the workflow", style: muted }
+        - { content: "user-owned Orc animation\n· ⚔ ····················\nassembling the workflow", style: accent }
+        - { content: "user-owned Orc animation\n·· ⚔ ···················\nassembling the workflow", style: accent }
+        - { content: "user-owned Orc animation\n··· ⚔ ··················\nassembling the workflow", style: success }
+    compact:
+      dimensions: { width: 3, height: 1 }
+      playback: loop
+      easing: linear
+      fps: 4
+      frames:
+        - { content: "⚔  ", style: muted }
+        - { content: " ⚔ ", style: accent }
+        - { content: "  ⚔", style: success }
+    reduced_motion:
+      dimensions: { width: 25, height: 1 }
+      playback: once
+      easing: linear
+      frames:
+        - { content: "⚔ Orc", style: accent, duration_ms: 1000 }
+YAML
+export ORC_UI_ANIMATION_FILE="$animation"
 
 orchestrator=$(
   "$ORC_SCREENSHOT_BIN" connect \
@@ -44,7 +98,7 @@ orchestrator=$(
 )
 
 workflow="$fixture/provider-migration.yaml"
-cat >"$workflow" <<'YAML'
+cat > "$workflow" << 'YAML'
 version: orc.workflow/v1
 name: renderer-provider-migration
 description: Move rendering behind provider contracts

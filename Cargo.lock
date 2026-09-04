@@ -1052,17 +1052,19 @@ dependencies = [
 [[package]]
 name = "rs-utils"
 version = "0.1.0"
-source = "git+https://github.com/roshbhatia/rs-utils?rev=5418d8fbd3b4477095fe82a9db7e80b8377b5857#5418d8fbd3b4477095fe82a9db7e80b8377b5857"
+source = "git+https://github.com/roshbhatia/rs-utils?rev=8b8a7ed#8b8a7ed9673e68a75bb0f85b10eed8ff013a9acc"
 dependencies = [
  "clap",
  "clap_complete",
  "clap_complete_nushell",
  "minijinja",
+ "schemars",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "tempfile",
  "thiserror",
+ "unicode-width",
 ]
 
 [[package]]

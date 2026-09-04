@@ -12,3 +12,9 @@ lifecycle:
 providers:
   directory: ~/.config/orc/providers
   timeoutMs: 5000
+ui:
+  refreshMs: 5000
+  activityRefreshMs: 10000
+  inspectorPercent: 38
+  # animationFile: ~/.config/orc/animations.yaml
+  reducedMotion: false

@@ -37,9 +37,11 @@ use ratatui::{
         Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap,
     },
 };
+use rs_utils::animation::{AnimationConfig, Style as AnimationStyle};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
+    animation,
     config::Config,
     control, daemon,
     domain::{
@@ -630,11 +632,16 @@ struct App {
     boot: BootState,
     preferences: WorkspacePreferences,
     editor: Option<NodeEditor>,
+    loading_animation: AnimationConfig,
+    startup_warning: Option<String>,
 }
 
 impl App {
-    fn loading(config: Config, scope: PathBuf) -> Self {
-        let preferences = preferences::read(&scope).unwrap_or_default();
+    fn loading(config: Config, scope: PathBuf, loading_animation: animation::Loaded) -> Self {
+        let mut preferences = preferences::read(&scope).unwrap_or_default();
+        if preferences.reduced_motion.is_none() {
+            preferences.reduced_motion = Some(config.ui.reduced_motion);
+        }
         let mut config = config;
         config.ui.inspector_percent = preferences.inspector_percent;
         let mut app = Self::new(
@@ -646,6 +653,8 @@ impl App {
         app.boot = BootState::Loading {
             started_at: Instant::now(),
         };
+        app.loading_animation = loading_animation.config;
+        app.startup_warning = loading_animation.warning;
         app.refresh_inflight = false;
         app.enrichment_requested = true;
         app.apply_preferences(preferences);
@@ -719,6 +728,8 @@ impl App {
             boot: BootState::Ready,
             preferences: WorkspacePreferences::default(),
             editor: None,
+            loading_animation: animation::fallback(),
+            startup_warning: None,
         };
         app.rebuild(true);
         app
@@ -965,8 +976,12 @@ impl App {
                         }
                         self.boot = BootState::Ready;
                         self.rebuild(false);
-                        if let Some(warning) = warning {
-                            self.set_status(warning);
+                        let warnings = [self.startup_warning.take(), warning]
+                            .into_iter()
+                            .flatten()
+                            .collect::<Vec<_>>();
+                        if !warnings.is_empty() {
+                            self.set_status(warnings.join(" · "));
                         }
                         if first_load {
                             if let Some(selected) = self.preferences.selected_item.as_deref()
@@ -1934,6 +1949,19 @@ impl App {
             (KeyCode::Char('m'), _) if binding_enabled(self, "mode") => {
                 self.preferences.autonomy = self.preferences.autonomy.next();
                 self.set_status(format!("autonomy: {}", self.preferences.autonomy));
+                self.persist_preferences();
+            }
+            (KeyCode::Char('M'), _) if binding_enabled(self, "reduced-motion") => {
+                let reduced = !self
+                    .preferences
+                    .reduced_motion
+                    .unwrap_or(self.config.ui.reduced_motion);
+                self.preferences.reduced_motion = Some(reduced);
+                self.set_status(if reduced {
+                    "reduced motion enabled"
+                } else {
+                    "reduced motion disabled"
+                });
                 self.persist_preferences();
             }
             (KeyCode::Char('g'), _) if binding_enabled(self, "drill") => self.drill_down(),
@@ -3149,7 +3177,14 @@ fn render(frame: &mut Frame, app: &mut App) {
     app.hit = HitAreas::default();
     match &app.boot {
         BootState::Loading { started_at } => {
-            render_loading(frame, area, *started_at);
+            render_loading(
+                frame,
+                area,
+                *started_at,
+                &app.loading_animation,
+                app.preferences.reduced_motion.unwrap_or(false),
+                app.startup_warning.as_deref(),
+            );
             return;
         }
         BootState::Failed(error) => {
@@ -3191,119 +3226,68 @@ fn render(frame: &mut Frame, app: &mut App) {
     }
 }
 
-const ORC_ART: &[&str] = &[
-    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
-    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣿⣿⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
-    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣤⣶⣧⣄⣉⣉⣠⣼⣶⣤⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
-    "⠀⠀⠀⠀⠀⠀⠀⢰⣿⣿⣿⣿⡿⣿⣿⣿⣿⢿⣿⣿⣿⣿⡆⠀⠀⠀⠀⠀⠀⠀",
-    "⠀⠀⠀⠀⠀⠀⠀⣼⣤⣤⣈⠙⠳⢄⣉⣋⡡⠞⠋⣁⣤⣤⣧⠀⠀⠀⠀⠀⠀⠀",
-    "⠀⢲⣶⣤⣄⡀⢀⣿⣄⠙⠿⣿⣦⣤⡿⢿⣤⣴⣿⠿⠋⣠⣿⠀⢀⣠⣤⣶⡖⠀",
-    "⠀⠀⠙⣿⠛⠇⢸⣿⣿⡟⠀⡄⢉⠉⢀⡀⠉⡉⢠⠀⢻⣿⣿⡇⠸⠛⣿⠋⠀⠀",
-    "⠀⠀⠀⠘⣷⠀⢸⡏⠻⣿⣤⣤⠂⣠⣿⣿⣄⠑⣤⣤⣿⠟⢹⡇⠀⣾⠃⠀⠀⠀",
-    "⠀⠀⠀⠀⠘⠀⢸⣿⡀⢀⠙⠻⢦⣌⣉⣉⣡⡴⠟⠋⡀⢀⣿⡇⠀⠃⠀⠀⠀⠀",
-    "__MOUTH_TOP__",
-    "__MOUTH_MIDDLE__",
-    "__MOUTH_JAW__",
-    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠉⠉⠉⠛⠛⠛⠛⠉⠉⠉⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀",
-];
-const CLOSED_MOUTH: [&str; 3] = [
-    "⠀⠀⠀⠀⠀⠀⢸⣿⣧⠈⠛⠂⠀⠉⠛⠛⠉⠀⠐⠛⠁⣼⣿⡇⠀⠀⠀⠀⠀⠀",
-    "⠀⠀⠀⠀⠀⠀⠸⣏⠀⣤⡶⠖⠛⠋⠉⠉⠙⠛⠲⢶⣤⠀⣹⠇⠀⠀⠀⠀⠀⠀",
-    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⢹⣿⣶⣿⣿⣿⣿⣿⣿⣶⣿⡏⠀⠀⠀⠀⠀⠀⠀⠀⠀",
-];
-const SMILING_MOUTH: [&str; 3] = [
-    "⠀⠀⠀⠀⠀⠀⢸⣿⣧⠀⢠⡿⠛⠛⢿⡄⠀⣼⣿⡇⠀⠀⠀⠀⠀⠀",
-    "⠀⠀⠀⠀⠀⠀⠸⣏⠀⠀⢸⡇⠀⠀⢸⡇⠀⠀⣹⠇⠀⠀⠀⠀⠀⠀",
-    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⢷⣤⣤⡾⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
-];
-const LAUGHING_MOUTH: [&str; 3] = [
-    "⠀⠀⠀⠀⠀⠀⢸⣿⣧⠀⢀⣤⣶⣶⣶⣤⡀⠀⣼⣿⡇⠀⠀⠀⠀⠀⠀",
-    "⠀⠀⠀⠀⠀⠀⠸⣏⠀⠀⣿⡏⠀⠀⠀⠀⢹⣿⠀⠀⣹⠇⠀⠀⠀⠀⠀⠀",
-    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠻⣷⣦⣤⣤⣴⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
-];
-
-#[derive(Clone, Copy)]
-struct LaughFrame {
-    mouth: &'static [&'static str; 3],
-    bob: u16,
-}
-
-const ORC_LAUGH: &[LaughFrame] = &[
-    LaughFrame {
-        mouth: &CLOSED_MOUTH,
-        bob: 0,
-    },
-    LaughFrame {
-        mouth: &SMILING_MOUTH,
-        bob: 0,
-    },
-    LaughFrame {
-        mouth: &LAUGHING_MOUTH,
-        bob: 0,
-    },
-    LaughFrame {
-        mouth: &LAUGHING_MOUTH,
-        bob: 1,
-    },
-    LaughFrame {
-        mouth: &LAUGHING_MOUTH,
-        bob: 0,
-    },
-    LaughFrame {
-        mouth: &SMILING_MOUTH,
-        bob: 0,
-    },
-];
-
-fn render_loading(frame: &mut Frame, area: Rect, started_at: Instant) {
-    let tick = (started_at.elapsed().as_millis() / 110) as usize;
-    let laugh = ORC_LAUGH[tick % ORC_LAUGH.len()];
-    let spinner = spinner_glyph();
-    if area.width < 31 || area.height < 11 {
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("⚔ ", title()),
-                Span::styled(format!("{spinner} "), Style::default().fg(Color::Yellow)),
-                Span::styled("loading Orc…", plain()),
-            ]))
-            .alignment(Alignment::Center),
-            Rect::new(area.x, area.y + area.height / 2, area.width, 1),
-        );
-        return;
-    }
-    let first = usize::from(area.height < 16) * 4;
-    let mut lines = Vec::new();
-    for row in &ORC_ART[first..] {
-        match *row {
-            "__MOUTH_TOP__" => lines.push(Line::from(Span::styled(
-                laugh.mouth[0],
-                accent().add_modifier(Modifier::BOLD),
-            ))),
-            "__MOUTH_MIDDLE__" => lines.push(Line::from(Span::styled(
-                laugh.mouth[1],
-                accent().add_modifier(Modifier::BOLD),
-            ))),
-            "__MOUTH_JAW__" => lines.push(Line::from(Span::styled(
-                laugh.mouth[2],
-                accent().add_modifier(Modifier::BOLD),
-            ))),
-            _ => lines.push(Line::from(Span::styled(*row, plain()))),
-        }
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled(format!("{spinner} "), Style::default().fg(Color::Yellow)),
-        Span::styled("loading workspace…", plain()),
-    ]));
-    let height = lines.len().min(area.height as usize) as u16;
-    let width = 31.min(area.width);
+fn render_loading(
+    frame: &mut Frame,
+    area: Rect,
+    started_at: Instant,
+    config: &AnimationConfig,
+    reduced_motion: bool,
+    warning: Option<&str>,
+) {
+    let elapsed_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let sampled = animation::sample(config, elapsed_ms, area.width, area.height, reduced_motion);
+    let animation_style = match sampled.style {
+        AnimationStyle::Default => plain(),
+        AnimationStyle::Accent => accent().add_modifier(Modifier::BOLD),
+        AnimationStyle::Muted => dim(),
+        AnimationStyle::Success => Style::default().fg(Color::Green),
+        AnimationStyle::Warning => Style::default().fg(Color::Yellow),
+        AnimationStyle::Danger => Style::default().fg(Color::Red),
+    };
+    let height = sampled
+        .height
+        .saturating_add(2)
+        .saturating_add(u16::from(warning.is_some()))
+        .min(area.height);
+    let warning_width = warning
+        .map(UnicodeWidthStr::width)
+        .and_then(|width| u16::try_from(width).ok())
+        .unwrap_or_default();
+    let width = sampled.width.max(20).max(warning_width).min(area.width);
     let target = Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2 + laugh.bob,
+        area.y + area.height.saturating_sub(height) / 2,
         width,
         height,
     );
-    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), target);
+    frame.render_widget(Clear, target);
+    let art_height = sampled.height.min(target.height);
+    frame.render_widget(
+        Paragraph::new(sampled.content)
+            .style(animation_style)
+            .alignment(Alignment::Center),
+        Rect::new(target.x, target.y, target.width, art_height),
+    );
+    let label_y = target.y.saturating_add(art_height).saturating_add(1);
+    if label_y < target.bottom() {
+        frame.render_widget(
+            Paragraph::new("loading workspace…")
+                .style(plain())
+                .alignment(Alignment::Center),
+            Rect::new(target.x, label_y, target.width, 1),
+        );
+    }
+    let warning_y = label_y.saturating_add(1);
+    if let Some(warning) = warning
+        && warning_y < target.bottom()
+    {
+        frame.render_widget(
+            Paragraph::new(warning)
+                .style(Style::default().fg(Color::Yellow))
+                .alignment(Alignment::Center),
+            Rect::new(target.x, warning_y, target.width, 1),
+        );
+    }
 }
 
 fn render_startup_error(frame: &mut Frame, area: Rect, error: &str) {
@@ -4372,6 +4356,14 @@ const BINDINGS: &[Binding] = &[
         work_main
     ),
     binding!(
+        "reduced-motion",
+        "M",
+        "motion",
+        "toggle reduced motion for this workspace",
+        false,
+        anywhere
+    ),
+    binding!(
         "gate",
         "a",
         "gate",
@@ -4756,10 +4748,11 @@ impl Drop for TerminalGuard {
 
 pub fn run(config: Config, scope: &Path) -> Result<()> {
     let scope = crate::state::resolve_scope(scope)?;
+    let loaded_animation = animation::load(&config, None)?;
     daemon::ensure_running(&config)?;
     let (_guard, mut terminal) = TerminalGuard::enter()?;
     let (tx, rx): (Sender<BackgroundResult>, Receiver<BackgroundResult>) = mpsc::channel();
-    let mut app = App::loading(config, scope);
+    let mut app = App::loading(config, scope, loaded_animation);
     app.request_refresh(&tx);
     let mut last_tick = Instant::now();
     let mut last_draw = Instant::now();
@@ -4864,11 +4857,26 @@ pub fn run(config: Config, scope: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn preview_loading() -> Result<()> {
+pub fn preview_loading(config: &Config, scope: &Path) -> Result<()> {
+    let loaded_animation = animation::load(config, None)?;
+    let scope = crate::state::resolve_scope(scope)?;
+    let preferences = preferences::read(&scope).unwrap_or_default();
+    let reduced_motion = preferences
+        .reduced_motion
+        .unwrap_or(config.ui.reduced_motion);
     let (_guard, mut terminal) = TerminalGuard::enter()?;
     let started_at = Instant::now();
     loop {
-        terminal.draw(|frame| render_loading(frame, frame.area(), started_at))?;
+        terminal.draw(|frame| {
+            render_loading(
+                frame,
+                frame.area(),
+                started_at,
+                &loaded_animation.config,
+                reduced_motion,
+                loaded_animation.warning.as_deref(),
+            );
+        })?;
         if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
             && key.kind != KeyEventKind::Release
@@ -5797,7 +5805,15 @@ actions:
     fn startup_refresh_expands_active_work() {
         let mut state = app().state;
         state.runs.push(workflow_run());
-        let mut app = App::loading(Config::default(), PathBuf::from("/tmp/orc-test"));
+        let mut app = App::loading(
+            Config::default(),
+            PathBuf::from("/tmp/orc-test"),
+            animation::Loaded {
+                config: animation::fallback(),
+                source: animation::Source::Packaged,
+                warning: None,
+            },
+        );
         app.apply_background(BackgroundResult::Refresh(Ok((state, None, None))));
 
         assert_eq!(app.active_run.as_deref(), Some("run"));
@@ -6236,6 +6252,34 @@ actions:
     }
 
     #[test]
+    fn startup_surfaces_an_implicit_animation_fallback_warning() {
+        let mut app = app();
+        app.boot = BootState::Loading {
+            started_at: Instant::now(),
+        };
+        app.startup_warning = Some("ignored invalid animations.yaml".into());
+        let state = app.state.clone();
+
+        app.apply_background(BackgroundResult::Refresh(Ok((state, None, None))));
+
+        assert_eq!(
+            app.visible_status(),
+            Some("ignored invalid animations.yaml")
+        );
+    }
+
+    #[test]
+    fn reduced_motion_toggle_updates_the_workspace_preference() {
+        let mut app = app();
+        let (tx, _rx) = mpsc::channel();
+        assert_eq!(app.preferences.reduced_motion, None);
+
+        app.handle_key(key(KeyCode::Char('M'), KeyModifiers::SHIFT), &tx);
+
+        assert_eq!(app.preferences.reduced_motion, Some(true));
+    }
+
+    #[test]
     fn ctrl_c_quits_from_modal_states() {
         let mut app = app();
         let (tx, _rx) = mpsc::channel();
@@ -6250,19 +6294,47 @@ actions:
 
     #[test]
     fn loading_art_is_responsive() {
+        let animation = animation::fallback();
         for (width, height) in [(120, 40), (31, 16), (31, 11), (30, 9)] {
             let backend = TestBackend::new(width, height);
             let mut terminal = Terminal::new(backend).expect("test terminal");
             terminal
-                .draw(|frame| render_loading(frame, frame.area(), Instant::now()))
+                .draw(|frame| {
+                    render_loading(frame, frame.area(), Instant::now(), &animation, false, None);
+                })
                 .expect("loading art renders");
         }
-        assert_eq!(ORC_LAUGH.len(), 6);
-        for frame in ORC_LAUGH {
-            for line in frame.mouth {
-                assert!(line.width() <= 31, "mouth line exceeds the art width");
-            }
-        }
+        let (full, variant) = animation::select(&animation, 120, 40, false);
+        assert_eq!(variant, "full");
+        assert_eq!((full.dimensions.width, full.dimensions.height), (31, 15));
+    }
+
+    #[test]
+    fn loading_preview_surfaces_an_implicit_fallback_warning() {
+        let animation = animation::fallback();
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                render_loading(
+                    frame,
+                    frame.area(),
+                    Instant::now(),
+                    &animation,
+                    false,
+                    Some("ignored invalid /tmp/animations.yaml"),
+                );
+            })
+            .expect("loading warning renders");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("ignored invalid /tmp/animations.yaml"));
     }
 
     #[test]

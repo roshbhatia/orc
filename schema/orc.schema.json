@@ -78,12 +78,23 @@
           "minimum": 0,
           "type": "integer"
         },
+        "animationFile": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "inspectorPercent": {
           "default": 28,
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0,
           "type": "integer"
+        },
+        "reducedMotion": {
+          "default": false,
+          "type": "boolean"
         },
         "refreshMs": {
           "default": 5000,
@@ -149,7 +160,9 @@
       "$ref": "#/$defs/UiConfig",
       "default": {
         "activityRefreshMs": 10000,
+        "animationFile": null,
         "inspectorPercent": 28,
+        "reducedMotion": false,
         "refreshMs": 5000
       }
     },

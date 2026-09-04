@@ -68,6 +68,7 @@ pub struct WorkspacePreferences {
     pub graph_pan_y: f64,
     pub graph_zoom: f64,
     pub display_direction: String,
+    pub reduced_motion: Option<bool>,
 }
 
 impl Default for WorkspacePreferences {
@@ -86,6 +87,7 @@ impl Default for WorkspacePreferences {
             graph_pan_y: 0.0,
             graph_zoom: 1.0,
             display_direction: "right".into(),
+            reduced_motion: None,
         }
     }
 }

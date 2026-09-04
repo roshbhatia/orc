@@ -357,6 +357,8 @@ ui:
   refreshMs: 5000
   activityRefreshMs: 10000
   inspectorPercent: 38
+  # animationFile: ~/.config/orc/animations.yaml
+  reducedMotion: false
 ```
 
 Set `daemon.terminationRetrySeconds` to `0` to retry a failed termination on
@@ -373,10 +375,33 @@ ORC_PROVIDERS_DIRECTORY=/tmp/orc-providers orc providers
 ORC_PROVIDERS_TIMEOUT_MS=10000 orc
 ORC_WORKFLOWS_REPOSITORY=/tmp/orc-workflows orc workflow list
 ORC_UI_REFRESH_MS=1000 orc
+ORC_UI_ANIMATION_FILE=/tmp/my-animation.yaml orc animation validate
+ORC_UI_REDUCED_MOTION=true orc
 ```
 
 `ORC_PROVIDER_DIR` and `ORC_PROVIDER_TIMEOUT_MS` remain compatibility aliases.
 The generated schema supports YAML editor validation.
+
+Orc looks for user-owned loading frames in
+`$XDG_CONFIG_HOME/orc/animations.yaml`. The file uses the shared
+`terminal.animation/v1` contract. Copy `assets/animations.yaml` as a starting
+point, then replace the `full` and `compact` frame lists. The packaged default
+is static. Motion only comes from your YAML.
+
+An explicit `ui.animationFile`, `ORC_UI_ANIMATION_FILE`, or `--file` must be
+valid and readable. A missing implicit file uses the packaged animation. If the
+implicit XDG file is invalid, `orc animation` reports the problem and uses the
+packaged animation safely. Press `M` in the dashboard to persist reduced motion
+for the current workspace. The global `ui.reducedMotion` value sets its initial
+value.
+
+Validate and sample frames without opening the dashboard:
+
+```bash
+orc animation validate
+orc animation inspect --elapsed-ms 250 --width 120 --height 40
+orc animation inspect --width 20 --height 8 --reduced-motion
+```
 
 <!-- BEGIN GENERATED:commands -->
 ### `orc tui`
@@ -1034,6 +1059,58 @@ Options:
   -h, --help           Print help
 ```
 
+### `orc animation`
+
+Validate and inspect terminal animations
+
+```text
+Validate and inspect terminal animations
+
+Usage: orc animation <COMMAND>
+
+Commands:
+  validate  Validate the resolved animation configuration
+  inspect   Render one deterministic animation sample
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+```
+
+### `orc animation validate`
+
+Validate the resolved animation configuration
+
+```text
+Validate the resolved animation configuration
+
+Usage: orc animation validate [OPTIONS]
+
+Options:
+      --file <PATH>
+      --json
+  -h, --help         Print help
+```
+
+### `orc animation inspect`
+
+Render one deterministic animation sample
+
+```text
+Render one deterministic animation sample
+
+Usage: orc animation inspect [OPTIONS]
+
+Options:
+      --file <PATH>
+      --elapsed-ms <ELAPSED_MS>  [default: 0]
+      --width <WIDTH>            [default: 80]
+      --height <HEIGHT>          [default: 24]
+      --reduced-motion
+      --json
+  -h, --help                     Print help
+```
+
 ### `orc workflow`
 
 Manage versioned workflow definitions
@@ -1350,7 +1427,7 @@ Print generated JSON schemas
 Usage: orc schema <SCHEMA>
 
 Arguments:
-  <SCHEMA>  [possible values: config, provider, workflow, state]
+  <SCHEMA>  [possible values: config, animation, provider, workflow, state]
 
 Options:
   -h, --help  Print help

@@ -18,7 +18,7 @@ libc = "0.2"
 minijinja = "2.21"
 rataflow = { version = "0.1.0", default-features = false, features = ["crossterm", "sugiyama"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
-rs-utils = { git = "https://github.com/roshbhatia/rs-utils", rev = "5418d8fbd3b4477095fe82a9db7e80b8377b5857" }
+rs-utils = { git = "https://github.com/roshbhatia/rs-utils", rev = "8b8a7ed" }
 schemars = { version = "1", features = ["chrono04"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

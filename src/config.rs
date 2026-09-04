@@ -1,5 +1,7 @@
 use std::{
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -112,6 +114,8 @@ pub struct UiConfig {
     pub refresh_ms: u64,
     pub activity_refresh_ms: u64,
     pub inspector_percent: u16,
+    pub animation_file: Option<PathBuf>,
+    pub reduced_motion: bool,
 }
 
 impl Default for UiConfig {
@@ -120,14 +124,24 @@ impl Default for UiConfig {
             refresh_ms: 5_000,
             activity_refresh_ms: 10_000,
             inspector_percent: 28,
+            animation_file: None,
+            reduced_motion: false,
         }
     }
 }
 
 pub fn config_home() -> PathBuf {
-    env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+    config_home_from(env::var_os("XDG_CONFIG_HOME"), env::var_os("HOME"))
+}
+
+fn config_home_from(xdg: Option<OsString>, home: Option<OsString>) -> PathBuf {
+    xdg.map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            home.map(PathBuf::from)
+                .filter(|path| !path.as_os_str().is_empty())
+                .map(|path| path.join(".config"))
+        })
         .unwrap_or_else(|| PathBuf::from(".config"))
 }
 
@@ -237,8 +251,15 @@ pub fn load() -> Result<Config> {
     if let Ok(value) = env::var("ORC_UI_INSPECTOR_PERCENT") {
         config.ui.inspector_percent = value.parse().context("parse UI inspector size")?;
     }
+    if let Some(value) = env::var_os("ORC_UI_ANIMATION_FILE") {
+        config.ui.animation_file = Some(value.into());
+    }
+    if let Ok(value) = env::var("ORC_UI_REDUCED_MOTION") {
+        config.ui.reduced_motion = parse_bool(&value, "UI reduced motion")?;
+    }
     config.providers.directory = expand_home(config.providers.directory);
     config.workflows.repository = expand_home(config.workflows.repository);
+    config.ui.animation_file = config.ui.animation_file.map(expand_home);
     if config.providers.timeout_ms == 0 {
         bail!("providers.timeoutMs must be positive");
     }
@@ -368,6 +389,36 @@ mod tests {
                 PathBuf::from("/first/share/orc/providers"),
                 PathBuf::from("/second/share/orc/providers"),
             ]
+        );
+    }
+
+    #[test]
+    fn config_home_rejects_an_empty_xdg_path() {
+        assert_eq!(
+            config_home_from(Some(OsString::new()), Some(OsString::from("/home/tester"))),
+            PathBuf::from("/home/tester/.config")
+        );
+    }
+
+    #[test]
+    fn config_home_rejects_a_relative_xdg_path() {
+        assert_eq!(
+            config_home_from(
+                Some(OsString::from("relative")),
+                Some(OsString::from("/home/tester"))
+            ),
+            PathBuf::from("/home/tester/.config")
+        );
+    }
+
+    #[test]
+    fn config_home_accepts_an_absolute_xdg_path() {
+        assert_eq!(
+            config_home_from(
+                Some(OsString::from("/custom/config")),
+                Some(OsString::from("/home/tester"))
+            ),
+            PathBuf::from("/custom/config")
         );
     }
 

@@ -1,0 +1,284 @@
+{
+  "$defs": {
+    "Animation": {
+      "additionalProperties": false,
+      "description": "Full and accessibility-oriented variants of one animation.",
+      "properties": {
+        "compact": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Sequence"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional smaller rendering for constrained layouts."
+        },
+        "full": {
+          "$ref": "#/$defs/Sequence",
+          "description": "Normal rendering at the declared cell dimensions."
+        },
+        "reduced_motion": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Sequence"
+            },
+            {
+              "properties": {
+                "frames": {
+                  "maxItems": 1,
+                  "minItems": 1
+                },
+                "playback": {
+                  "const": "once"
+                }
+              }
+            }
+          ],
+          "description": "Static rendering when motion is reduced."
+        }
+      },
+      "required": [
+        "full",
+        "reduced_motion"
+      ],
+      "type": "object"
+    },
+    "Dimensions": {
+      "additionalProperties": false,
+      "description": "Terminal-cell canvas dimensions.",
+      "properties": {
+        "height": {
+          "description": "Canvas height in rows.",
+          "format": "uint16",
+          "maximum": 256,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "width": {
+          "description": "Canvas width in display cells.",
+          "format": "uint16",
+          "maximum": 512,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "width",
+        "height"
+      ],
+      "type": "object"
+    },
+    "Easing": {
+      "description": "Bounded easing names shared by all implementations.",
+      "oneOf": [
+        {
+          "const": "linear",
+          "description": "Constant velocity.",
+          "type": "string"
+        },
+        {
+          "const": "ease_in",
+          "description": "Accelerate from rest.",
+          "type": "string"
+        },
+        {
+          "const": "ease_out",
+          "description": "Decelerate to rest.",
+          "type": "string"
+        },
+        {
+          "const": "ease_in_out",
+          "description": "Accelerate, then decelerate.",
+          "type": "string"
+        }
+      ]
+    },
+    "Frame": {
+      "additionalProperties": false,
+      "description": "A complete frame and its renderer-selected semantic style.",
+      "properties": {
+        "content": {
+          "description": "Full frame text without ANSI escapes.",
+          "pattern": "^[^\\r\\t\\u001b]*$",
+          "type": "string"
+        },
+        "duration_ms": {
+          "description": "Frame duration. Required on every frame when `fps` is absent.",
+          "format": "uint64",
+          "maximum": 10000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "style": {
+          "$ref": "#/$defs/Style",
+          "description": "Semantic style resolved by the consuming renderer."
+        }
+      },
+      "required": [
+        "content",
+        "style"
+      ],
+      "type": "object"
+    },
+    "Playback": {
+      "description": "Playback behavior after the sequence reaches its end.",
+      "oneOf": [
+        {
+          "const": "once",
+          "description": "Stop on the final frame.",
+          "type": "string"
+        },
+        {
+          "const": "loop",
+          "description": "Return to the first frame.",
+          "type": "string"
+        },
+        {
+          "const": "ping_pong",
+          "description": "Reverse without repeating either endpoint.",
+          "type": "string"
+        }
+      ]
+    },
+    "Sequence": {
+      "additionalProperties": false,
+      "description": "One timed sequence with a stable terminal-cell canvas.",
+      "oneOf": [
+        {
+          "properties": {
+            "frames": {
+              "items": {
+                "not": {
+                  "required": [
+                    "duration_ms"
+                  ]
+                }
+              }
+            }
+          },
+          "required": [
+            "fps"
+          ]
+        },
+        {
+          "not": {
+            "required": [
+              "fps"
+            ]
+          },
+          "properties": {
+            "frames": {
+              "items": {
+                "required": [
+                  "duration_ms"
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "dimensions": {
+          "$ref": "#/$defs/Dimensions",
+          "description": "Width and height of every rendered frame in terminal cells."
+        },
+        "easing": {
+          "$ref": "#/$defs/Easing",
+          "description": "Easing applied to progress within the selected frame."
+        },
+        "fps": {
+          "description": "Frames per second. Omit this when every frame has `duration_ms`.",
+          "format": "uint16",
+          "maximum": 60,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "frames": {
+          "description": "Ordered full-text frames.",
+          "items": {
+            "$ref": "#/$defs/Frame"
+          },
+          "maxItems": 512,
+          "minItems": 1,
+          "type": "array"
+        },
+        "playback": {
+          "$ref": "#/$defs/Playback",
+          "description": "Behavior after the last frame."
+        }
+      },
+      "required": [
+        "dimensions",
+        "playback",
+        "easing",
+        "frames"
+      ],
+      "type": "object"
+    },
+    "Style": {
+      "description": "Semantic frame styles. Applications map these roles to their palette.",
+      "oneOf": [
+        {
+          "const": "default",
+          "description": "Normal foreground text.",
+          "type": "string"
+        },
+        {
+          "const": "accent",
+          "description": "Primary animated emphasis.",
+          "type": "string"
+        },
+        {
+          "const": "muted",
+          "description": "Secondary text.",
+          "type": "string"
+        },
+        {
+          "const": "success",
+          "description": "Successful state.",
+          "type": "string"
+        },
+        {
+          "const": "warning",
+          "description": "Warning state.",
+          "type": "string"
+        },
+        {
+          "const": "danger",
+          "description": "Failed state.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$id": "https://roshbhatia.github.io/schemas/terminal.animation.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A set of named terminal animations.",
+  "properties": {
+    "animations": {
+      "additionalProperties": {
+        "$ref": "#/$defs/Animation"
+      },
+      "description": "Animations keyed by an application-defined name.",
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": ".*\\S.*"
+      },
+      "type": "object"
+    },
+    "version": {
+      "const": "terminal.animation/v1",
+      "description": "Must equal [`VERSION`].",
+      "type": "string"
+    }
+  },
+  "required": [
+    "version",
+    "animations"
+  ],
+  "title": "AnimationConfig",
+  "type": "object"
+}

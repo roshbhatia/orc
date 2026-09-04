@@ -99,6 +99,7 @@
             rustfmt
             shellcheck
             shfmt
+            ttyd
             vhs
           ];
         };
