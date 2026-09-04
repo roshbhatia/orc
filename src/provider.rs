@@ -751,13 +751,74 @@ fn invoke_raw(
         let _ = input_sender.send(write_provider_input(stdin, &payload, &input_cancel_writer));
     });
     let remaining = deadline.saturating_duration_since(Instant::now());
+    let input_result = input_receiver.recv_timeout(remaining);
+    if matches!(input_result, Err(RecvTimeoutError::Timeout)) {
+        input_cancel.store(true, Ordering::Relaxed);
+        let cleanup = finish_process_control(&mut tracker, &mut process_group, tracker_directory);
+        let wait = child.wait();
+        let writer_panicked = input.join().is_err();
+        discard_drain(stdout);
+        discard_drain(stderr);
+        let cleanup_failure = cleanup
+            .err()
+            .map(|error| format!("process cleanup failed: {error:#}"))
+            .or_else(|| {
+                wait.err()
+                    .map(|error| format!("process reap failed: {error:#}"))
+            })
+            .or_else(|| writer_panicked.then(|| "request writer panicked".to_owned()));
+        let message = cleanup_failure.map_or_else(
+            || "timed out while reading its request".to_owned(),
+            |failure| format!("timed out while reading its request; {failure}"),
+        );
+        record_invocation(
+            provider,
+            request,
+            false,
+            started.elapsed().as_millis(),
+            &message,
+        );
+        bail!("{} {message}", provider.name);
+    }
+    let writer_panicked = input.join().is_err();
+    let input_failure = if writer_panicked {
+        Some("provider stdin writer panicked".to_owned())
+    } else {
+        match input_result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!("provider request failed: {error}")),
+            Err(RecvTimeoutError::Disconnected) => Some("provider request writer stopped".into()),
+            Err(RecvTimeoutError::Timeout) => unreachable!("handled provider request timeout"),
+        }
+    };
+    if let Some(message) = input_failure {
+        input_cancel.store(true, Ordering::Relaxed);
+        let cleanup = finish_process_control(&mut tracker, &mut process_group, tracker_directory);
+        let _ = child.wait();
+        discard_drain(stdout);
+        discard_drain(stderr);
+        record_invocation(
+            provider,
+            request,
+            false,
+            started.elapsed().as_millis(),
+            &message,
+        );
+        if let Err(error) = cleanup {
+            bail!(
+                "{}: {message}; provider cleanup failed: {error:#}",
+                provider.name
+            );
+        }
+        bail!("{}: {message}", provider.name);
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
     let status = match child.wait_timeout(remaining)? {
         Some(status) => status,
         None => {
             input_cancel.store(true, Ordering::Relaxed);
             finish_process_control(&mut tracker, &mut process_group, tracker_directory)?;
             let _ = child.wait();
-            let _ = input.join();
             discard_drain(stdout);
             discard_drain(stderr);
             record_invocation(
@@ -771,39 +832,6 @@ fn invoke_raw(
         }
     };
     finish_process_control(&mut tracker, &mut process_group, tracker_directory)?;
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let input_result = input_receiver.recv_timeout(remaining);
-    if input_result.is_err() {
-        input_cancel.store(true, Ordering::Relaxed);
-        let _ = finish_process_control(&mut tracker, &mut process_group, tracker_directory);
-    }
-    let writer_panicked = input.join().is_err();
-    let input_failure = if Instant::now() >= deadline {
-        Some("provider timed out while reading its request".to_owned())
-    } else if writer_panicked {
-        Some("provider stdin writer panicked".to_owned())
-    } else {
-        match input_result {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(format!("provider request failed: {error}")),
-            Err(RecvTimeoutError::Timeout) => {
-                Some("provider timed out while reading its request".into())
-            }
-            Err(RecvTimeoutError::Disconnected) => Some("provider request writer stopped".into()),
-        }
-    };
-    if let Some(message) = input_failure {
-        discard_drain(stdout);
-        discard_drain(stderr);
-        record_invocation(
-            provider,
-            request,
-            false,
-            started.elapsed().as_millis(),
-            &message,
-        );
-        bail!("{}: {message}", provider.name);
-    }
     let stdout =
         finish_drain_with_timeout(stdout, deadline.saturating_duration_since(Instant::now()))
             .with_context(|| format!("{} timed out draining stdout", provider.name))?;
@@ -2951,6 +2979,32 @@ exit 0
 
         assert!(error.to_string().contains("timed out"), "{error:#}");
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn provider_preserves_request_error_before_deadline() {
+        let directory = tempfile::tempdir().expect("provider directory");
+        let command = write_provider(
+            directory.path(),
+            "closed-input",
+            r#"#!/bin/sh
+exit 0
+"#,
+        );
+        let provider = provider_manifest("closed-input", &command, 0);
+        let mut config = Config::default();
+        config.providers.timeout_ms = 2_000;
+        let request = json!({
+            "version": "orc.provider/v1",
+            "scope": directory.path(),
+            "payload": "x".repeat(2 * 1024 * 1024),
+        });
+
+        let error = invoke_raw(&provider, &request, &config, None)
+            .expect_err("provider that closes stdin must report delivery failure");
+
+        assert!(error.to_string().contains("request failed"), "{error:#}");
+        assert!(!error.to_string().contains("timed out"), "{error:#}");
     }
 
     #[test]
