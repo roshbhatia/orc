@@ -2477,6 +2477,9 @@ fn terminate_process_group(child: &mut Child) -> Result<()> {
         const SIGKILL: i32 = 9;
         if unsafe { kill(-(child.id() as i32), SIGKILL) } != 0 {
             let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
             if child.try_wait()?.is_none() {
                 return Err(error).context("terminate command process group");
             }
@@ -3068,7 +3071,7 @@ actions:
 request=$(cat)
 case "$request" in
   *'"harness":"available-harness"'*)
-    printf '%s\n' '{"version":"orc.provider/v1","command":["/usr/bin/true"]}'
+    printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
     ;;
   *)
     printf '%s\n' '{"version":"orc.provider/v1","status":"declined","reason":"unknown harness"}'
@@ -3081,15 +3084,15 @@ esac
             Capability::SessionLaunch,
             "Launch an available harness".into(),
         )]);
-        let mut persistence = provider_manifest("persistence", Path::new("/usr/bin/true"), 0);
+        let mut persistence = provider_manifest("persistence", Path::new("true"), 0);
         persistence.actions = BTreeMap::from([
             (Capability::SessionPersist, "Persist a session".into()),
             (Capability::SessionStop, "Stop a session".into()),
         ]);
-        let mut execution = provider_manifest("executor", Path::new("/usr/bin/true"), 0);
+        let mut execution = provider_manifest("executor", Path::new("true"), 0);
         execution.actions =
             BTreeMap::from([(Capability::ExecutionRun, "Execute a session".into())]);
-        let mut display = provider_manifest("display", Path::new("/usr/bin/true"), 0);
+        let mut display = provider_manifest("display", Path::new("true"), 0);
         display.actions = BTreeMap::from([(Capability::TerminalOpen, "Open a session".into())]);
         let providers = [launch, persistence, execution, display];
         let mut config = Config::default();
@@ -3131,7 +3134,7 @@ esac
             r#"#!/bin/sh
 cat >/dev/null
 if [ -e "$1" ]; then
-  printf '%s\n' '{"version":"orc.provider/v1","command":["/usr/bin/true"]}'
+  printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
 else
   printf '%s\n' '{"version":"orc.provider/v1","status":"declined","reason":"harness unavailable"}'
 fi
@@ -3146,15 +3149,15 @@ fi
             Capability::SessionLaunch,
             "Launch an available harness".into(),
         )]);
-        let mut persistence = provider_manifest("persistence", Path::new("/usr/bin/true"), 0);
+        let mut persistence = provider_manifest("persistence", Path::new("true"), 0);
         persistence.actions = BTreeMap::from([
             (Capability::SessionPersist, "Persist a session".into()),
             (Capability::SessionStop, "Stop a session".into()),
         ]);
-        let mut execution = provider_manifest("executor", Path::new("/usr/bin/true"), 0);
+        let mut execution = provider_manifest("executor", Path::new("true"), 0);
         execution.actions =
             BTreeMap::from([(Capability::ExecutionRun, "Execute a session".into())]);
-        let mut display = provider_manifest("display", Path::new("/usr/bin/true"), 0);
+        let mut display = provider_manifest("display", Path::new("true"), 0);
         display.actions = BTreeMap::from([(Capability::TerminalOpen, "Open a session".into())]);
         let providers = [launch, persistence, execution, display];
         let mut config = Config::default();

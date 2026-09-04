@@ -5080,7 +5080,7 @@ mod tests {
 
         app.providers.push(
             serde_yaml::from_str(
-                "version: orc.provider/v1\nname: display\nkind: display\ncommand: /usr/bin/true\nactions:\n  terminal.focus: Focus an existing display\n",
+                "version: orc.provider/v1\nname: display\nkind: display\ncommand: \"true\"\nactions:\n  terminal.focus: Focus an existing display\n",
             )
             .expect("display provider manifest"),
         );
@@ -5617,9 +5617,9 @@ command:
 actions:
   session.launch: Launch a harness
 "#,
-            "version: orc.provider/v1\nname: persistence\nkind: persistence\ncommand: /usr/bin/true\nactions:\n  session.persist: Preserve a session\n  session.stop: Stop a session\n",
-            "version: orc.provider/v1\nname: executor-a\nkind: execution\ncommand: /usr/bin/true\nactions:\n  execution.run: Execute the plan\n",
-            "version: orc.provider/v1\nname: display\nkind: display\ncommand: /usr/bin/true\nactions:\n  terminal.open: Open a display\n",
+            "version: orc.provider/v1\nname: persistence\nkind: persistence\ncommand: \"true\"\nactions:\n  session.persist: Preserve a session\n  session.stop: Stop a session\n",
+            "version: orc.provider/v1\nname: executor-a\nkind: execution\ncommand: \"true\"\nactions:\n  execution.run: Execute the plan\n",
+            "version: orc.provider/v1\nname: display\nkind: display\ncommand: \"true\"\nactions:\n  terminal.open: Open a display\n",
         ]
         .into_iter()
         .map(|manifest| serde_yaml::from_str(manifest).expect("provider manifest"))
@@ -5652,10 +5652,10 @@ actions:
         app.active_run = Some("run".into());
         app.explorer_view = ExplorerView::Graph;
         app.providers = [
-            "version: orc.provider/v1\nname: harness\nkind: harness\ncommand: /usr/bin/true\nactions:\n  session.launch: Launch a harness\n",
-            "version: orc.provider/v1\nname: persistence\nkind: persistence\ncommand: /usr/bin/true\nactions:\n  session.persist: Preserve a session\n  session.stop: Stop a session\n",
-            "version: orc.provider/v1\nname: executor-a\nkind: execution\ncommand: /usr/bin/true\nactions:\n  execution.run: Execute the plan\n",
-            "version: orc.provider/v1\nname: display\nkind: display\ncommand: /usr/bin/true\nactions:\n  terminal.open: Open a display\n",
+            "version: orc.provider/v1\nname: harness\nkind: harness\ncommand: \"true\"\nactions:\n  session.launch: Launch a harness\n",
+            "version: orc.provider/v1\nname: persistence\nkind: persistence\ncommand: \"true\"\nactions:\n  session.persist: Preserve a session\n  session.stop: Stop a session\n",
+            "version: orc.provider/v1\nname: executor-a\nkind: execution\ncommand: \"true\"\nactions:\n  execution.run: Execute the plan\n",
+            "version: orc.provider/v1\nname: display\nkind: display\ncommand: \"true\"\nactions:\n  terminal.open: Open a display\n",
         ]
         .into_iter()
         .map(|manifest| serde_yaml::from_str(manifest).expect("provider manifest"))

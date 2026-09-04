@@ -5837,12 +5837,15 @@ steps:
         let directory = tempfile::tempdir().expect("tracker directory");
         let tracker_directory = directory.path().join("trackers");
         let worker_directory = tracker_directory.clone();
+        let ready = directory.path().join("ready");
         let plan = CommandPlan {
             version: "orc.provider/v1".into(),
             command: vec![
                 "sh".into(),
                 "-c".into(),
-                "trap '' TERM; while :; do sleep 3600; done".into(),
+                "trap '' TERM; : > \"$1\"; while :; do sleep 3600; done".into(),
+                "orc-cancellation-fixture".into(),
+                ready.display().to_string(),
             ],
             cwd: None,
             environment: BTreeMap::new(),
@@ -5851,7 +5854,7 @@ steps:
         let worker = thread::spawn(move || {
             provider::run_plan_tracked(&plan, Path::new("."), Some(&worker_directory))
         });
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let tracker_exists = fs::read_dir(&tracker_directory)
                 .ok()
@@ -5861,10 +5864,13 @@ steps:
                 .any(|entry| {
                     entry.path().extension().and_then(|value| value.to_str()) == Some("process")
                 });
-            if tracker_exists {
+            if tracker_exists && ready.exists() {
                 break;
             }
-            assert!(Instant::now() < deadline, "tracked command did not start");
+            assert!(
+                Instant::now() < deadline,
+                "tracked command did not install its termination handler"
+            );
             thread::sleep(Duration::from_millis(10));
         }
 
@@ -5874,7 +5880,7 @@ steps:
 
         assert!(
             result.is_ok(),
-            "tracked runner must reconcile after cancellation"
+            "tracked runner must reconcile after cancellation: {result:?}"
         );
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(
