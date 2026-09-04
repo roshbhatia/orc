@@ -37,7 +37,8 @@ let
       cp ${./provider.sh} "$out/lib/provider.sh"
       cp ${manifest} "$out/share/orc/providers/${name}/provider.yaml"
       chmod 0555 "$out/bin/orc-provider-${name}" "$out/lib/provider.sh"
-      patchShebangs "$out/bin/orc-provider-${name}"
+      substituteInPlace "$out/bin/orc-provider-${name}" "$out/lib/provider.sh" \
+        --replace-fail '#!/usr/bin/env bash' '#!${lib.getExe bash}'
       wrapProgram "$out/bin/orc-provider-${name}" \
         --prefix PATH : ${lib.makeBinPath providerRuntimeInputs} \
         --set ORC_PROVIDER_SELF "$out/bin/orc-provider-${name}"
