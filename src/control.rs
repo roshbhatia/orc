@@ -10,6 +10,7 @@ use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
@@ -24,6 +25,10 @@ use crate::{
 };
 
 const MAX_NODE_OUTPUT_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Error)]
+#[error("no matching active session")]
+pub(crate) struct NoMatchingActiveSession;
 
 fn require_transition(
     subject: LifecycleSubject,
@@ -1161,6 +1166,18 @@ pub(crate) fn terminable(session: &Session) -> bool {
             ))
 }
 
+pub(crate) fn has_active_session(
+    scope: &Path,
+    id: Option<&str>,
+    native_id: Option<&str>,
+) -> Result<bool> {
+    Ok(read_workspace(scope)?.sessions.iter().any(|session| {
+        session.status.active()
+            && (id.is_some_and(|id| session.id == id)
+                || native_id.is_some_and(|native| session.native_id == native))
+    }))
+}
+
 pub fn archive(scope: &Path, id: Option<&str>, native_id: Option<&str>) -> Result<Session> {
     let scope = state::resolve_scope(scope)?;
     state::update(&scope, |workspace| {
@@ -1173,7 +1190,7 @@ pub fn archive(scope: &Path, id: Option<&str>, native_id: Option<&str>) -> Resul
                     || native_id.is_some_and(|native| session.native_id == native)
             })
             .max_by_key(|session| session.updated_at)
-            .context("no matching active session")?;
+            .ok_or(NoMatchingActiveSession)?;
         if session.status == LifecycleStatus::Terminating {
             bail!("session termination is in progress: {}", session.id);
         }

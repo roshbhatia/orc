@@ -846,8 +846,26 @@ pub fn run() -> Result<u8> {
                     }
                     return Ok(0);
                 }
+                if hook_input
+                    && !control::has_active_session(
+                        &scope.scope,
+                        id.as_deref(),
+                        native_id.as_deref(),
+                    )?
+                {
+                    return Ok(0);
+                }
                 require_orchestrator_or_operator(&scope.scope)?;
-                let session = control::archive(&scope.scope, id.as_deref(), native_id.as_deref())?;
+                let session =
+                    match control::archive(&scope.scope, id.as_deref(), native_id.as_deref()) {
+                        Ok(session) => session,
+                        Err(error)
+                            if hook_input && error.is::<control::NoMatchingActiveSession>() =>
+                        {
+                            return Ok(0);
+                        }
+                        Err(error) => return Err(error),
+                    };
                 if !quiet {
                     println!("{}", session.id);
                 }
