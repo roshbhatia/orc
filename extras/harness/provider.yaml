@@ -5,7 +5,10 @@ description: Resume sessions through the registered agent harness
 kind: harness
 command: orc-provider-harness
 actions:
+  provider.validate: Validate the configured agent registry and harness commands
   session.bind: Detect whether the harness session is active
   session.attach: Build the native harness resume command
   session.launch: Build the native harness launch command
+requires:
+  environment: [ORC_AGENT_REGISTRY]
 priority: 100

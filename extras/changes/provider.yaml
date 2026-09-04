@@ -5,6 +5,7 @@ description: Render structured workspace changes
 kind: changes
 command: orc-provider-changes
 actions:
+  provider.validate: Validate the Changes adapter and command
   changes.inspect: Show repository changes for the workspace
 requires:
   commands: [changes]

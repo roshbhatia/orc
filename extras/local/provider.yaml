@@ -5,5 +5,6 @@ description: Execute command plans on the current machine
 kind: execution
 command: orc-provider-local
 actions:
+  provider.validate: Validate local execution support
   execution.run: Execute a command plan as a local process
 priority: 0

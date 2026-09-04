@@ -44,6 +44,8 @@ const LAUNCH_OWNERSHIP_LABEL_PREFIX: &str = "Launch ownership: ";
     Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
 )]
 pub enum Capability {
+    #[serde(rename = "provider.validate")]
+    ProviderValidate,
     #[serde(rename = "activity.read")]
     ActivityRead,
     #[serde(rename = "changes.inspect")]
@@ -1304,6 +1306,7 @@ fn parse_provider_checks(value: &Value) -> Result<Vec<ValidationCheck>> {
 
 fn capability_action(capability: Capability) -> &'static str {
     match capability {
+        Capability::ProviderValidate => "validate",
         Capability::ActivityRead => "activity",
         Capability::ChangesInspect => "changes",
         Capability::SessionAttach => "attach",
@@ -1457,17 +1460,27 @@ pub fn validate_all(config: &Config, scope: &Path, name: Option<&str>) -> Result
                 message: "manifest is valid".into(),
             }];
             checks.extend(host_checks(&provider));
-            checks.extend(provider_checks(invoke_raw(
-                &provider, &request, config, None,
-            )));
-            checks.extend(provider.all_capabilities().into_iter().map(|capability| {
-                let request = validation_action_request(&provider, capability, scope);
-                validate_action_response(
-                    &provider,
-                    capability,
-                    invoke_raw(&provider, &request, config, None),
-                )
-            }));
+            if provider.supports(Capability::ProviderValidate) {
+                checks.extend(provider_checks(invoke_raw(
+                    &provider, &request, config, None,
+                )));
+            }
+            checks.extend(
+                provider
+                    .all_capabilities()
+                    .into_iter()
+                    .filter_map(|capability| {
+                        if capability == Capability::ProviderValidate {
+                            return None;
+                        }
+                        let request = validation_action_request(&provider, capability, scope);
+                        Some(validate_action_response(
+                            &provider,
+                            capability,
+                            invoke_raw(&provider, &request, config, None),
+                        ))
+                    }),
+            );
             let status = if checks.iter().all(|check| check.status == CheckStatus::Ok) {
                 CheckStatus::Ok
             } else {
@@ -2542,6 +2555,7 @@ mod tests {
 name: test
 command: {{ command }}
 actions:
+  provider.validate: Validate the provider
   changes.inspect: Inspect changes
 "#;
 
@@ -2549,7 +2563,7 @@ actions:
 request=$(cat)
 printf '%s\n' "$request" >> '{{ calls }}'
 case "$request" in
-  *provider.validate*)
+  *'"capability":"provider.validate"'*)
     cat <<'JSON'
 {"version":"orc.provider/v1","checks":[{"name":"protocol","status":"ok","message":"ready"}]}
 JSON
@@ -2818,6 +2832,10 @@ actions:
         assert_eq!(command[1]["items"]["minLength"], 1);
         assert_eq!(schema["properties"]["version"]["const"], "orc.provider/v1");
         assert_eq!(schema["properties"]["name"]["pattern"], "^[a-z0-9._-]+$");
+        assert_eq!(
+            schema["$defs"]["Capability"]["enum"][0],
+            "provider.validate"
+        );
         assert_eq!(
             schema["allOf"][0]["anyOf"][0]["properties"]["actions"]["minProperties"],
             1
@@ -3479,6 +3497,37 @@ JSON
         );
         let calls = fs::read_to_string(calls).expect("provider calls");
         assert!(calls.contains("provider.validate"));
+        assert!(calls.contains("changes.inspect"));
+    }
+
+    #[test]
+    fn validation_does_not_call_unadvertised_self_validation() {
+        let directory = tempfile::tempdir().expect("provider directory");
+        let calls = directory.path().join("calls.jsonl");
+        let provider = write_provider(
+            directory.path(),
+            "provider",
+            &render_fixture(
+                VALIDATION_PROVIDER,
+                serde_json::json!({ "calls": calls.display().to_string() }),
+            ),
+        );
+        fs::write(
+            directory.path().join("provider.yaml"),
+            format!(
+                "version: orc.provider/v1\nname: test\ncommand: {}\nactions:\n  changes.inspect: Inspect changes\n",
+                provider.display()
+            ),
+        )
+        .expect("provider manifest");
+        let mut config = Config::default();
+        config.providers.directory = directory.path().to_path_buf();
+
+        let validations = validate_all(&config, directory.path(), None).expect("validation");
+
+        assert_eq!(validations[0].status, CheckStatus::Ok);
+        let calls = fs::read_to_string(calls).expect("provider calls");
+        assert!(!calls.contains("provider.validate"));
         assert!(calls.contains("changes.inspect"));
     }
 

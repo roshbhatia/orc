@@ -2,6 +2,7 @@
   "$defs": {
     "Capability": {
       "enum": [
+        "provider.validate",
         "activity.read",
         "changes.inspect",
         "session.attach",
@@ -124,6 +125,9 @@
           "type": "string"
         },
         "execution.status": {
+          "type": "string"
+        },
+        "provider.validate": {
           "type": "string"
         },
         "session.attach": {

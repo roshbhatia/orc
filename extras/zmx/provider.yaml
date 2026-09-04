@@ -5,6 +5,7 @@ description: Keep harness processes available when displays close
 kind: persistence
 command: orc-provider-zmx
 actions:
+  provider.validate: Validate the Zmx adapter and command
   session.bind: Detect the current persistent process
   session.persist: Wrap a harness command in a persistent session
   session.stop: Stop a persistent agent process

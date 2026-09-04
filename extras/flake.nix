@@ -296,6 +296,21 @@
                 bash ${./zmx/test.sh}
                 touch "$out"
               '';
+          harnessRegistry = pkgs.runCommand "orc-harness-registry-requirement"
+            {
+              nativeBuildInputs = [
+                pkgs.bash
+                pkgs.coreutils
+                pkgs.jq
+              ];
+            }
+            ''
+              export HOME="$TMPDIR/home"
+              export ORC_PROVIDER_LIB=${./lib/provider.sh}
+              export ORC_PROVIDER_HARNESS_SCRIPT=${./harness/provider.sh}
+              bash ${./harness/test.sh}
+              touch "$out"
+            '';
         in
         {
           default = packages.default;
@@ -305,6 +320,7 @@
           provider-aggregate-boundary = providerAggregateBoundary;
           full-main-program = fullMainProgram;
           installed-provider-discovery = installedProviderDiscovery;
+          harness-registry-requirement = harnessRegistry;
           wezterm-composed-environment = weztermEnvironment;
           zmx-lifecycle = zmxLifecycle;
         }

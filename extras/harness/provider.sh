@@ -6,7 +6,7 @@ provider_library=${ORC_PROVIDER_LIB:-"$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")
 source "$provider_library"
 
 provider_init "harness"
-agent_registry=${ORC_AGENT_REGISTRY:-${XDG_CONFIG_HOME:-$HOME/.config}/sysinit/agents.json}
+agent_registry=${ORC_AGENT_REGISTRY:-}
 
 session_environment() {
   jq -ce --arg scope "$scope" '
@@ -30,7 +30,10 @@ session_environment() {
 
 case "$capability" in
   provider.validate)
-    if [[ ! -s $agent_registry ]] || ! jq -e '
+    if [[ -z $agent_registry ]]; then
+      emit_validation "failed" "registry" "ORC_AGENT_REGISTRY is required"
+      exit 0
+    elif [[ ! -s $agent_registry ]] || ! jq -e '
       .agents
       | type == "array" and length > 0
       and all(.[]; (.name | type) == "string" and (.command | type) == "string")
@@ -60,7 +63,7 @@ case "$capability" in
     ;;
   session.bind)
     harness=$(jq -r '.session.harness // empty' <<< "$request")
-    if [[ ! -s $agent_registry ]] || ! jq -e --arg harness "$harness" '.agents[] | select(.name == $harness)' "$agent_registry" > /dev/null; then
+    if [[ -z $agent_registry ]] || [[ ! -s $agent_registry ]] || ! jq -e --arg harness "$harness" '.agents[] | select(.name == $harness)' "$agent_registry" > /dev/null; then
       emit_declined "harness is absent from the agent registry"
     elif current_session_matches; then
       emit_binding "harness" "active" "$(jq -r '.session.nativeId' <<< "$request")" "$harness session"
@@ -95,7 +98,7 @@ case "$capability" in
     emit_plan "$scope" "$environment" "${resume_command[@]}"
     ;;
   session.launch)
-    if [[ ! -s $agent_registry ]]; then
+    if [[ -z $agent_registry ]] || [[ ! -s $agent_registry ]]; then
       emit_declined "agent registry is unavailable"
       exit 0
     fi

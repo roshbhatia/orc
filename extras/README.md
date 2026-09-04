@@ -4,7 +4,8 @@ Orc core knows only provider capabilities and the JSON protocol. This directory
 contains optional adapters for common local tools.
 
 - `orc-provider-harness` reads an external harness registry and creates resume
-  and launch command plans.
+  and launch command plans. It requires `ORC_AGENT_REGISTRY` to name that JSON
+  file; the adapter does not assume which system produced it.
 - `orc-provider-local` executes command plans on the current machine.
 - `orc-provider-zmx` adds persistence.
 - `orc-provider-wezterm` adds display panes and keeps failed commands visible.
@@ -27,3 +28,8 @@ external product inputs. The root Orc flake remains provider-neutral. Use
 launching a harness. Each packaged adapter supplies its own Bash and command
 dependencies. Validation therefore works under a clean process environment;
 the parent Orc process does not need provider commands on its `PATH`.
+
+An adapter can advertise `provider.validate` and return one or more checks for
+its own configuration and dependencies. Orc only sends this request when the
+manifest advertises it. See the root README for the request and response
+contract.

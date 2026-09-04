@@ -203,6 +203,7 @@ description: Open provider command plans in a WezTerm pane
 kind: display
 command: /path/to/orc-provider-wezterm
 actions:
+  provider.validate: Validate the adapter and its dependencies
   session.bind: Detect the current WezTerm pane
   terminal.open: Open a command in a split pane
   terminal.focus: Focus an existing pane
@@ -218,6 +219,25 @@ the manifest, executable, dependencies, and protocol with:
 orc provider validate
 orc provider validate wezterm
 ```
+
+Providers may advertise `provider.validate` for adapter-specific health
+checks. Orc sends a request with `action: validate`, `capability:
+provider.validate`, the selected `scope`, and the provider's manifest fields.
+The provider returns at least one named check:
+
+```json
+{
+  "version": "orc.provider/v1",
+  "checks": [
+    { "name": "backend", "status": "ok", "message": "ready" }
+  ]
+}
+```
+
+Each check needs a non-empty `name` and `message`. `status` is `ok` or
+`failed`. Orc runs self-validation only when the manifest advertises this
+capability. It still validates the manifest, executable, and every other
+advertised action when self-validation is absent.
 
 Provider kinds describe session facets:
 
@@ -283,6 +303,10 @@ nix profile install 'github:roshbhatia/orc?dir=extras#provider-harness'
 nix profile install 'github:roshbhatia/orc?dir=extras#provider-zmx'
 nix profile install 'github:roshbhatia/orc?dir=extras#provider-wezterm'
 ```
+
+The harness adapter has no built-in registry path. Set `ORC_AGENT_REGISTRY` to
+the agent-registry JSON file when you install it. This keeps Orc independent of
+the system that generates that registry.
 
 Every provider directory owns its adapter, manifest, and Nix runtime
 dependencies. The extras flake default installs all providers. Its `#full`

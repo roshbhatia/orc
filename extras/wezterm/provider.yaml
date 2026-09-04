@@ -5,6 +5,7 @@ description: Open provider command plans in a WezTerm pane
 kind: display
 command: orc-provider-wezterm
 actions:
+  provider.validate: Validate the WezTerm adapter and command
   session.bind: Detect the current WezTerm pane
   terminal.focus: Focus an existing WezTerm pane
   terminal.open: Open a command in a split pane
