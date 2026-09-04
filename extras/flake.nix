@@ -100,12 +100,15 @@
             wezterm = pkgs.wezterm;
             zmx = pkgs.zmx;
           };
+          validationHarness = pkgs.writeShellScriptBin "orc-provider-validation" ''
+            exit 0
+          '';
           registry = pkgs.writeText "orc-provider-validation-agents.json" (
             builtins.toJSON {
               agents = [
                 {
                   name = "orc-provider-validation";
-                  command = "true";
+                  command = lib.getExe validationHarness;
                   launch.resumeArgs = [ "resume" ];
                 }
               ];
@@ -148,7 +151,10 @@
                     and .[0].provider.name == "${name}"
                     and .[0].status == "ok"
                     and all(.[0].checks[]; .status == "ok")
-                  ' result.json > /dev/null
+                  ' result.json > /dev/null || {
+                    cat result.json >&2
+                    exit 1
+                  }
                   touch "$out"
                 ''
             )
