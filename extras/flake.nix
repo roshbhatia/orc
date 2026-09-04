@@ -283,6 +283,7 @@
                 export HOME="$TMPDIR/home"
                 export ORC_PROVIDER_LIB=${./lib/provider.sh}
                 export ORC_PROVIDER_ZMX_SCRIPT=${./zmx/provider.sh}
+                export ORC_TEST_BASH=${pkgs.lib.getExe pkgs.bash}
                 bash ${./zmx/test.sh}
                 touch "$out"
               '';

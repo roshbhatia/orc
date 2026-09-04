@@ -7,8 +7,8 @@ test_scope=${TMPDIR:?}/zmx-provider-test
 fake_bin=$test_scope/bin
 mkdir -p "$fake_bin"
 
-cat > "$fake_bin/zmx" << 'SCRIPT'
-#!/usr/bin/env bash
+printf '#!%s\n' "${ORC_TEST_BASH:?}" > "$fake_bin/zmx"
+cat >> "$fake_bin/zmx" << 'SCRIPT'
 set -euo pipefail
 case ${1:-} in
   list)
@@ -24,6 +24,7 @@ case ${1:-} in
 esac
 SCRIPT
 chmod +x "$fake_bin/zmx"
+test "$(head -n 1 "$fake_bin/zmx")" = "#!$ORC_TEST_BASH"
 
 launch_request=$(jq -n \
   --arg scope "$test_scope" \
