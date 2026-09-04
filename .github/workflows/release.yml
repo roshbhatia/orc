@@ -76,9 +76,13 @@ jobs:
           "$binary" completion fish > "$archive/share/fish/vendor_completions.d/orc.fish"
           "$binary" completion nu > "$archive/share/nushell/vendor/autoload/orc.nu"
           "$binary" completion zsh > "$archive/share/zsh/site-functions/_orc"
-          for schema in config provider state workflow; do
-            "$binary" schema "$schema" > "$archive/share/orc/$schema.schema.json"
-          done
+          "$binary" schema config > "$archive/share/orc/config.schema.json"
+          "$binary" schema animation > "$archive/share/orc/terminal.animation.v1.schema.json"
+          "$binary" schema provider > "$archive/share/orc/provider.schema.json"
+          "$binary" schema resource > "$archive/share/orc/resource.schema.json"
+          "$binary" schema state > "$archive/share/orc/state.schema.json"
+          "$binary" schema workflow > "$archive/share/orc/workflow.schema.json"
+          install -m 0644 assets/animations.yaml "$archive/share/orc/animations.yaml"
           tar -czf "dist/$archive.tar.gz" "$archive"
           (cd dist && shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256")
       - uses: actions/upload-artifact@v7
