@@ -408,6 +408,22 @@ Options:
   -h, --help           Print help
 ```
 
+### `orc doctor`
+
+Diagnose and safely repair workspace state
+
+```text
+Diagnose and safely repair workspace state
+
+Usage: orc doctor [OPTIONS]
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --repair
+      --json
+  -h, --help           Print help
+```
+
 ### `orc start`
 
 Start the managed-session supervisor

@@ -202,6 +202,98 @@ impl Manifest {
     pub fn supports(&self, capability: Capability) -> bool {
         self.actions.contains_key(&capability) || self.capabilities.contains(&capability)
     }
+
+    pub fn available_on_host(&self) -> bool {
+        self.command
+            .program()
+            .is_some_and(|command| which::which(command).is_ok())
+            && self
+                .requires
+                .commands
+                .iter()
+                .all(|command| which::which(command).is_ok())
+            && self
+                .requires
+                .environment
+                .iter()
+                .all(|name| std::env::var_os(name).is_some())
+            && self.requires.paths.iter().all(|path| path.exists())
+    }
+}
+
+pub fn launch_attach_route_available(
+    providers: &[Manifest],
+    execution_provider: Option<&str>,
+) -> bool {
+    let available = |capability, selected: Option<&str>| {
+        providers.iter().any(|provider| {
+            provider.supports(capability)
+                && selected.is_none_or(|name| provider.name == name)
+                && provider.available_on_host()
+        })
+    };
+    available(Capability::SessionLaunch, None)
+        && providers.iter().any(|provider| {
+            provider.supports(Capability::SessionPersist)
+                && provider.supports(Capability::SessionStop)
+                && provider.available_on_host()
+        })
+        && execution_provider.is_none_or(|name| available(Capability::ExecutionRun, Some(name)))
+        && available(Capability::TerminalOpen, None)
+}
+
+pub fn launch_attach_route_ready(
+    config: &Config,
+    providers: &[Manifest],
+    request: Value,
+    execution_provider: Option<&str>,
+) -> Result<()> {
+    launch_attach_route_ready_with(config, providers, request, execution_provider, invoke_raw)
+}
+
+pub fn launch_attach_route_ready_cached(
+    config: &Config,
+    providers: &[Manifest],
+    request: Value,
+    execution_provider: Option<&str>,
+) -> Result<()> {
+    launch_attach_route_ready_with(
+        config,
+        providers,
+        request,
+        execution_provider,
+        |provider, request, config, _| invoke_cached(provider, request, config),
+    )
+}
+
+fn launch_attach_route_ready_with(
+    config: &Config,
+    providers: &[Manifest],
+    mut request: Value,
+    execution_provider: Option<&str>,
+    invoke: impl Fn(&Manifest, &Value, &Config, Option<&Path>) -> Result<Value>,
+) -> Result<()> {
+    if !launch_attach_route_available(providers, execution_provider) {
+        bail!("the launch, persistence, execution, and display provider chain is incomplete");
+    }
+    request["capability"] = Value::String(Capability::SessionLaunch.to_string());
+    request["plan"] = Value::Null;
+    let mut failures = Vec::new();
+    for provider in candidates_for_request(providers, Capability::SessionLaunch, &request)
+        .into_iter()
+        .filter(|provider| provider.available_on_host())
+    {
+        match invoke(provider, &request, config, None).and_then(|value| parse_plan(provider, value))
+        {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => failures.push(format!("{} declined the selected harness", provider.name)),
+            Err(error) => failures.push(format!("{}: {error:#}", provider.name)),
+        }
+    }
+    bail!(
+        "no launch provider accepted the selected harness: {}",
+        failures.join("; ")
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2884,6 +2976,124 @@ actions:
     fn attach_chain_composes_three_capabilities() {
         assert_eq!(Action::Attach.stages().len(), 3);
         assert!(Action::Attach.stages()[1].1);
+    }
+
+    #[test]
+    fn launch_readiness_requires_a_provider_to_accept_the_selected_harness() {
+        let directory = tempfile::tempdir().expect("provider directory");
+        let launch_command = write_provider(
+            directory.path(),
+            "launch-provider",
+            r#"#!/bin/sh
+request=$(cat)
+case "$request" in
+  *'"harness":"available-harness"'*)
+    printf '%s\n' '{"version":"orc.provider/v1","command":["/usr/bin/true"]}'
+    ;;
+  *)
+    printf '%s\n' '{"version":"orc.provider/v1","status":"declined","reason":"unknown harness"}'
+    ;;
+esac
+"#,
+        );
+        let mut launch = provider_manifest("launch", &launch_command, 0);
+        launch.actions = BTreeMap::from([(
+            Capability::SessionLaunch,
+            "Launch an available harness".into(),
+        )]);
+        let mut persistence = provider_manifest("persistence", Path::new("/usr/bin/true"), 0);
+        persistence.actions = BTreeMap::from([
+            (Capability::SessionPersist, "Persist a session".into()),
+            (Capability::SessionStop, "Stop a session".into()),
+        ]);
+        let mut execution = provider_manifest("executor", Path::new("/usr/bin/true"), 0);
+        execution.actions =
+            BTreeMap::from([(Capability::ExecutionRun, "Execute a session".into())]);
+        let mut display = provider_manifest("display", Path::new("/usr/bin/true"), 0);
+        display.actions = BTreeMap::from([(Capability::TerminalOpen, "Open a session".into())]);
+        let providers = [launch, persistence, execution, display];
+        let mut config = Config::default();
+        config.cache.provider_ttl_ms = 0;
+        let request = |harness| {
+            json!({
+                "version": "orc.provider/v1",
+                "scope": directory.path(),
+                "session": {"harness": harness},
+                "providers": {"execution.run": "executor"}
+            })
+        };
+
+        let error = launch_attach_route_ready(
+            &config,
+            &providers,
+            request("missing-harness"),
+            Some("executor"),
+        )
+        .expect_err("declined harness is not launch ready");
+        assert!(error.to_string().contains("declined the selected harness"));
+        launch_attach_route_ready(
+            &config,
+            &providers,
+            request("available-harness"),
+            Some("executor"),
+        )
+        .expect("accepted harness is launch ready");
+    }
+
+    #[test]
+    fn launch_recheck_bypasses_a_stale_readiness_cache() {
+        let directory = tempfile::tempdir().expect("provider directory");
+        let marker = directory.path().join("harness-available");
+        fs::write(&marker, "ready").expect("availability marker");
+        let launch_command = write_provider(
+            directory.path(),
+            "mutable-launch-provider",
+            r#"#!/bin/sh
+cat >/dev/null
+if [ -e "$1" ]; then
+  printf '%s\n' '{"version":"orc.provider/v1","command":["/usr/bin/true"]}'
+else
+  printf '%s\n' '{"version":"orc.provider/v1","status":"declined","reason":"harness unavailable"}'
+fi
+"#,
+        );
+        let mut launch = provider_manifest("launch", &launch_command, 0);
+        launch.command = ProviderCommand::Argv(vec![
+            launch_command.display().to_string(),
+            marker.display().to_string(),
+        ]);
+        launch.actions = BTreeMap::from([(
+            Capability::SessionLaunch,
+            "Launch an available harness".into(),
+        )]);
+        let mut persistence = provider_manifest("persistence", Path::new("/usr/bin/true"), 0);
+        persistence.actions = BTreeMap::from([
+            (Capability::SessionPersist, "Persist a session".into()),
+            (Capability::SessionStop, "Stop a session".into()),
+        ]);
+        let mut execution = provider_manifest("executor", Path::new("/usr/bin/true"), 0);
+        execution.actions =
+            BTreeMap::from([(Capability::ExecutionRun, "Execute a session".into())]);
+        let mut display = provider_manifest("display", Path::new("/usr/bin/true"), 0);
+        display.actions = BTreeMap::from([(Capability::TerminalOpen, "Open a session".into())]);
+        let providers = [launch, persistence, execution, display];
+        let mut config = Config::default();
+        config.cache.provider_ttl_ms = 30_000;
+        let request = json!({
+            "version": "orc.provider/v1",
+            "scope": directory.path(),
+            "session": {"harness": "mutable-harness"},
+            "providers": {"execution.run": "executor"}
+        });
+
+        launch_attach_route_ready_cached(&config, &providers, request.clone(), Some("executor"))
+            .expect("background readiness accepts available harness");
+        fs::remove_file(marker).expect("make harness unavailable");
+        launch_attach_route_ready_cached(&config, &providers, request.clone(), Some("executor"))
+            .expect("background readiness remains cached");
+        let error = launch_attach_route_ready(&config, &providers, request, Some("executor"))
+            .expect_err("Enter recheck observes unavailable harness");
+        assert!(error.to_string().contains("declined the selected harness"));
     }
 
     #[test]

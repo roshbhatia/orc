@@ -38,6 +38,8 @@ enum Commands {
     Tui(TuiArgs),
     #[command(about = "Show workspace status")]
     Status(OutputArgs),
+    #[command(about = "Diagnose and safely repair workspace state")]
+    Doctor(DoctorArgs),
     #[command(about = "Start the managed-session supervisor")]
     Start,
     #[command(about = "Stop the managed-session supervisor")]
@@ -138,6 +140,16 @@ struct ScopeArgs {
 struct OutputArgs {
     #[command(flatten)]
     scope: ScopeArgs,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct DoctorArgs {
+    #[command(flatten)]
+    scope: ScopeArgs,
+    #[arg(long)]
+    repair: bool,
     #[arg(long)]
     json: bool,
 }
@@ -711,6 +723,34 @@ pub fn run() -> Result<u8> {
                     state.runs.len(),
                     state.scope
                 );
+            }
+        }
+        Commands::Doctor(args) => {
+            if args.repair {
+                require_orchestrator_or_operator(&args.scope.scope)?;
+            }
+            let report = control::doctor(&args.scope.scope, args.repair)?;
+            if args.json {
+                print_json(&report)?;
+            } else if report.duplicates.is_empty() {
+                println!("healthy · no duplicate active native session IDs");
+            } else {
+                for duplicate in &report.duplicates {
+                    println!(
+                        "{} · keep {} · {} {}",
+                        duplicate.native_id,
+                        duplicate.canonical_id,
+                        if report.repaired {
+                            "archived"
+                        } else {
+                            "duplicate"
+                        },
+                        duplicate.duplicate_ids.join(", ")
+                    );
+                }
+                if !report.repaired {
+                    println!("run `orc doctor --repair` to archive the duplicate records");
+                }
             }
         }
         Commands::Start => {

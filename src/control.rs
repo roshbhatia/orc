@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     env,
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
@@ -9,6 +10,7 @@ use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -92,6 +94,22 @@ pub struct SessionLease {
     pub idle_timeout_seconds: Option<u64>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateNativeSession {
+    pub native_id: String,
+    pub canonical_id: String,
+    pub duplicate_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DoctorReport {
+    pub scope: String,
+    pub repaired: bool,
+    pub duplicates: Vec<DuplicateNativeSession>,
+}
+
 #[derive(Clone, Debug)]
 pub struct NodeSpec {
     pub id: String,
@@ -131,6 +149,130 @@ pub fn inferred_session_id(harness: &str, native_id: &str) -> String {
 pub fn read_workspace(scope: &Path) -> Result<WorkspaceState> {
     let scope = state::resolve_scope(scope)?;
     state::read(&scope)
+}
+
+pub fn doctor(scope: &Path, repair: bool) -> Result<DoctorReport> {
+    let scope = state::resolve_scope(scope)?;
+    if repair {
+        return state::update(&scope, |workspace| {
+            repair_duplicate_native_sessions(workspace, true)
+        });
+    }
+    let mut workspace = state::read(&scope)?;
+    repair_duplicate_native_sessions(&mut workspace, false)
+}
+
+fn repair_duplicate_native_sessions(
+    workspace: &mut WorkspaceState,
+    repair: bool,
+) -> Result<DoctorReport> {
+    let mut groups = BTreeMap::<String, Vec<usize>>::new();
+    for (index, session) in workspace.sessions.iter().enumerate() {
+        if session.status.active() && session.status != LifecycleStatus::Terminating {
+            groups
+                .entry(session.native_id.clone())
+                .or_default()
+                .push(index);
+        }
+    }
+    let mut duplicates = Vec::new();
+    for (native_id, indices) in groups.into_iter().filter(|(_, indices)| indices.len() > 1) {
+        let canonical = indices
+            .iter()
+            .copied()
+            .max_by_key(|index| {
+                let session = &workspace.sessions[*index];
+                (
+                    session.updated_at,
+                    session.connected_at,
+                    session.role == SessionRole::Orchestrator,
+                    session.id.clone(),
+                )
+            })
+            .context("duplicate session group has no canonical record")?;
+        let canonical_id = workspace.sessions[canonical].id.clone();
+        let mut duplicate_ids = indices
+            .into_iter()
+            .filter(|index| *index != canonical)
+            .map(|index| workspace.sessions[index].id.clone())
+            .collect::<Vec<_>>();
+        duplicate_ids.sort();
+        duplicates.push(DuplicateNativeSession {
+            native_id,
+            canonical_id: canonical_id.clone(),
+            duplicate_ids: duplicate_ids.clone(),
+        });
+        if !repair {
+            continue;
+        }
+        let now = Utc::now();
+        let forbidden_parents = duplicate_ids
+            .iter()
+            .chain(std::iter::once(&canonical_id))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if parent_chain_reaches_any(
+            workspace,
+            workspace.sessions[canonical].parent_id.as_deref(),
+            &forbidden_parents,
+        ) {
+            workspace.sessions[canonical].parent_id = None;
+            workspace.sessions[canonical].updated_at = now;
+        }
+        for session in &mut workspace.sessions {
+            if duplicate_ids.contains(&session.id) {
+                session.status = LifecycleStatus::Archived;
+                session.updated_at = now;
+            }
+        }
+        reparent_active_descendants(workspace, &duplicate_ids, &canonical_id);
+        for run in workspace.runs.iter_mut().filter(|run| run.status.active()) {
+            if run
+                .orchestrator_id
+                .as_ref()
+                .is_some_and(|id| duplicate_ids.contains(id))
+            {
+                run.orchestrator_id = Some(canonical_id.clone());
+                run.updated_at = now;
+            }
+            for node in &mut run.nodes {
+                if node
+                    .session_id
+                    .as_ref()
+                    .is_some_and(|id| duplicate_ids.contains(id))
+                {
+                    node.session_id = Some(canonical_id.clone());
+                    node.updated_at = now;
+                    run.updated_at = now;
+                }
+            }
+        }
+    }
+    duplicates.sort_by(|left, right| left.native_id.cmp(&right.native_id));
+    Ok(DoctorReport {
+        scope: workspace.scope.clone(),
+        repaired: repair && !duplicates.is_empty(),
+        duplicates,
+    })
+}
+
+fn parent_chain_reaches_any<'a>(
+    workspace: &'a WorkspaceState,
+    mut parent_id: Option<&'a str>,
+    targets: &BTreeSet<String>,
+) -> bool {
+    let mut visited = BTreeSet::new();
+    while let Some(id) = parent_id {
+        if targets.contains(id) || !visited.insert(id) {
+            return true;
+        }
+        parent_id = workspace
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+            .and_then(|session| session.parent_id.as_deref());
+    }
+    false
 }
 
 pub fn register(scope: &Path, mut contract: Contract, link: SessionLink) -> Result<Session> {
@@ -1222,10 +1364,11 @@ pub fn reconcile_with_current(
     let providers = provider::discover(config)?;
     let snapshot = state::read(&scope)?;
     let current_id = if rebind_current {
-        snapshot
-            .active_sessions()
-            .next()
-            .map(|session| session.id.clone())
+        current_rebind_id(
+            &snapshot,
+            env::var("ORC_SESSION_ID").ok().as_deref(),
+            env::var("ORC_NATIVE_SESSION_ID").ok().as_deref(),
+        )
     } else {
         None
     };
@@ -1259,6 +1402,24 @@ pub fn reconcile_with_current(
         }
         Ok(workspace.clone())
     })
+}
+
+fn current_rebind_id(
+    snapshot: &WorkspaceState,
+    session_id: Option<&str>,
+    native_id: Option<&str>,
+) -> Option<String> {
+    session_id
+        .and_then(|id| snapshot.current_session_for(Some(id)))
+        .or_else(|| {
+            native_id.and_then(|native_id| {
+                snapshot
+                    .active_sessions()
+                    .filter(|session| session.native_id == native_id)
+                    .max_by_key(|session| session.updated_at)
+            })
+        })
+        .map(|session| session.id.clone())
 }
 
 fn apply_enrichment(
@@ -2238,6 +2399,63 @@ actions:
         }
     }
 
+    fn run_with_assignment(orchestrator_id: &str, session_id: &str) -> WorkflowRun {
+        WorkflowRun {
+            id: "run".into(),
+            name: "Repair duplicates".into(),
+            goal: "Keep one canonical session".into(),
+            expected_output: "References point at the canonical session".into(),
+            status: LifecycleStatus::Working,
+            orchestrator_id: Some(orchestrator_id.into()),
+            parent_run_id: None,
+            definition: None,
+            revision: None,
+            checkpoint: None,
+            mode: crate::domain::RunMode::Foreground,
+            process_id: None,
+            execution_nonce: None,
+            resume_requested: false,
+            log_path: None,
+            current_node: Some("repair".into()),
+            tokens: 0,
+            cost_usd: 0.0,
+            token_burn: Vec::new(),
+            pending_gates: Vec::new(),
+            approved_gates: Vec::new(),
+            agents: Vec::new(),
+            nodes: vec![WorkflowNode {
+                id: "repair".into(),
+                name: "Repair".into(),
+                purpose: "Repair inherited records".into(),
+                role: SessionRole::Implementer,
+                harness: "test".into(),
+                model: None,
+                execution: None,
+                judge_policy: JudgePolicy::default(),
+                goal: "Repair records".into(),
+                expected_output: "Canonical references".into(),
+                success_criteria: Vec::new(),
+                completion: CompletionTarget::Orchestrator,
+                review_by: None,
+                session_id: Some(session_id.into()),
+                child_run_id: None,
+                status: LifecycleStatus::Working,
+                attempt: 1,
+                retry_after: None,
+                prompt: None,
+                input: None,
+                output: None,
+                activity: Vec::new(),
+                tokens: 0,
+                cost_usd: 0.0,
+                updated_at: Utc::now(),
+            }],
+            edges: Vec::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
     fn register(scope: &Path, mut contract: Contract, link: SessionLink) -> Result<Session> {
         if link.source == RegistrationSource::Managed {
             return register_for_caller(
@@ -2327,6 +2545,101 @@ actions:
         let id = inferred_session_id("agent", "abc");
         assert_eq!(id, inferred_session_id("agent", "abc"));
         assert_eq!(id.len(), 18);
+    }
+
+    #[test]
+    fn current_rebind_uses_only_the_hook_identity() {
+        let mut workspace = WorkspaceState::empty("/tmp".into());
+        let mut older = session("older", SessionRole::Orchestrator, LifecycleStatus::Working);
+        older.native_id = "native".into();
+        older.updated_at = Utc::now() - chrono::Duration::minutes(1);
+        let mut newer = session("newer", SessionRole::Orchestrator, LifecycleStatus::Working);
+        newer.native_id = "native".into();
+        workspace.sessions = vec![older, newer];
+
+        assert_eq!(
+            current_rebind_id(&workspace, Some("older"), Some("native")).as_deref(),
+            Some("older")
+        );
+        assert_eq!(
+            current_rebind_id(&workspace, None, Some("native")).as_deref(),
+            Some("newer")
+        );
+        assert_eq!(current_rebind_id(&workspace, None, None), None);
+        assert_eq!(current_rebind_id(&workspace, Some("missing"), None), None);
+    }
+
+    #[test]
+    fn doctor_repairs_duplicate_native_sessions_once() {
+        let mut workspace = WorkspaceState::empty("/tmp".into());
+        let now = Utc::now();
+        let mut older = session("older", SessionRole::Orchestrator, LifecycleStatus::Working);
+        older.native_id = "native".into();
+        older.updated_at = now - chrono::Duration::minutes(1);
+        let mut newer = session("newer", SessionRole::Orchestrator, LifecycleStatus::Working);
+        newer.native_id = "native".into();
+        newer.updated_at = now;
+        let mut child = session("child", SessionRole::Implementer, LifecycleStatus::Working);
+        child.parent_id = Some("older".into());
+        newer.parent_id = Some("child".into());
+        workspace.sessions = vec![older, newer, child];
+        workspace.runs.push(run_with_assignment("older", "older"));
+
+        let audit = repair_duplicate_native_sessions(&mut workspace, false).expect("audit");
+        assert!(!audit.repaired);
+        assert_eq!(audit.duplicates.len(), 1);
+        assert_eq!(audit.duplicates[0].canonical_id, "newer");
+        assert_eq!(workspace.sessions[0].status, LifecycleStatus::Working);
+
+        let repaired = repair_duplicate_native_sessions(&mut workspace, true).expect("repair");
+        assert!(repaired.repaired);
+        assert_eq!(
+            workspace
+                .sessions
+                .iter()
+                .find(|session| session.id == "older")
+                .expect("older")
+                .status,
+            LifecycleStatus::Archived
+        );
+        assert_eq!(
+            workspace
+                .sessions
+                .iter()
+                .find(|session| session.id == "child")
+                .expect("child")
+                .parent_id
+                .as_deref(),
+            Some("newer")
+        );
+        assert_eq!(workspace.runs[0].orchestrator_id.as_deref(), Some("newer"));
+        assert_eq!(
+            workspace
+                .sessions
+                .iter()
+                .find(|session| session.id == "newer")
+                .expect("newer")
+                .parent_id,
+            None
+        );
+        assert_eq!(
+            workspace.runs[0].nodes[0].session_id.as_deref(),
+            Some("newer")
+        );
+        let mut cursor = Some("child");
+        let mut visited = BTreeSet::new();
+        while let Some(id) = cursor {
+            assert!(visited.insert(id), "repair created a parent cycle at {id}");
+            cursor = workspace
+                .sessions
+                .iter()
+                .find(|session| session.id == id)
+                .and_then(|session| session.parent_id.as_deref());
+        }
+
+        let clean = repair_duplicate_native_sessions(&mut workspace, true).expect("idempotent");
+        assert!(clean.duplicates.is_empty());
+        assert!(!clean.repaired);
     }
 
     #[test]

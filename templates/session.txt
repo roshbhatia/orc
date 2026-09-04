@@ -10,6 +10,7 @@ runtime
   {{ session.role }} · {{ placement }} · {{ session.harness }}{% if session.model %}/{{ session.model }}{% endif %}
   lifecycle     {{ session.status }}
   activity      {{ activity }}
+  open          {{ open_readiness }}
 {% if session.registration == "managed" %}  runtime lease {{ runtime_lease }}
   idle lease    {{ idle_lease }}
   heartbeat     {% if session.heartbeatAt %}{{ session.heartbeatAt }}{% else %}never{% endif %}

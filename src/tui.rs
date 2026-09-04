@@ -43,11 +43,11 @@ use crate::{
     config::Config,
     control, daemon,
     domain::{
-        CompletionTarget, JudgePolicy, LifecycleStatus, RegistrationSource, Session, WorkflowNode,
-        WorkflowRun, WorkspaceState,
+        BindingStatus, CompletionTarget, JudgePolicy, LifecycleStatus, ProviderKind,
+        RegistrationSource, Session, WorkflowNode, WorkflowRun, WorkspaceState,
     },
     preferences::{self, WorkspacePreferences},
-    provider::{self, Action, Manifest},
+    provider::{self, Action, Capability, Manifest},
     workflow,
 };
 
@@ -173,6 +173,7 @@ enum ItemRef {
     Run(String),
     Node(String, String),
     Provider(String),
+    History,
 }
 
 #[derive(Clone, Debug)]
@@ -191,6 +192,71 @@ enum RuntimeActivity {
     Active,
     Idle,
     Stalled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttachReadiness {
+    Focus,
+    Reattach,
+    Unavailable,
+}
+
+impl AttachReadiness {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Focus => "open ready · focus",
+            Self::Reattach => "open ready · reattach",
+            Self::Unavailable => "open unavailable",
+        }
+    }
+}
+
+fn provider_binding_ready(
+    session: &Session,
+    providers: &[Manifest],
+    kind: ProviderKind,
+    capability: Capability,
+) -> bool {
+    session.providers.iter().any(|binding| {
+        binding.kind == kind
+            && binding.status == BindingStatus::Active
+            && binding
+                .r#ref
+                .as_deref()
+                .is_some_and(|reference| !reference.is_empty())
+            && providers.iter().any(|provider| {
+                provider.name == binding.provider
+                    && provider.supports(capability)
+                    && provider.available_on_host()
+            })
+    })
+}
+
+fn attach_readiness(session: &Session, providers: &[Manifest]) -> AttachReadiness {
+    if session.status.active()
+        && provider_binding_ready(
+            session,
+            providers,
+            ProviderKind::Display,
+            Capability::TerminalFocus,
+        )
+    {
+        return AttachReadiness::Focus;
+    }
+    let persistent = provider_binding_ready(
+        session,
+        providers,
+        ProviderKind::Persistence,
+        Capability::SessionPersist,
+    );
+    let display = providers.iter().any(|provider| {
+        provider.supports(Capability::TerminalOpen) && provider.available_on_host()
+    });
+    if persistent && display {
+        AttachReadiness::Reattach
+    } else {
+        AttachReadiness::Unavailable
+    }
 }
 
 impl RuntimeActivity {
@@ -484,12 +550,15 @@ enum BootState {
 }
 
 type RefreshPayload = (WorkspaceState, Option<daemon::Status>, Option<String>);
+type LaunchReadyNodes = BTreeSet<(String, String)>;
+type ProviderRefreshPayload = (Vec<Manifest>, LaunchReadyNodes);
 
 enum BackgroundResult {
     Refresh(Result<RefreshPayload, String>),
-    Providers(Result<Vec<Manifest>, String>),
+    Providers(Result<ProviderRefreshPayload, String>),
     Enrichment {
         generation: u64,
+        rebind_current: bool,
         result: Result<WorkspaceState, String>,
     },
     Activity {
@@ -513,6 +582,7 @@ struct App {
     config: Config,
     state: WorkspaceState,
     providers: Vec<Manifest>,
+    launch_ready: LaunchReadyNodes,
     supervisor: Option<daemon::Status>,
     flow: AgentFlow,
     graph_items: BTreeMap<String, ItemRef>,
@@ -551,6 +621,7 @@ struct App {
     provider_refresh_inflight: bool,
     enrichment_inflight: bool,
     enrichment_requested: bool,
+    rebind_current_pending: bool,
     enrichment_due_at: Instant,
     state_generation: u64,
     resize_at: Option<Instant>,
@@ -591,7 +662,8 @@ impl App {
         let active_run = state
             .runs
             .iter()
-            .find(|run| run.status.active())
+            .filter(|run| run.status.active())
+            .max_by_key(|run| run.updated_at)
             .map(|run| run.id.clone());
         let expanded = default_expansions(&state);
         let mut app = Self {
@@ -599,6 +671,7 @@ impl App {
             config,
             state,
             providers,
+            launch_ready: BTreeSet::new(),
             supervisor: daemon::status().ok().flatten(),
             flow: new_flow(),
             graph_items: BTreeMap::new(),
@@ -637,6 +710,7 @@ impl App {
             provider_refresh_inflight: false,
             enrichment_inflight: false,
             enrichment_requested: false,
+            rebind_current_pending: true,
             enrichment_due_at,
             state_generation: 0,
             resize_at: None,
@@ -735,13 +809,13 @@ impl App {
             || self.state.runs.iter().any(|run| {
                 run.nodes
                     .iter()
-                    .any(|node| node.status == LifecycleStatus::Working)
+                    .any(|node| node_runtime_active(&self.state, node))
             })
     }
 
     fn rebuild(&mut self, force_layout: bool) {
         let selected_tree_id = self.tree.get(self.tree_at).map(|row| row.id.clone());
-        self.tree = tree_rows(&self.state, &self.expanded);
+        self.tree = tree_rows(&self.state, &self.expanded, &self.providers);
         self.tree_at = selected_tree_id
             .as_deref()
             .and_then(|id| self.tree.iter().position(|row| row.id == id))
@@ -749,6 +823,7 @@ impl App {
         self.provider_at = self.provider_at.min(self.providers.len().saturating_sub(1));
         let signature = graph_signature(&self.state, self.active_run.as_deref());
         if signature != self.graph_signature || force_layout {
+            let restore_viewport = self.preferences.graph_selected_item.is_some();
             let selected = self
                 .preferences
                 .graph_selected_item
@@ -770,6 +845,10 @@ impl App {
                 flow = configure_flow(restored);
             }
             self.flow = flow;
+            if !restore_viewport {
+                self.flow
+                    .request_fit_view_with_options(FitViewOptions::default().with_padding(3.0));
+            }
             self.graph_items = items;
             self.graph_signature = signature;
         } else {
@@ -812,9 +891,18 @@ impl App {
         }
         self.provider_refresh_inflight = true;
         let config = self.config.clone();
+        let scope = self.scope.clone();
+        let state = self.state.clone();
+        let direction = self.display_direction().to_owned();
         let tx = tx.clone();
         thread::spawn(move || {
-            let result = provider::discover(&config).map_err(|error| format!("{error:#}"));
+            let result = provider::discover(&config)
+                .map(|providers| {
+                    let launch_ready =
+                        launch_ready_nodes(&config, &providers, &scope, &state, &direction);
+                    (providers, launch_ready)
+                })
+                .map_err(|error| format!("{error:#}"));
             let _ = tx.send(BackgroundResult::Providers(result));
         });
     }
@@ -829,9 +917,16 @@ impl App {
         let scope = self.scope.clone();
         let tx = tx.clone();
         let generation = self.state_generation;
+        let rebind_current = self.rebind_current_pending;
+        self.rebind_current_pending = false;
         thread::spawn(move || {
-            let result = control::reconcile(&config, &scope).map_err(|error| format!("{error:#}"));
-            let _ = tx.send(BackgroundResult::Enrichment { generation, result });
+            let result = control::reconcile_with_current(&config, &scope, rebind_current)
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(BackgroundResult::Enrichment {
+                generation,
+                rebind_current,
+                result,
+            });
         });
     }
 
@@ -864,7 +959,8 @@ impl App {
                                 .state
                                 .runs
                                 .iter()
-                                .find(|run| run.status.active())
+                                .filter(|run| run.status.active())
+                                .max_by_key(|run| run.updated_at)
                                 .map(|run| run.id.clone());
                         }
                         self.boot = BootState::Ready;
@@ -898,16 +994,25 @@ impl App {
             BackgroundResult::Providers(result) => {
                 self.provider_refresh_inflight = false;
                 match result {
-                    Ok(providers) => {
+                    Ok((providers, launch_ready)) => {
                         self.providers = providers;
+                        self.launch_ready = launch_ready;
                         self.provider_at =
                             self.provider_at.min(self.providers.len().saturating_sub(1));
+                        self.rebuild(false);
                     }
                     Err(error) => self.set_status(format!("provider discovery failed: {error}")),
                 }
             }
-            BackgroundResult::Enrichment { generation, result } => {
+            BackgroundResult::Enrichment {
+                generation,
+                rebind_current,
+                result,
+            } => {
                 self.enrichment_inflight = false;
+                if rebind_current && (result.is_err() || generation != self.state_generation) {
+                    self.rebind_current_pending = true;
+                }
                 if generation != self.state_generation {
                     self.enrichment_due_at =
                         Instant::now() + enrichment_retry_interval(&self.config);
@@ -1149,7 +1254,7 @@ impl App {
                             .map(|run| run.id.clone())
                     })
                 }),
-            ItemRef::Provider(_) => None,
+            ItemRef::Provider(_) | ItemRef::History => None,
         }
     }
 
@@ -1217,7 +1322,7 @@ impl App {
                         .map(|run| run.id.clone())
                 })
             }
-            ItemRef::Provider(_) => None,
+            ItemRef::Provider(_) | ItemRef::History => None,
         }
     }
 
@@ -1344,6 +1449,10 @@ impl App {
             return;
         }
         if let Some(session) = self.selected_session().cloned() {
+            if attach_readiness(&session, &self.providers) == AttachReadiness::Unavailable {
+                self.set_status("this session has no ready display and persistence provider chain");
+                return;
+            }
             self.action_inflight = true;
             self.set_status("opening session through providers");
             let config = self.config.clone();
@@ -1372,6 +1481,32 @@ impl App {
         } else if matches!(self.selected(), Some(ItemRef::Run(_))) {
             self.set_status("this run has no associated agent display");
         } else if let Some((run_id, node_id)) = self.selected_unassigned_stage() {
+            if !launch_attach_ready(self) {
+                self.set_status("this stage has no ready persistence and display provider chain");
+                return;
+            }
+            let (launch_request, execution_provider) = self
+                .state
+                .runs
+                .iter()
+                .find(|run| run.id == run_id)
+                .and_then(|run| {
+                    run.nodes
+                        .iter()
+                        .find(|node| node.id == node_id)
+                        .map(|node| {
+                            (
+                                launch_preflight_request(
+                                    &self.scope,
+                                    run,
+                                    node,
+                                    self.display_direction(),
+                                ),
+                                node.execution.clone(),
+                            )
+                        })
+                })
+                .expect("selected unassigned stage remains present");
             self.action_inflight = true;
             self.set_status(format!("launching {node_id} through the workflow executor"));
             let config = self.config.clone();
@@ -1380,6 +1515,13 @@ impl App {
             let tx = tx.clone();
             thread::spawn(move || {
                 let result = (|| -> Result<String> {
+                    let providers = provider::discover(&config)?;
+                    provider::launch_attach_route_ready(
+                        &config,
+                        &providers,
+                        launch_request,
+                        execution_provider.as_deref(),
+                    )?;
                     let started =
                         workflow::spawn_with_direction(&config, &scope, &run_id, &direction)?;
                     let deadline = Instant::now() + DISPLAY_ATTACH_WAIT;
@@ -2004,6 +2146,9 @@ impl App {
             },
         }
         if self.focus == Focus::Main && self.explorer_view == ExplorerView::Graph {
+            if let Some(selected) = self.flow.first_selected_node_id() {
+                self.flow.ensure_node_visible(&selected);
+            }
             clamp_flow_viewport(&mut self.flow);
             self.persist_preferences();
         }
@@ -2076,7 +2221,7 @@ fn inspector_tabs(item: Option<&ItemRef>) -> &'static [(OutputTab, &'static str)
         Some(ItemRef::Run(_)) => RUN,
         Some(ItemRef::Node(_, _)) => STAGE,
         Some(ItemRef::Provider(_)) => PROVIDER,
-        Some(ItemRef::Session(_)) | None => AGENT,
+        Some(ItemRef::Session(_) | ItemRef::History) | None => AGENT,
     }
 }
 
@@ -2107,6 +2252,132 @@ fn default_expansions(state: &WorkspaceState) -> BTreeSet<String> {
                 .map(|run| format!("run:{}", run.id)),
         )
         .collect()
+}
+
+fn node_session<'a>(state: &'a WorkspaceState, node: &WorkflowNode) -> Option<&'a Session> {
+    let session_id = node.session_id.as_deref()?;
+    state
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id && session.status != LifecycleStatus::Archived)
+}
+
+fn node_placement(state: &WorkspaceState, node: &WorkflowNode) -> String {
+    if let Some(session) = node_session(state, node) {
+        return session_placement(session);
+    }
+    let execution = node.execution.as_deref().unwrap_or("execution unassigned");
+    if matches!(
+        node.status,
+        LifecycleStatus::Pending | LifecycleStatus::Queued | LifecycleStatus::Waiting
+    ) {
+        format!("proposed · {execution} · no agent assigned")
+    } else {
+        format!("{execution} · no agent assigned")
+    }
+}
+
+fn node_runtime_active(state: &WorkspaceState, node: &WorkflowNode) -> bool {
+    node.status == LifecycleStatus::Working
+        && node_session(state, node).and_then(RuntimeActivity::for_session)
+            == Some(RuntimeActivity::Active)
+}
+
+fn launch_ready_nodes(
+    config: &Config,
+    providers: &[Manifest],
+    scope: &Path,
+    state: &WorkspaceState,
+    direction: &str,
+) -> LaunchReadyNodes {
+    state
+        .runs
+        .iter()
+        .filter(|run| run.status.active())
+        .flat_map(|run| {
+            run.nodes
+                .iter()
+                .filter(|node| node.status.active() && node.session_id.is_none())
+                .filter(move |node| {
+                    provider::launch_attach_route_ready_cached(
+                        config,
+                        providers,
+                        launch_preflight_request(scope, run, node, direction),
+                        node.execution.as_deref(),
+                    )
+                    .is_ok()
+                })
+                .map(|node| (run.id.clone(), node.id.clone()))
+        })
+        .collect()
+}
+
+fn launch_preflight_request(
+    scope: &Path,
+    run: &WorkflowRun,
+    node: &WorkflowNode,
+    direction: &str,
+) -> serde_json::Value {
+    let session_id = format!("preflight-{}-{}", run.id, node.id);
+    let prompt = node.prompt.clone().unwrap_or_else(|| {
+        format!(
+            "Goal: {}\nExpected output: {}\nSuccess criteria:\n{}",
+            node.goal,
+            node.expected_output,
+            node.success_criteria
+                .iter()
+                .map(|criterion| format!("- {criterion}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    });
+    let mut selected_providers = serde_json::Map::new();
+    if let Some(execution) = &node.execution {
+        selected_providers.insert(
+            Capability::ExecutionRun.to_string(),
+            serde_json::Value::String(execution.clone()),
+        );
+    }
+    serde_json::json!({
+        "version": "orc.provider/v1",
+        "action": "launch",
+        "preflight": true,
+        "scope": scope,
+        "direction": direction,
+        "session": {
+            "id": session_id,
+            "nativeId": session_id,
+            "harness": node.harness,
+            "model": node.model,
+            "role": node.role,
+            "title": node.name,
+            "purpose": node.purpose,
+            "goal": node.goal,
+            "expectedOutput": node.expected_output,
+            "successCriteria": node.success_criteria,
+            "completion": node.completion,
+            "reviewBy": node.review_by,
+            "parentId": run.orchestrator_id,
+            "runId": run.id,
+            "nodeId": node.id,
+            "providerRef": serde_json::Value::Null,
+            "providers": [],
+            "directory": scope,
+            "registration": RegistrationSource::Managed,
+            "status": node.status,
+        },
+        "command": [node.harness, prompt],
+        "prompt": prompt,
+        "environment": {
+            "ORC_SCOPE": scope,
+            "ORC_SESSION_ID": session_id,
+            "ORC_NATIVE_SESSION_ID": session_id,
+            "ORC_PARENT_SESSION_ID": run.orchestrator_id,
+            "ORC_RUN_ID": run.id,
+            "ORC_NODE_ID": node.id,
+        },
+        "providers": selected_providers,
+    })
 }
 
 fn new_flow() -> AgentFlow {
@@ -2332,7 +2603,7 @@ fn refresh_flow_content(flow: &mut AgentFlow, state: &WorkspaceState, active_run
         for node in &run.nodes {
             if let Some(card) = flow.node_content_mut(&format!("node:{}:{}", run.id, node.id)) {
                 card.title.clone_from(&node.name);
-                card.subtitle = node.execution.as_deref().unwrap_or("unassigned").into();
+                card.subtitle = node_placement(state, node);
                 card.contract = format!(
                     "{} · judge {}",
                     harness_label(&node.harness, node.model.as_deref()),
@@ -2341,7 +2612,7 @@ fn refresh_flow_content(flow: &mut AgentFlow, state: &WorkspaceState, active_run
                 card.goal.clone_from(&node.goal);
                 card.attention = node_attention(run, node);
                 card.status = node.status;
-                card.active = node.status == LifecycleStatus::Working;
+                card.active = node_runtime_active(state, node);
             }
         }
     }
@@ -2420,11 +2691,7 @@ fn build_flow(
             let card = AgentCard {
                 kind: workflow_node.role.to_string(),
                 title: workflow_node.name.clone(),
-                subtitle: workflow_node
-                    .execution
-                    .as_deref()
-                    .unwrap_or("unassigned")
-                    .into(),
+                subtitle: node_placement(state, workflow_node),
                 contract: format!(
                     "{} · judge {}",
                     harness_label(&workflow_node.harness, workflow_node.model.as_deref()),
@@ -2433,7 +2700,7 @@ fn build_flow(
                 goal: workflow_node.goal.clone(),
                 attention: node_attention(run, workflow_node),
                 status: workflow_node.status,
-                active: workflow_node.status == LifecycleStatus::Working,
+                active: node_runtime_active(state, workflow_node),
             };
             let node = Node::new(
                 &node_id,
@@ -2640,10 +2907,14 @@ fn graph_handles() -> Vec<Handle> {
     .collect()
 }
 
-fn tree_rows(state: &WorkspaceState, expanded: &BTreeSet<String>) -> Vec<TreeRow> {
+fn tree_rows(
+    state: &WorkspaceState,
+    expanded: &BTreeSet<String>,
+    providers: &[Manifest],
+) -> Vec<TreeRow> {
     let mut rows = Vec::new();
     let mut visited = BTreeSet::new();
-    let roots: Vec<_> = state
+    let mut roots: Vec<_> = state
         .sessions
         .iter()
         .filter(|session| {
@@ -2655,18 +2926,86 @@ fn tree_rows(state: &WorkspaceState, expanded: &BTreeSet<String>) -> Vec<TreeRow
                     }))
         })
         .collect();
+    roots.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
     for session in roots {
-        push_session_rows(state, expanded, &mut rows, &mut visited, session, 0);
+        push_session_rows(
+            state,
+            expanded,
+            providers,
+            &mut rows,
+            &mut visited,
+            session,
+            0,
+        );
     }
-    let remaining: Vec<_> = state
+    let mut remaining: Vec<_> = state
         .sessions
         .iter()
         .filter(|session| {
             session.status != LifecycleStatus::Archived && !visited.contains(&session.id)
         })
         .collect();
+    remaining.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
     for session in remaining {
-        push_session_rows(state, expanded, &mut rows, &mut visited, session, 0);
+        push_session_rows(
+            state,
+            expanded,
+            providers,
+            &mut rows,
+            &mut visited,
+            session,
+            0,
+        );
+    }
+    let active_session_ids = state
+        .sessions
+        .iter()
+        .filter(|session| session.status != LifecycleStatus::Archived)
+        .map(|session| session.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut orphaned_active_runs = state
+        .runs
+        .iter()
+        .filter(|run| {
+            run.status.active()
+                && !run
+                    .orchestrator_id
+                    .as_deref()
+                    .is_some_and(|id| active_session_ids.contains(id))
+        })
+        .collect::<Vec<_>>();
+    orphaned_active_runs.sort_by_key(|run| std::cmp::Reverse(run.updated_at));
+    for run in orphaned_active_runs {
+        push_run_rows(state, expanded, providers, &mut rows, &mut visited, run, 0);
+    }
+    let mut history = state
+        .runs
+        .iter()
+        .filter(|run| {
+            !run.status.active()
+                && !run
+                    .orchestrator_id
+                    .as_deref()
+                    .is_some_and(|id| active_session_ids.contains(id))
+        })
+        .collect::<Vec<_>>();
+    history.sort_by_key(|run| std::cmp::Reverse(run.updated_at));
+    if !history.is_empty() {
+        let history_id = "history".to_owned();
+        rows.push(TreeRow {
+            id: history_id.clone(),
+            depth: 0,
+            title: "recent history".into(),
+            subtitle: format!("{} completed runs · newest first", history.len()),
+            status: None,
+            item: ItemRef::History,
+            children: true,
+        });
+        if expanded.contains(&history_id) {
+            for run in history {
+                push_run_rows(state, expanded, providers, &mut rows, &mut visited, run, 1);
+            }
+        }
     }
     rows
 }
@@ -2674,6 +3013,7 @@ fn tree_rows(state: &WorkspaceState, expanded: &BTreeSet<String>) -> Vec<TreeRow
 fn push_session_rows(
     state: &WorkspaceState,
     expanded: &BTreeSet<String>,
+    providers: &[Manifest],
     rows: &mut Vec<TreeRow>,
     visited: &mut BTreeSet<String>,
     session: &Session,
@@ -2683,11 +3023,12 @@ fn push_session_rows(
         return;
     }
     let id = format!("session:{}", session.id);
-    let runs: Vec<_> = state
+    let mut runs: Vec<_> = state
         .runs
         .iter()
         .filter(|run| run.orchestrator_id.as_deref() == Some(&session.id))
         .collect();
+    runs.sort_by_key(|run| std::cmp::Reverse(run.updated_at));
     let represented: BTreeSet<_> = runs
         .iter()
         .flat_map(|run| run.nodes.iter().filter_map(|node| node.session_id.clone()))
@@ -2712,6 +3053,7 @@ fn push_session_rows(
             RuntimeActivity::for_session(session)
                 .map(|runtime| runtime.label().to_owned())
                 .unwrap_or_else(|| session.status.to_string()),
+            attach_readiness(session, providers).label().to_owned(),
         ]
         .join(" · "),
         status: Some(session.status),
@@ -2722,51 +3064,83 @@ fn push_session_rows(
         return;
     }
     for run in runs {
-        let run_id = format!("run:{}", run.id);
-        rows.push(TreeRow {
-            id: run_id.clone(),
-            depth: depth + 1,
-            title: run.name.clone(),
-            subtitle: format!("workflow · {} stages · {}", run.nodes.len(), run_phase(run)),
-            status: Some(run.status),
-            item: ItemRef::Run(run.id.clone()),
-            children: !run.nodes.is_empty(),
-        });
-        if !expanded.contains(&run_id) {
-            continue;
-        }
-        for node in &run.nodes {
-            let assigned = node.session_id.as_deref().and_then(|id| {
-                state.sessions.iter().find(|candidate| {
-                    candidate.id == id && candidate.status != LifecycleStatus::Archived
-                })
-            });
-            let node_id = format!("node:{}:{}", run.id, node.id);
-            rows.push(TreeRow {
-                id: node_id.clone(),
-                depth: depth + 2,
-                title: node.name.clone(),
-                subtitle: format!(
-                    "{} · {} · {}",
-                    node.role,
-                    node.execution.as_deref().unwrap_or("unassigned"),
-                    node.harness
-                ),
-                status: Some(node.status),
-                item: ItemRef::Node(run.id.clone(), node.id.clone()),
-                children: assigned.is_some(),
-            });
-            if expanded.contains(&node_id)
-                && let Some(assigned) = assigned
-            {
-                push_session_rows(state, expanded, rows, visited, assigned, depth + 3);
-            } else if let Some(assigned) = assigned {
-                visited.insert(assigned.id.clone());
-            }
-        }
+        push_run_rows(state, expanded, providers, rows, visited, run, depth + 1);
     }
     for child in children {
-        push_session_rows(state, expanded, rows, visited, child, depth + 1);
+        push_session_rows(state, expanded, providers, rows, visited, child, depth + 1);
+    }
+}
+
+fn push_run_rows(
+    state: &WorkspaceState,
+    expanded: &BTreeSet<String>,
+    providers: &[Manifest],
+    rows: &mut Vec<TreeRow>,
+    visited: &mut BTreeSet<String>,
+    run: &WorkflowRun,
+    depth: usize,
+) {
+    let run_id = format!("run:{}", run.id);
+    let orchestrator_unavailable = run.status.active()
+        && !run.orchestrator_id.as_deref().is_some_and(|id| {
+            state
+                .sessions
+                .iter()
+                .any(|session| session.id == id && session.status != LifecycleStatus::Archived)
+        });
+    rows.push(TreeRow {
+        id: run_id.clone(),
+        depth,
+        title: run.name.clone(),
+        subtitle: format!(
+            "workflow · {} stages · {}{}",
+            run.nodes.len(),
+            run_phase(run),
+            if orchestrator_unavailable {
+                " · orchestrator unavailable"
+            } else {
+                ""
+            }
+        ),
+        status: Some(run.status),
+        item: ItemRef::Run(run.id.clone()),
+        children: !run.nodes.is_empty(),
+    });
+    if !expanded.contains(&run_id) {
+        return;
+    }
+    for node in &run.nodes {
+        let assigned = node_session(state, node);
+        let node_id = format!("node:{}:{}", run.id, node.id);
+        rows.push(TreeRow {
+            id: node_id.clone(),
+            depth: depth + 1,
+            title: node.name.clone(),
+            subtitle: format!(
+                "{} · {} · {}",
+                node.role,
+                node_placement(state, node),
+                node.harness
+            ),
+            status: Some(node.status),
+            item: ItemRef::Node(run.id.clone(), node.id.clone()),
+            children: assigned.is_some(),
+        });
+        if expanded.contains(&node_id)
+            && let Some(assigned) = assigned
+        {
+            push_session_rows(
+                state,
+                expanded,
+                providers,
+                rows,
+                visited,
+                assigned,
+                depth + 2,
+            );
+        } else if let Some(assigned) = assigned {
+            visited.insert(assigned.id.clone());
+        }
     }
 }
 
@@ -2791,7 +3165,11 @@ fn render(frame: &mut Frame, app: &mut App) {
     ])
     .areas(area);
     render_header(frame, header, app);
-    let (main, inspector) = split_body(body, app.dock, app.config.ui.inspector_percent);
+    let (mut main, mut inspector) = split_body(body, app.dock, app.config.ui.inspector_percent);
+    if graph_needs_full_body(app, main) {
+        main = body;
+        inspector = None;
+    }
     if inspector.is_none() && app.focus == Focus::Inspector {
         app.focus = Focus::Main;
     }
@@ -2991,6 +3369,16 @@ fn split_body(area: Rect, dock: Dock, percent: u16) -> (Rect, Option<Rect>) {
         }
         Dock::Hidden => (area, None),
     }
+}
+
+fn graph_needs_full_body(app: &App, graph_area: Rect) -> bool {
+    if app.main_tab != MainTab::Work || app.explorer_view != ExplorerView::Graph {
+        return false;
+    }
+    let minimum_width = (AGENT_CARD_WIDTH * 0.75).ceil() as u16 + 4;
+    let minimum_height =
+        ((AGENT_CARD_HEIGHT * 2.0 + CONTROL_LANE_PADDING + 4.0) * 0.75).ceil() as u16 + 4;
+    graph_area.width < minimum_width || graph_area.height < minimum_height
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -3508,7 +3896,10 @@ fn selected_log(app: &App) -> String {
                 (false, false) => format!("{local}\n\n{provider}"),
                 (false, true) => local,
                 (true, false) => provider,
-                (true, true) => "Waiting for this agent to report activity.".into(),
+                (true, true) if node.session_id.is_none() => {
+                    "No agent is assigned to this stage.".into()
+                }
+                (true, true) => "No activity has been reported for this agent.".into(),
             }
         }
         Some(ItemRef::Run(id)) => app
@@ -3639,6 +4030,9 @@ fn details(app: &App) -> String {
             .iter()
             .find(|provider| provider.name == name)
             .map_or_else(String::new, provider_details),
+        Some(ItemRef::History) => {
+            "Completed workflow runs from archived orchestrators · newest first.".into()
+        }
         None => "Select an item.".into(),
     }
 }
@@ -3694,9 +4088,10 @@ fn session_details(app: &App, session: &Session) -> String {
     } else {
         "stopped · leases are not enforced"
     };
+    let open_readiness = attach_readiness(session, &app.providers).label();
     render_detail_template(
         "session",
-        context! { session, placement, activity, runtime_lease, idle_lease, supervisor },
+        context! { session, placement, activity, runtime_lease, idle_lease, supervisor, open_readiness },
     )
 }
 
@@ -3803,7 +4198,16 @@ fn inspector_available(app: &App) -> bool {
 
 fn open_available(app: &App) -> bool {
     work_main(app)
-        && (app.selected_session().is_some() || app.selected_unassigned_stage().is_some())
+        && (app.selected_session().is_some_and(|session| {
+            attach_readiness(session, &app.providers) != AttachReadiness::Unavailable
+        }) || launch_attach_ready(app))
+}
+
+fn launch_attach_ready(app: &App) -> bool {
+    let Some((run_id, node_id)) = app.selected_unassigned_stage() else {
+        return false;
+    };
+    app.launch_ready.contains(&(run_id, node_id))
 }
 
 fn drill_available(app: &App) -> bool {
@@ -4438,7 +4842,12 @@ pub fn run(config: Config, scope: &Path) -> Result<()> {
                 match event::read()? {
                     Event::Key(key) if app.handle_key(key, &tx) => quit = true,
                     Event::Mouse(mouse) => app.handle_mouse(mouse),
-                    Event::Resize(_, _) => app.resize_at = Some(Instant::now()),
+                    Event::Resize(_, _) => {
+                        app.flow.request_fit_view_with_options(
+                            FitViewOptions::default().with_padding(3.0),
+                        );
+                        app.resize_at = Some(Instant::now());
+                    }
                     _ => {}
                 }
                 dirty = true;
@@ -4657,9 +5066,31 @@ mod tests {
             .map(|binding| binding.id)
             .collect::<BTreeSet<_>>();
         assert!(tree.contains("view"));
-        assert!(tree.contains("open"));
+        assert!(!tree.contains("open"));
         assert!(!tree.contains("drill"));
         assert!(!tree.contains("provider-validate"));
+
+        app.providers.push(
+            serde_yaml::from_str(
+                "version: orc.provider/v1\nname: display\nkind: display\ncommand: /usr/bin/true\nactions:\n  terminal.focus: Focus an existing display\n",
+            )
+            .expect("display provider manifest"),
+        );
+        app.state.sessions[0]
+            .providers
+            .push(crate::domain::ProviderBinding {
+                provider: "display".into(),
+                kind: ProviderKind::Display,
+                r#ref: Some("pane:1".into()),
+                status: BindingStatus::Active,
+                label: "ready".into(),
+            });
+        app.rebuild(true);
+        let ready = footer_bindings(&app)
+            .into_iter()
+            .map(|binding| binding.id)
+            .collect::<BTreeSet<_>>();
+        assert!(ready.contains("open"));
 
         app.explorer_view = ExplorerView::Graph;
         app.rebuild(true);
@@ -4725,6 +5156,7 @@ mod tests {
         let rendered = session_details(&app, &app.state.sessions[0]);
         assert!(rendered.contains("orchestrator · external · agent-a"));
         assert!(rendered.contains("activity      active"));
+        assert!(rendered.contains("open          open unavailable"));
         assert!(!rendered.contains("integrations"));
         assert!(rendered.contains("expected output Verified result"));
         assert!(rendered.contains("success criteria\n  - It passes"));
@@ -5135,6 +5567,102 @@ mod tests {
     }
 
     #[test]
+    fn enter_is_hidden_and_inert_without_a_complete_attach_chain() {
+        let mut app = app();
+        let mut run = workflow_run();
+        run.nodes
+            .push(workflow_node("implement", LifecycleStatus::Queued, 0));
+        app.state.runs.push(run);
+        app.active_run = Some("run".into());
+        app.explorer_view = ExplorerView::Graph;
+        app.rebuild(true);
+        app.flow.select_node("node:run:implement");
+        let (tx, rx) = mpsc::channel();
+
+        assert!(!open_available(&app));
+        app.open_selected(&tx);
+
+        assert!(!app.action_inflight);
+        assert!(app.status.contains("no ready persistence and display"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn enter_stays_hidden_when_the_launch_provider_declines_the_selected_harness() {
+        let mut app = app();
+        let mut run = workflow_run();
+        run.nodes
+            .push(workflow_node("implement", LifecycleStatus::Queued, 0));
+        app.state.runs.push(run);
+        app.active_run = Some("run".into());
+        app.explorer_view = ExplorerView::Graph;
+        app.providers = [
+            r#"version: orc.provider/v1
+name: harness
+kind: harness
+command:
+  - /bin/sh
+  - -c
+  - |
+      cat >/dev/null
+      printf '%s\n' '{"version":"orc.provider/v1","status":"declined","reason":"unknown harness"}'
+actions:
+  session.launch: Launch a harness
+"#,
+            "version: orc.provider/v1\nname: persistence\nkind: persistence\ncommand: /usr/bin/true\nactions:\n  session.persist: Preserve a session\n  session.stop: Stop a session\n",
+            "version: orc.provider/v1\nname: executor-a\nkind: execution\ncommand: /usr/bin/true\nactions:\n  execution.run: Execute the plan\n",
+            "version: orc.provider/v1\nname: display\nkind: display\ncommand: /usr/bin/true\nactions:\n  terminal.open: Open a display\n",
+        ]
+        .into_iter()
+        .map(|manifest| serde_yaml::from_str(manifest).expect("provider manifest"))
+        .collect();
+        app.config.cache.provider_ttl_ms = 0;
+        app.launch_ready = launch_ready_nodes(
+            &app.config,
+            &app.providers,
+            &app.scope,
+            &app.state,
+            app.display_direction(),
+        );
+        app.rebuild(true);
+        app.flow.select_node("node:run:implement");
+
+        assert!(provider::launch_attach_route_available(
+            &app.providers,
+            Some("executor-a")
+        ));
+        assert!(!open_available(&app));
+    }
+
+    #[test]
+    fn enter_is_advertised_for_an_unassigned_stage_with_a_complete_attach_chain() {
+        let mut app = app();
+        let mut run = workflow_run();
+        run.nodes
+            .push(workflow_node("implement", LifecycleStatus::Queued, 0));
+        app.state.runs.push(run);
+        app.active_run = Some("run".into());
+        app.explorer_view = ExplorerView::Graph;
+        app.providers = [
+            "version: orc.provider/v1\nname: harness\nkind: harness\ncommand: /usr/bin/true\nactions:\n  session.launch: Launch a harness\n",
+            "version: orc.provider/v1\nname: persistence\nkind: persistence\ncommand: /usr/bin/true\nactions:\n  session.persist: Preserve a session\n  session.stop: Stop a session\n",
+            "version: orc.provider/v1\nname: executor-a\nkind: execution\ncommand: /usr/bin/true\nactions:\n  execution.run: Execute the plan\n",
+            "version: orc.provider/v1\nname: display\nkind: display\ncommand: /usr/bin/true\nactions:\n  terminal.open: Open a display\n",
+        ]
+        .into_iter()
+        .map(|manifest| serde_yaml::from_str(manifest).expect("provider manifest"))
+        .collect();
+        app.rebuild(true);
+        app.flow.select_node("node:run:implement");
+        app.launch_ready.insert(("run".into(), "implement".into()));
+
+        assert!(open_available(&app));
+
+        app.launch_ready.clear();
+        assert!(!open_available(&app));
+    }
+
+    #[test]
     fn assigned_session_is_nested_once_below_its_stage() {
         let mut app = app();
         let mut run = workflow_run();
@@ -5222,7 +5750,7 @@ mod tests {
         state.sessions.push(archived);
 
         assert_eq!(visible_agent_count(&state), 3);
-        assert_eq!(tree_rows(&state, &default_expansions(&state)).len(), 3);
+        assert_eq!(tree_rows(&state, &default_expansions(&state), &[]).len(), 3);
         let (_, graph_items) = build_flow(&state, None);
         assert_eq!(
             graph_items
@@ -5277,6 +5805,86 @@ mod tests {
         assert_eq!(app.tree[1].title, "Provider migration");
         assert!(app.enrichment_requested);
         assert!(!app.enrichment_inflight);
+    }
+
+    #[test]
+    fn newest_active_run_is_selected_on_startup() {
+        let mut older = workflow_run();
+        older.id = "older".into();
+        older.updated_at = Utc::now() - chrono::Duration::minutes(1);
+        let mut newer = workflow_run();
+        newer.id = "newer".into();
+        newer.updated_at = Utc::now();
+        let mut state = app().state;
+        state.runs = vec![older, newer];
+
+        let app = App::new(
+            Config::default(),
+            PathBuf::from("/tmp/orc-test"),
+            state,
+            Vec::new(),
+        );
+
+        assert_eq!(app.active_run.as_deref(), Some("newer"));
+    }
+
+    #[test]
+    fn archived_orchestrator_runs_stay_in_collapsed_recent_history() {
+        let mut state = app().state;
+        state.sessions[0].status = LifecycleStatus::Archived;
+        let mut older = workflow_run();
+        older.id = "older".into();
+        older.name = "Older completed run".into();
+        older.status = LifecycleStatus::Done;
+        older.updated_at = Utc::now() - chrono::Duration::minutes(2);
+        let mut newer = workflow_run();
+        newer.id = "newer".into();
+        newer.name = "Newer completed run".into();
+        newer.status = LifecycleStatus::Done;
+        newer.updated_at = Utc::now() - chrono::Duration::minutes(1);
+        state.runs = vec![older, newer];
+
+        let expanded = default_expansions(&state);
+        let collapsed = tree_rows(&state, &expanded, &[]);
+        let history = collapsed
+            .iter()
+            .find(|row| row.item == ItemRef::History)
+            .expect("recent history branch");
+        assert_eq!(history.subtitle, "2 completed runs · newest first");
+        assert!(collapsed.iter().all(|row| {
+            !matches!(&row.item, ItemRef::Run(id) if id == "older" || id == "newer")
+        }));
+
+        let mut expanded = expanded;
+        expanded.insert("history".into());
+        let visible = tree_rows(&state, &expanded, &[]);
+        let runs = visible
+            .iter()
+            .filter_map(|row| match &row.item {
+                ItemRef::Run(id) => Some(id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(runs, ["newer", "older"]);
+    }
+
+    #[test]
+    fn active_run_with_an_archived_orchestrator_remains_visible() {
+        let mut state = app().state;
+        state.sessions[0].status = LifecycleStatus::Archived;
+        let mut run = workflow_run();
+        run.status = LifecycleStatus::Working;
+        state.runs = vec![run];
+
+        let rows = tree_rows(&state, &default_expansions(&state), &[]);
+        let visible = rows
+            .iter()
+            .filter(|row| matches!(&row.item, ItemRef::Run(id) if id == "run"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].depth, 0);
+        assert!(visible[0].subtitle.contains("orchestrator unavailable"));
     }
 
     #[test]
@@ -5485,15 +6093,18 @@ mod tests {
         stale.sessions[0].title = "stale title".into();
         app.apply_background(BackgroundResult::Enrichment {
             generation: 1,
+            rebind_current: true,
             result: Ok(stale),
         });
         assert_eq!(app.state.sessions[0].title, "root");
         assert!(!app.enrichment_inflight);
+        assert!(app.rebind_current_pending);
         assert!(app.enrichment_due_at > Instant::now());
 
         app.enrichment_inflight = true;
         app.apply_background(BackgroundResult::Enrichment {
             generation: 2,
+            rebind_current: false,
             result: Err("provider unavailable".into()),
         });
         assert!(app.status.contains("provider unavailable"));
@@ -5538,10 +6149,12 @@ mod tests {
     fn graph_marks_every_parallel_working_node_active() {
         let mut state = app().state;
         let mut run = workflow_run();
-        run.nodes
-            .push(workflow_node("research", LifecycleStatus::Working, 1));
-        run.nodes
-            .push(workflow_node("implement", LifecycleStatus::Working, 1));
+        let mut research = workflow_node("research", LifecycleStatus::Working, 1);
+        research.session_id = Some("native-child".into());
+        let mut implement = workflow_node("implement", LifecycleStatus::Working, 1);
+        implement.session_id = Some("harness-child".into());
+        run.nodes.push(research);
+        run.nodes.push(implement);
         run.current_node = Some("research".into());
         run.status = LifecycleStatus::Working;
         state.runs.push(run);
@@ -5554,6 +6167,24 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing {id}"));
             assert!(node.content.active, "{id} is not rendered active");
         }
+    }
+
+    #[test]
+    fn graph_does_not_animate_a_working_stage_without_an_agent() {
+        let mut state = app().state;
+        let mut run = workflow_run();
+        run.nodes
+            .push(workflow_node("research", LifecycleStatus::Working, 1));
+        run.status = LifecycleStatus::Working;
+        state.runs.push(run);
+
+        let (flow, _) = build_flow(&state, Some("run"));
+        let node = flow
+            .nodes()
+            .find(|node| node.id == "node:run:research")
+            .expect("research node");
+        assert!(!node.content.active);
+        assert!(node.content.subtitle.contains("no agent assigned"));
     }
 
     #[test]
@@ -5975,5 +6606,53 @@ mod tests {
             assert!(app.hit.graph.width > 0);
             assert!(app.hit.graph.height > 0);
         }
+    }
+
+    #[test]
+    fn compact_graph_keeps_root_and_keyboard_selection_visible() {
+        let mut app = app();
+        let mut run = workflow_run();
+        run.nodes
+            .push(workflow_node("implement", LifecycleStatus::Queued, 0));
+        app.state.runs.push(run);
+        app.active_run = Some("run".into());
+        app.explorer_view = ExplorerView::Graph;
+        app.rebuild(true);
+        app.flow.select_node("session:root");
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("compact terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("compact graph renders");
+        assert!(app.hit.inspector.is_none());
+        assert_node_visible(&app.flow, "session:root");
+
+        let (tx, _rx) = mpsc::channel();
+        app.handle_key(key(KeyCode::Char('j'), KeyModifiers::NONE), &tx);
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("selected node renders");
+        assert_eq!(
+            app.flow.first_selected_node_id().as_deref(),
+            Some("node:run:implement")
+        );
+        assert_node_visible(&app.flow, "node:run:implement");
+        assert_node_visible(&app.flow, "session:root");
+    }
+
+    fn assert_node_visible(flow: &AgentFlow, id: &str) {
+        let (left, top, right, bottom) = flow.node_terminal_rect(id).expect("node rectangle");
+        assert!(
+            flow.is_in_bounds(left, top),
+            "{id} top-left ({left}, {top}) is outside {:?}",
+            flow.canvas_area()
+        );
+        assert!(
+            flow.is_in_bounds(right - 1, bottom - 1),
+            "{id} bottom-right ({}, {}) is outside {:?}",
+            right - 1,
+            bottom - 1,
+            flow.canvas_area()
+        );
     }
 }
