@@ -150,6 +150,80 @@ new orchestrator for the current directory. Orc archives the previous active
 orchestrator incarnation. Use `orc session archive` when an unhooked harness
 ends. Harness exit hooks should call `orc session archive --hook-input --quiet`.
 
+## Apply desired state
+
+Users and orchestrator agents use the same resource API. A file contains one or
+more `orc.dev/v1alpha1` resources: `Workflow`, `Run`, `Session`, `Execution`,
+`EventBinding`, or `Artifact`.
+
+Orc borrows the desired-state and reconciliation model. It does not embed
+Kubernetes. A future execution provider can target Kubernetes without changing
+the resource API or the local control-plane store.
+
+```bash
+orc diff -f examples/control-plane.yaml
+orc apply -f examples/control-plane.yaml --field-manager roshan
+orc get executions
+orc describe run release-2026-09-04
+orc events execution release-2026-09-04-verify
+```
+
+`apply` persists desired state, checks field ownership, and reconciles active
+resources. Use `--dry-run` to calculate changes without writes or provider
+calls. Use `--no-reconcile` to stage desired state for a later
+`orc reconcile`. `--force-conflicts` explicitly transfers changed fields from
+another field manager.
+
+Workflows declare dependency-ordered stages. A `Run` references a workflow.
+Reconciliation materializes each stage as an `Execution`, processes ready
+levels in stable name order, and writes observed state only after the provider
+responds. Imperative workflow and session commands remain compatibility paths.
+
+An `Artifact` stores its body once by SHA-256 digest. An execution input can
+refer to an artifact or a prior execution output:
+
+```yaml
+inputs:
+  requirements:
+    artifactRef: release-goal
+  implementation:
+    executionRef: release-2026-09-04-implement
+    output: result
+```
+
+`EventBinding` filters durable events by `eventTypes`, `reasons`, and
+`subjectKinds`, then delivers each match once through `event.deliver`.
+Providers receive a stable
+`operationId`, the complete resource, resolved inputs, and the event when one
+exists. A provider may return observed state directly or a command plan. The
+declarative provider capabilities are:
+
+```text
+execution.ensure   make desired execution state exist
+execution.observe  refresh observed execution state
+execution.cancel   stop an execution idempotently
+execution.logs     return execution logs
+session.observe    refresh session state
+event.deliver      execute an EventBinding hook once per event
+```
+
+The bundled local provider reads `spec.command` for `execution.ensure`. Other
+actions read `spec.actions.<capability>.command`. Each command must print one
+JSON observation such as:
+
+```json
+{"status":"Succeeded","outputs":{"result":"verified"}}
+```
+
+An action can set `cwd` and `environment` beside `command`. The provider only
+translates the resource into a command plan. Orc owns execution, timeout
+handling, output capture, and status persistence.
+
+`orc watch` emits JSON lines and always stops at the requested event count or
+timeout. The maximum timeout is one hour. See
+[`examples/control-plane.yaml`](examples/control-plane.yaml) and the generated
+[`resource schema`](schema/resource.schema.json).
+
 ## Run a workflow
 
 Create a starter definition in the current workspace's workflow catalog:
@@ -544,6 +618,176 @@ Usage: orc mode [OPTIONS] [MODE]
 
 Arguments:
   [MODE]
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+  -h, --help           Print help
+```
+
+### `orc apply`
+
+Apply declarative resources
+
+```text
+Apply declarative resources
+
+Usage: orc apply [OPTIONS] --file <FILE>
+
+Options:
+  -f, --file <FILE>
+      --scope <SCOPE>                  [env: ORC_SCOPE=] [default: .]
+      --json
+      --field-manager <FIELD_MANAGER>  [default: orc-cli]
+      --force-conflicts
+      --dry-run
+      --no-reconcile
+  -h, --help                           Print help
+```
+
+### `orc diff`
+
+Compare declarative resources with stored state
+
+```text
+Compare declarative resources with stored state
+
+Usage: orc diff [OPTIONS] --file <FILE>
+
+Options:
+  -f, --file <FILE>
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --json
+  -h, --help           Print help
+```
+
+### `orc get`
+
+Get declarative resources
+
+```text
+Get declarative resources
+
+Usage: orc get [OPTIONS] [KIND] [NAME]
+
+Arguments:
+  [KIND]
+  [NAME]
+
+Options:
+      --scope <SCOPE>    [env: ORC_SCOPE=] [default: .]
+  -o, --output <OUTPUT>  [default: table] [possible values: table, json, yaml]
+      --raw
+  -h, --help             Print help
+```
+
+### `orc describe`
+
+Describe a declarative resource
+
+```text
+Describe a declarative resource
+
+Usage: orc describe [OPTIONS] <KIND> <NAME>
+
+Arguments:
+  <KIND>
+  <NAME>
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+  -h, --help           Print help
+```
+
+### `orc delete`
+
+Delete a declarative resource
+
+```text
+Delete a declarative resource
+
+Usage: orc delete [OPTIONS] <KIND> <NAME>
+
+Arguments:
+  <KIND>
+  <NAME>
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --dry-run
+      --json
+  -h, --help           Print help
+```
+
+### `orc events`
+
+List durable control-plane events
+
+```text
+List durable control-plane events
+
+Usage: orc events [OPTIONS] [KIND] [NAME]
+
+Arguments:
+  [KIND]
+  [NAME]
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --after <AFTER>  [default: 0]
+      --json
+  -h, --help           Print help
+```
+
+### `orc watch`
+
+Watch a bounded stream of control-plane events
+
+```text
+Watch a bounded stream of control-plane events
+
+Usage: orc watch [OPTIONS] [KIND] [NAME]
+
+Arguments:
+  [KIND]
+  [NAME]
+
+Options:
+      --scope <SCOPE>                      [env: ORC_SCOPE=] [default: .]
+      --after <AFTER>                      [default: 0]
+      --count <COUNT>                      [default: 1]
+      --timeout-seconds <TIMEOUT_SECONDS>  [default: 30]
+  -h, --help                               Print help
+```
+
+### `orc reconcile`
+
+Reconcile declarative desired state
+
+```text
+Reconcile declarative desired state
+
+Usage: orc reconcile [OPTIONS]
+
+Options:
+      --scope <SCOPE>            [env: ORC_SCOPE=] [default: .]
+      --max-passes <MAX_PASSES>  [default: 16]
+      --dry-run
+      --json
+  -h, --help                     Print help
+```
+
+### `orc logs`
+
+Read logs for a declarative execution
+
+```text
+Read logs for a declarative execution
+
+Usage: orc logs [OPTIONS] <KIND> <NAME>
+
+Arguments:
+  <KIND>
+  <NAME>
 
 Options:
       --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
@@ -1427,7 +1671,7 @@ Print generated JSON schemas
 Usage: orc schema <SCHEMA>
 
 Arguments:
-  <SCHEMA>  [possible values: config, animation, provider, workflow, state]
+  <SCHEMA>  [possible values: config, animation, resource, provider, workflow, state]
 
 Options:
   -h, --help  Print help

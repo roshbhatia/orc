@@ -447,6 +447,14 @@ pub fn update<T>(
     Ok(result)
 }
 
+pub(crate) fn with_path_lock<T>(target: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).context("create state directory")?;
+    }
+    let _lock = Lock::acquire(target.with_extension("json.lock"))?;
+    operation()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

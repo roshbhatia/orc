@@ -70,14 +70,22 @@ pub enum Capability {
     TerminalFocus,
     #[serde(rename = "execution.run")]
     ExecutionRun,
+    #[serde(rename = "execution.ensure")]
+    ExecutionEnsure,
     #[serde(rename = "execution.cancel")]
     ExecutionCancel,
+    #[serde(rename = "execution.observe")]
+    ExecutionObserve,
     #[serde(rename = "execution.status")]
     ExecutionStatus,
     #[serde(rename = "execution.logs")]
     ExecutionLogs,
     #[serde(rename = "session.guide")]
     SessionGuide,
+    #[serde(rename = "session.observe")]
+    SessionObserve,
+    #[serde(rename = "event.deliver")]
+    EventDeliver,
 }
 
 impl std::fmt::Display for Capability {
@@ -1020,6 +1028,11 @@ fn validate_protocol_response(provider: &Manifest, request: &Value, value: Value
         Some("session.describe") => {
             parse_description(provider, &value)?;
         }
+        Some(
+            "execution.ensure" | "execution.observe" | "execution.cancel" | "execution.logs"
+            | "session.observe" | "event.deliver",
+        ) if value.get("status").and_then(Value::as_str).is_some()
+            || value.get("phase").and_then(Value::as_str).is_some() => {}
         Some(_) => {
             parse_plan(provider, value.clone())?
                 .with_context(|| format!("{} returned no command plan", provider.name))?;
@@ -1411,10 +1424,14 @@ fn capability_action(capability: Capability) -> &'static str {
         Capability::TerminalOpen => "open",
         Capability::TerminalFocus => "focus",
         Capability::ExecutionRun => "execute",
+        Capability::ExecutionEnsure => "ensure",
         Capability::ExecutionCancel => "cancel",
+        Capability::ExecutionObserve => "observe",
         Capability::ExecutionStatus => "status",
         Capability::ExecutionLogs => "logs",
         Capability::SessionGuide => "guide",
+        Capability::SessionObserve => "observe",
+        Capability::EventDeliver => "deliver",
     }
 }
 
@@ -1500,6 +1517,14 @@ fn validate_action_response(
             Capability::SessionDescribe => {
                 parse_description(provider, &value)?;
             }
+            Capability::ExecutionEnsure
+            | Capability::ExecutionObserve
+            | Capability::ExecutionCancel
+            | Capability::ExecutionLogs
+            | Capability::SessionObserve
+            | Capability::EventDeliver
+                if value.get("status").and_then(Value::as_str).is_some()
+                    || value.get("phase").and_then(Value::as_str).is_some() => {}
             _ => {
                 parse_plan(provider, value)?.context("provider declined without a status")?;
             }
@@ -1732,6 +1757,61 @@ pub fn resolve_plan(
     request: Value,
 ) -> Result<CommandPlan> {
     resolve_plan_from_tracked(config, providers, action, request, None, None, None)
+}
+
+#[derive(Clone, Debug)]
+pub struct CapabilityInvocation {
+    pub provider: String,
+    pub value: Value,
+    pub plan: Option<CommandPlan>,
+}
+
+pub fn invoke_capability(
+    config: &Config,
+    providers: &[Manifest],
+    capability: Capability,
+    mut request: Value,
+) -> Result<CapabilityInvocation> {
+    request["capability"] = Value::String(capability.to_string());
+    if request.get("action").and_then(Value::as_str).is_none() {
+        request["action"] = Value::String(capability_action(capability).into());
+    }
+    let mut failures = Vec::new();
+    for provider in candidates_for_request(providers, capability, &request) {
+        match invoke_raw(provider, &request, config, None) {
+            Ok(value) if value.get("status").and_then(Value::as_str) == Some("declined") => {
+                failures.push(format!(
+                    "{}: {}",
+                    provider.name,
+                    value
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("declined")
+                ));
+            }
+            Ok(value) => {
+                let plan = value
+                    .get("command")
+                    .is_some()
+                    .then(|| parse_plan(provider, value.clone()))
+                    .transpose()?
+                    .flatten();
+                return Ok(CapabilityInvocation {
+                    provider: provider.name.clone(),
+                    value,
+                    plan,
+                });
+            }
+            Err(error) => failures.push(format!("{}: {error:#}", provider.name)),
+        }
+    }
+    if failures.is_empty() {
+        bail!("no provider advertises capability {capability}");
+    }
+    bail!(
+        "no provider accepted capability {capability}: {}",
+        failures.join("; ")
+    )
 }
 
 pub(crate) fn resolve_plan_tracked(
@@ -2241,6 +2321,11 @@ pub(crate) fn monitor_process(tracker_fd: i32, parent_fd: i32) -> Result<()> {
     }
 }
 
+#[cfg(not(unix))]
+pub(crate) fn monitor_process(_tracker_fd: i32, _parent_fd: i32) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(unix)]
 fn terminate_current_process_group() -> ! {
     let group = unsafe { libc::getpgrp() };
@@ -2254,11 +2339,6 @@ fn terminate_current_process_group() -> ! {
         }
     }
     std::process::exit(0)
-}
-
-#[cfg(not(unix))]
-pub(crate) fn monitor_process(_tracker_fd: i32, _parent_fd: i32) -> Result<()> {
-    Ok(())
 }
 
 pub(crate) struct ProcessTrackerGuard {

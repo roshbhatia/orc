@@ -15,10 +15,14 @@
         "terminal.open",
         "terminal.focus",
         "execution.run",
+        "execution.ensure",
         "execution.cancel",
+        "execution.observe",
         "execution.status",
         "execution.logs",
-        "session.guide"
+        "session.guide",
+        "session.observe",
+        "event.deliver"
       ],
       "type": "string"
     },
@@ -115,10 +119,19 @@
         "changes.inspect": {
           "type": "string"
         },
+        "event.deliver": {
+          "type": "string"
+        },
         "execution.cancel": {
           "type": "string"
         },
+        "execution.ensure": {
+          "type": "string"
+        },
         "execution.logs": {
+          "type": "string"
+        },
+        "execution.observe": {
           "type": "string"
         },
         "execution.run": {
@@ -146,6 +159,9 @@
           "type": "string"
         },
         "session.launch": {
+          "type": "string"
+        },
+        "session.observe": {
           "type": "string"
         },
         "session.persist": {

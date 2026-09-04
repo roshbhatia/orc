@@ -1,0 +1,176 @@
+{
+  "$defs": {
+    "ArtifactReference": {
+      "properties": {
+        "digest": {
+          "type": "string"
+        },
+        "mediaType": {
+          "type": "string"
+        },
+        "size": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "digest",
+        "size",
+        "mediaType"
+      ],
+      "type": "object"
+    },
+    "ObjectMeta": {
+      "properties": {
+        "createdAt": {
+          "default": "1970-01-01T00:00:00Z",
+          "format": "date-time",
+          "type": "string"
+        },
+        "fieldOwners": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "generation": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "labels": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "name": {
+          "type": "string"
+        },
+        "resourceVersion": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "uid": {
+          "default": "",
+          "type": "string"
+        },
+        "updatedAt": {
+          "default": "1970-01-01T00:00:00Z",
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "ResourceKind": {
+      "enum": [
+        "Workflow",
+        "Run",
+        "Session",
+        "Execution",
+        "EventBinding",
+        "Artifact"
+      ],
+      "type": "string"
+    },
+    "ResourceStatus": {
+      "properties": {
+        "deliveredEvents": {
+          "default": [],
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "externalRef": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "observedGeneration": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "outputs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ArtifactReference"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "phase": {
+          "default": "",
+          "type": "string"
+        },
+        "provider": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "apiVersion": {
+      "const": "orc.dev/v1alpha1",
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/$defs/ResourceKind"
+    },
+    "metadata": {
+      "$ref": "#/$defs/ObjectMeta"
+    },
+    "spec": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "status": {
+      "$ref": "#/$defs/ResourceStatus",
+      "default": {
+        "deliveredEvents": [],
+        "externalRef": null,
+        "message": null,
+        "observedGeneration": 0,
+        "outputs": {},
+        "phase": "",
+        "provider": null
+      }
+    }
+  },
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec"
+  ],
+  "title": "Resource",
+  "type": "object"
+}

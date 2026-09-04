@@ -17,6 +17,7 @@ use crate::{
     VERSION, animation,
     config::{self, Config},
     control::{self, Contract, SessionLease, SessionLink},
+    control_plane::{self, ResourceKind},
     daemon,
     domain::{CompletionTarget, JudgePolicy, LifecycleStatus, RegistrationSource, SessionRole},
     mcp,
@@ -55,6 +56,24 @@ enum Commands {
         #[command(flatten)]
         scope: ScopeArgs,
     },
+    #[command(about = "Apply declarative resources")]
+    Apply(ApplyArgs),
+    #[command(about = "Compare declarative resources with stored state")]
+    Diff(FileArgs),
+    #[command(about = "Get declarative resources")]
+    Get(GetArgs),
+    #[command(about = "Describe a declarative resource")]
+    Describe(ResourceArgs),
+    #[command(about = "Delete a declarative resource")]
+    Delete(DeleteArgs),
+    #[command(about = "List durable control-plane events")]
+    Events(EventsArgs),
+    #[command(about = "Watch a bounded stream of control-plane events")]
+    Watch(WatchArgs),
+    #[command(about = "Reconcile declarative desired state")]
+    Reconcile(ReconcileArgs),
+    #[command(about = "Read logs for a declarative execution")]
+    Logs(ResourceArgs),
     #[command(about = "List registered sessions")]
     List(OutputArgs),
     #[command(about = "Register the current session")]
@@ -181,6 +200,105 @@ struct DoctorArgs {
     scope: ScopeArgs,
     #[arg(long)]
     repair: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct FileArgs {
+    #[arg(short = 'f', long = "file")]
+    file: PathBuf,
+    #[command(flatten)]
+    scope: ScopeArgs,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct ApplyArgs {
+    #[command(flatten)]
+    source: FileArgs,
+    #[arg(long, default_value = "orc-cli")]
+    field_manager: String,
+    #[arg(long)]
+    force_conflicts: bool,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    no_reconcile: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ResourceOutput {
+    Table,
+    Json,
+    Yaml,
+}
+
+#[derive(Args)]
+struct GetArgs {
+    kind: Option<ResourceKind>,
+    name: Option<String>,
+    #[command(flatten)]
+    scope: ScopeArgs,
+    #[arg(short = 'o', long, default_value = "table")]
+    output: ResourceOutput,
+    #[arg(long)]
+    raw: bool,
+}
+
+#[derive(Args)]
+struct ResourceArgs {
+    kind: ResourceKind,
+    name: String,
+    #[command(flatten)]
+    scope: ScopeArgs,
+}
+
+#[derive(Args)]
+struct DeleteArgs {
+    #[command(flatten)]
+    resource: ResourceArgs,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct EventsArgs {
+    kind: Option<ResourceKind>,
+    name: Option<String>,
+    #[command(flatten)]
+    scope: ScopeArgs,
+    #[arg(long, default_value_t = 0)]
+    after: u64,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct WatchArgs {
+    kind: Option<ResourceKind>,
+    name: Option<String>,
+    #[command(flatten)]
+    scope: ScopeArgs,
+    #[arg(long, default_value_t = 0)]
+    after: u64,
+    #[arg(long, default_value_t = 1)]
+    count: usize,
+    #[arg(long, default_value_t = 30)]
+    timeout_seconds: u64,
+}
+
+#[derive(Args)]
+struct ReconcileArgs {
+    #[command(flatten)]
+    scope: ScopeArgs,
+    #[arg(long, default_value_t = 16)]
+    max_passes: usize,
+    #[arg(long)]
+    dry_run: bool,
     #[arg(long)]
     json: bool,
 }
@@ -596,6 +714,7 @@ struct GuideArgs {
 enum SchemaTarget {
     Config,
     Animation,
+    Resource,
     Provider,
     Workflow,
     State,
@@ -856,6 +975,167 @@ pub fn run() -> Result<u8> {
                 preferences::write(&scope, &selected)?;
             }
             println!("{}", selected.autonomy);
+        }
+        Commands::Apply(args) => {
+            require_orchestrator_or_operator(&args.source.scope.scope)?;
+            let resources = control_plane::load_documents(&args.source.file)?;
+            let result = control_plane::apply(
+                &args.source.scope.scope,
+                resources,
+                &args.field_manager,
+                args.force_conflicts,
+                args.dry_run,
+            )?;
+            let should_reconcile = !args.dry_run
+                && !args.no_reconcile
+                && result.changes.iter().any(|change| {
+                    matches!(
+                        change.resource.kind,
+                        ResourceKind::Run | ResourceKind::Session | ResourceKind::Execution
+                    )
+                });
+            print_changes(&result.changes, args.source.json)?;
+            if should_reconcile {
+                let reconciled =
+                    control_plane::reconcile(&config, &args.source.scope.scope, 16, false)?;
+                if reconciled
+                    .actions
+                    .iter()
+                    .any(|action| action.error.is_some())
+                {
+                    for action in reconciled.actions {
+                        if let Some(error) = action.error {
+                            eprintln!("{}: {error}", action.resource);
+                        }
+                    }
+                    return Ok(1);
+                }
+            }
+        }
+        Commands::Diff(args) => {
+            let resources = control_plane::load_documents(&args.file)?;
+            print_changes(
+                &control_plane::diff(&args.scope.scope, &resources)?,
+                args.json,
+            )?;
+        }
+        Commands::Get(args) => {
+            if args.raw {
+                if args.kind != Some(ResourceKind::Artifact) {
+                    bail!("--raw requires kind Artifact");
+                }
+                let name = args
+                    .name
+                    .as_deref()
+                    .context("--raw requires an artifact name")?;
+                print!("{}", control_plane::artifact_body(&args.scope.scope, name)?);
+            } else {
+                let resources =
+                    control_plane::list(&args.scope.scope, args.kind, args.name.as_deref())?;
+                print_resources(&resources, args.output)?;
+            }
+        }
+        Commands::Describe(args) => {
+            let resource =
+                control_plane::list(&args.scope.scope, Some(args.kind), Some(&args.name))?
+                    .remove(0);
+            let events =
+                control_plane::events(&args.scope.scope, Some(args.kind), Some(&args.name), 0)?;
+            println!(
+                "{}",
+                serde_yaml::to_string(&serde_json::json!({
+                    "resource": resource,
+                    "events": events,
+                }))?
+            );
+        }
+        Commands::Delete(args) => {
+            require_orchestrator_or_operator(&args.resource.scope.scope)?;
+            let change = control_plane::delete(
+                &args.resource.scope.scope,
+                args.resource.kind,
+                &args.resource.name,
+                args.dry_run,
+            )?;
+            print_changes(&[change], args.json)?;
+        }
+        Commands::Events(args) => {
+            let events = control_plane::events(
+                &args.scope.scope,
+                args.kind,
+                args.name.as_deref(),
+                args.after,
+            )?;
+            if args.json {
+                print_json(&events)?;
+            } else {
+                for event in events {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        event.sequence, event.at, event.reason, event.subject, event.message
+                    );
+                }
+            }
+        }
+        Commands::Watch(args) => {
+            control_plane::watch_events(
+                &args.scope.scope,
+                args.kind,
+                args.name.as_deref(),
+                args.after,
+                args.count.clamp(1, 10_000),
+                std::time::Duration::from_secs(args.timeout_seconds.clamp(1, 3600)),
+                |event| {
+                    println!("{}", serde_json::to_string(&event)?);
+                    Ok(())
+                },
+            )?;
+        }
+        Commands::Reconcile(args) => {
+            require_orchestrator_or_operator(&args.scope.scope)?;
+            let result = control_plane::reconcile(
+                &config,
+                &args.scope.scope,
+                args.max_passes,
+                args.dry_run,
+            )?;
+            let failed = result.actions.iter().any(|action| action.error.is_some());
+            if args.json {
+                print_json(&result)?;
+            } else if result.actions.is_empty() {
+                println!("stable");
+            } else {
+                for action in result.actions {
+                    println!(
+                        "{}\t{}\t{}\t{}{}",
+                        action.resource,
+                        action.capability,
+                        action.provider.as_deref().unwrap_or(if args.dry_run {
+                            "dry-run"
+                        } else {
+                            "failed"
+                        }),
+                        action.operation_id,
+                        action
+                            .error
+                            .as_deref()
+                            .map(|error| format!("\t{error}"))
+                            .unwrap_or_default()
+                    );
+                }
+            }
+            if failed {
+                return Ok(1);
+            }
+        }
+        Commands::Logs(args) => {
+            if args.kind != ResourceKind::Execution {
+                bail!("logs requires kind Execution");
+            }
+            print!(
+                "{}",
+                control_plane::logs(&config, &args.scope.scope, &args.name)?
+            );
         }
         Commands::List(args) => list_sessions(&args)?,
         Commands::Connect(args) => {
@@ -1272,6 +1552,7 @@ pub fn run() -> Result<u8> {
                 SchemaTarget::Animation => {
                     serde_json::from_str(&rs_utils::animation::AnimationConfig::json_schema()?)?
                 }
+                SchemaTarget::Resource => control_plane::schema(),
                 SchemaTarget::Provider => provider::schema(),
                 SchemaTarget::Workflow => workflow::schema(),
                 SchemaTarget::State => {
@@ -1283,6 +1564,52 @@ pub fn run() -> Result<u8> {
         Commands::Generate { root, check } => generate_artifacts(&root, check)?,
     }
     Ok(0)
+}
+
+fn print_changes(changes: &[control_plane::ResourceChange], json: bool) -> Result<()> {
+    if json {
+        print_json(&changes)
+    } else {
+        for change in changes {
+            if change.paths.is_empty() {
+                println!("{}\t{}", change.resource, change.action);
+            } else {
+                println!(
+                    "{}\t{}\t{}",
+                    change.resource,
+                    change.action,
+                    change.paths.join(",")
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn print_resources(resources: &[control_plane::Resource], output: ResourceOutput) -> Result<()> {
+    match output {
+        ResourceOutput::Json => print_json(&resources),
+        ResourceOutput::Yaml => {
+            print!("{}", serde_yaml::to_string(resources)?);
+            Ok(())
+        }
+        ResourceOutput::Table => {
+            for resource in resources {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    resource.kind,
+                    resource.metadata.name,
+                    if resource.status.phase.is_empty() {
+                        "Pending"
+                    } else {
+                        &resource.status.phase
+                    },
+                    resource.metadata.generation
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 fn list_sessions(args: &OutputArgs) -> Result<()> {
@@ -1504,6 +1831,7 @@ fn generate_artifacts(root: &std::path::Path, check: bool) -> Result<()> {
             "terminal.animation.v1.schema.json",
             serde_json::from_str(&rs_utils::animation::AnimationConfig::json_schema()?)?,
         ),
+        ("resource.schema.json", control_plane::schema()),
         ("provider.schema.json", provider::schema()),
         ("workflow.schema.json", workflow::schema()),
         (

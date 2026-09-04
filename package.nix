@@ -50,6 +50,7 @@ rustPlatform.buildRustPackage {
     "$out/bin/orc" completion nu > "$out/share/nushell/vendor/autoload/orc.nu"
     "$out/bin/orc" schema config > "$out/share/orc/config.schema.json"
     "$out/bin/orc" schema animation > "$out/share/orc/terminal.animation.v1.schema.json"
+    "$out/bin/orc" schema resource > "$out/share/orc/resource.schema.json"
     "$out/bin/orc" schema provider > "$out/share/orc/provider.schema.json"
     "$out/bin/orc" schema workflow > "$out/share/orc/workflow.schema.json"
     "$out/bin/orc" schema state > "$out/share/orc/state.schema.json"

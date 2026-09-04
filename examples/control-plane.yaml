@@ -1,0 +1,83 @@
+# yaml-language-server: $schema=../schema/resource.schema.json
+apiVersion: orc.dev/v1alpha1
+kind: Workflow
+metadata:
+  name: release
+spec:
+  goal: Ship a verified release
+  expectedOutput: A tagged release with passing checks
+  stages:
+    - name: implement
+      provider: local
+      command:
+        - /bin/sh
+        - -c
+        - |
+          printf '%s\n' '{"status":"Succeeded","outputs":{"result":"implemented"}}'
+      inputs:
+        goal:
+          artifactRef: release-goal
+    - name: verify
+      provider: local
+      command:
+        - /bin/sh
+        - -c
+        - |
+          printf '%s\n' '{"status":"Succeeded","outputs":{"result":"verified"}}'
+      dependsOn:
+        - implement
+      inputs:
+        implementation:
+          executionRef: release-2026-09-04-implement
+          output: result
+---
+apiVersion: orc.dev/v1alpha1
+kind: Run
+metadata:
+  name: release-2026-09-04
+spec:
+  workflowRef: release
+  parameters:
+    version: v0.10.0
+---
+apiVersion: orc.dev/v1alpha1
+kind: Session
+metadata:
+  name: release-orchestrator
+spec:
+  harness: codex
+  role: orchestrator
+  provider: local
+  actions:
+    session.observe:
+      command:
+        - /bin/sh
+        - -c
+        - |
+          printf '%s\n' '{"status":"Active"}'
+---
+apiVersion: orc.dev/v1alpha1
+kind: EventBinding
+metadata:
+  name: report-failures
+spec:
+  reasons:
+    - ReconcileFailed
+  subjectKinds:
+    - Execution
+  provider: local
+  actions:
+    event.deliver:
+      command:
+        - /bin/sh
+        - -c
+        - |
+          printf '%s\n' '{"status":"delivered"}'
+---
+apiVersion: orc.dev/v1alpha1
+kind: Artifact
+metadata:
+  name: release-goal
+spec:
+  mediaType: text/plain
+  content: Ship Orc with a reproducible release check.

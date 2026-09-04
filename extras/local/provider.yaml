@@ -7,4 +7,10 @@ command: orc-provider-local
 actions:
   provider.validate: Validate local execution support
   execution.run: Execute a command plan as a local process
+  execution.ensure: Ensure declarative execution state with a local command
+  execution.observe: Observe declarative execution state with a local command
+  execution.cancel: Cancel declarative execution state with a local command
+  execution.logs: Read declarative execution logs with a local command
+  session.observe: Observe declarative session state with a local command
+  event.deliver: Deliver a declarative event with a local command
 priority: 0
