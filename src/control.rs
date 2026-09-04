@@ -2169,6 +2169,7 @@ actions:
 
     const PROVIDER_MANIFEST: &str = r#"version: orc.provider/v1
 name: {{ name }}
+kind: persistence
 command: {{ command }}
 actions:
 {% for action in actions %}  {{ action.capability }}: {{ action.description }}

@@ -688,6 +688,10 @@ fn invoke_raw(
     tracker_directory: Option<&Path>,
 ) -> Result<Value> {
     let started = Instant::now();
+    let timeout = config.provider_timeout();
+    let deadline = started
+        .checked_add(timeout)
+        .context("provider timeout exceeds the platform clock range")?;
     let payload = serde_json::to_vec(request)?;
     let program = provider
         .command
@@ -746,8 +750,8 @@ fn invoke_raw(
     let input = thread::spawn(move || {
         let _ = input_sender.send(write_provider_input(stdin, &payload, &input_cancel_writer));
     });
-    let timeout = config.provider_timeout().saturating_sub(started.elapsed());
-    let status = match child.wait_timeout(timeout)? {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let status = match child.wait_timeout(remaining)? {
         Some(status) => status,
         None => {
             input_cancel.store(true, Ordering::Relaxed);
@@ -767,14 +771,16 @@ fn invoke_raw(
         }
     };
     finish_process_control(&mut tracker, &mut process_group, tracker_directory)?;
-    let remaining = config.provider_timeout().saturating_sub(started.elapsed());
+    let remaining = deadline.saturating_duration_since(Instant::now());
     let input_result = input_receiver.recv_timeout(remaining);
     if input_result.is_err() {
         input_cancel.store(true, Ordering::Relaxed);
         let _ = finish_process_control(&mut tracker, &mut process_group, tracker_directory);
     }
     let writer_panicked = input.join().is_err();
-    let input_failure = if writer_panicked {
+    let input_failure = if Instant::now() >= deadline {
+        Some("provider timed out while reading its request".to_owned())
+    } else if writer_panicked {
         Some("provider stdin writer panicked".to_owned())
     } else {
         match input_result {
@@ -798,16 +804,12 @@ fn invoke_raw(
         );
         bail!("{}: {message}", provider.name);
     }
-    let stdout = finish_drain_with_timeout(
-        stdout,
-        config.provider_timeout().saturating_sub(started.elapsed()),
-    )
-    .with_context(|| format!("{} timed out draining stdout", provider.name))?;
-    let stderr = finish_drain_with_timeout(
-        stderr,
-        config.provider_timeout().saturating_sub(started.elapsed()),
-    )
-    .with_context(|| format!("{} timed out draining stderr", provider.name))?;
+    let stdout =
+        finish_drain_with_timeout(stdout, deadline.saturating_duration_since(Instant::now()))
+            .with_context(|| format!("{} timed out draining stdout", provider.name))?;
+    let stderr =
+        finish_drain_with_timeout(stderr, deadline.saturating_duration_since(Instant::now()))
+            .with_context(|| format!("{} timed out draining stderr", provider.name))?;
     if !status.success() {
         record_invocation(
             provider,
@@ -2892,7 +2894,7 @@ actions:
         let error =
             run_plan_with_timeout(&plan, Path::new("."), std::time::Duration::from_millis(10))
                 .expect_err("sleep must exceed the timeout");
-        assert!(error.to_string().contains("timed out"));
+        assert!(error.to_string().contains("timed out"), "{error:#}");
     }
 
     #[test]
@@ -2918,7 +2920,7 @@ sleep 10
         let error = invoke_raw(&provider, &request, &config, None)
             .expect_err("provider that ignores input must time out");
 
-        assert!(error.to_string().contains("timed out"));
+        assert!(error.to_string().contains("timed out"), "{error:#}");
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
@@ -2947,7 +2949,7 @@ exit 0
         let error = invoke_raw(&provider, &request, &config, None)
             .expect_err("provider descendant that holds stdin must time out");
 
-        assert!(error.to_string().contains("timed out"));
+        assert!(error.to_string().contains("timed out"), "{error:#}");
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
