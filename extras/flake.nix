@@ -364,6 +364,8 @@
           harness-registry-requirement = harnessRegistry;
           wezterm-composed-environment = weztermEnvironment;
           zmx-lifecycle = zmxLifecycle;
+        }
+        // lib.optionalAttrs (providerPackages ? zmx && pkgs ? zmx) {
           zmx-process-tree = zmxProcessTree;
         }
         // validationChecks
