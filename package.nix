@@ -1,6 +1,7 @@
 {
   git,
   installShellFiles,
+  jq,
   lib,
   makeWrapper,
   procps,
@@ -17,6 +18,8 @@ rustPlatform.buildRustPackage {
       ./Cargo.lock
       ./Cargo.toml
       ./assets
+      ./extras/lib/provider.sh
+      ./extras/local/provider.sh
       ./src
       ./templates
       ./tests
@@ -37,6 +40,7 @@ rustPlatform.buildRustPackage {
 
   nativeCheckInputs = [
     git
+    jq
   ]
   ++ lib.optionals stdenv.hostPlatform.isDarwin [ unixtools.ps ]
   ++ lib.optionals stdenv.hostPlatform.isLinux [ procps ];
