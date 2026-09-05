@@ -15,7 +15,7 @@ use std::{
 
 #[cfg(unix)]
 use std::os::{
-    fd::{AsRawFd, FromRawFd},
+    fd::{AsRawFd, FromRawFd, RawFd},
     unix::net::UnixStream,
     unix::process::CommandExt,
 };
@@ -836,6 +836,19 @@ fn invoke_raw(
     config: &Config,
     tracker_directory: Option<&Path>,
 ) -> Result<Value> {
+    invoke_raw_after_spawn(provider, request, config, tracker_directory, |_| {})
+}
+
+fn invoke_raw_after_spawn<F>(
+    provider: &Manifest,
+    request: &Value,
+    config: &Config,
+    tracker_directory: Option<&Path>,
+    after_spawn: F,
+) -> Result<Value>
+where
+    F: FnOnce(&mut Child),
+{
     let started = Instant::now();
     let timeout = config.provider_timeout();
     let deadline = started
@@ -889,6 +902,7 @@ fn invoke_raw(
             return Err(error).with_context(|| format!("start provider {}", provider.name));
         }
     };
+    after_spawn(&mut child);
     drop(tracker_guard);
     let stdout = drain_bounded(child.stdout.take().context("provider stdout")?);
     let stderr = drain_bounded(child.stderr.take().context("provider stderr")?);
@@ -1077,19 +1091,7 @@ fn write_provider_input<W>(mut writer: W, payload: &[u8], deadline: Instant) -> 
 where
     W: AsRawFd + Write,
 {
-    unsafe extern "C" {
-        fn fcntl(fd: i32, command: i32, argument: i32) -> i32;
-    }
-    const GET_FLAGS: i32 = 3;
-    const SET_FLAGS: i32 = 4;
-    #[cfg(target_os = "linux")]
-    const NONBLOCK: i32 = 0x0800;
-    #[cfg(not(target_os = "linux"))]
-    const NONBLOCK: i32 = 0x0004;
-    let flags = unsafe { fcntl(writer.as_raw_fd(), GET_FLAGS, 0) };
-    if flags < 0 || unsafe { fcntl(writer.as_raw_fd(), SET_FLAGS, flags | NONBLOCK) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    enable_nonblocking(writer.as_raw_fd())?;
     let mut written = 0;
     while written < payload.len() {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1099,7 +1101,14 @@ where
                 "provider request delivery timed out",
             ));
         }
-        match writer.write(&payload[written..]) {
+        let attempt = writer.write(&payload[written..]);
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "provider request delivery timed out",
+            ));
+        }
+        match attempt {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(count) => written += count,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1107,6 +1116,27 @@ where
             }
             Err(error) => return Err(error),
         }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn enable_nonblocking(fd: RawFd) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let applied = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if applied < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if applied & libc::O_NONBLOCK == 0 {
+        return Err(io::Error::other(
+            "provider request pipe did not enable nonblocking I/O",
+        ));
     }
     Ok(())
 }
@@ -2329,14 +2359,8 @@ impl Drop for ProcessGroup {
 
 #[cfg(unix)]
 fn clear_close_on_exec(fd: i32) -> io::Result<()> {
-    unsafe extern "C" {
-        fn fcntl(fd: i32, command: i32, argument: i32) -> i32;
-    }
-    const GET_DESCRIPTOR_FLAGS: i32 = 1;
-    const SET_DESCRIPTOR_FLAGS: i32 = 2;
-    const CLOSE_ON_EXEC: i32 = 1;
-    let flags = unsafe { fcntl(fd, GET_DESCRIPTOR_FLAGS, 0) };
-    if flags < 0 || unsafe { fcntl(fd, SET_DESCRIPTOR_FLAGS, flags & !CLOSE_ON_EXEC) } < 0 {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -3351,27 +3375,107 @@ exit 0
     #[test]
     fn provider_preserves_request_error_before_deadline() {
         let directory = tempfile::tempdir().expect("provider directory");
-        let command = write_provider(
-            directory.path(),
-            "closed-input",
-            r#"#!/bin/sh
-exit 0
-"#,
-        );
-        let provider = provider_manifest("closed-input", &command, 0);
+        let marker = directory.path().join("stdin-closed");
+        let mut provider = provider_manifest("closed-input", Path::new("sh"), 0);
+        provider.command = ProviderCommand::Argv(vec![
+            "sh".into(),
+            "-c".into(),
+            "exec 0<&-\ntouch \"$1\"\nsleep 10".into(),
+            "closed-input".into(),
+            marker.display().to_string(),
+        ]);
         let mut config = Config::default();
         config.providers.timeout_ms = 2_000;
         let request = json!({
             "version": "orc.provider/v1",
             "scope": directory.path(),
-            "payload": "x".repeat(2 * 1024 * 1024),
+            "payload": "x",
         });
 
-        let error = invoke_raw(&provider, &request, &config, None)
-            .expect_err("provider that closes stdin must report delivery failure");
+        let error = invoke_raw_after_spawn(&provider, &request, &config, None, |_| {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !marker.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "provider did not report closing stdin"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+        })
+        .expect_err("provider that closes stdin must report delivery failure");
 
         assert!(error.to_string().contains("request failed"), "{error:#}");
         assert!(!error.to_string().contains("timed out"), "{error:#}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_write_errors_respect_the_observed_deadline_order() {
+        use std::os::fd::{AsRawFd, RawFd};
+        use std::os::unix::net::UnixStream;
+
+        struct DelayedBrokenPipe {
+            stream: UnixStream,
+            delay: Duration,
+        }
+
+        impl AsRawFd for DelayedBrokenPipe {
+            fn as_raw_fd(&self) -> RawFd {
+                self.stream.as_raw_fd()
+            }
+        }
+
+        impl Write for DelayedBrokenPipe {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                thread::sleep(self.delay);
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (_reader, stream) = UnixStream::pair().expect("pipe fixture");
+        let writer = DelayedBrokenPipe {
+            stream,
+            delay: Duration::ZERO,
+        };
+
+        let error =
+            write_provider_input(writer, b"request", Instant::now() + Duration::from_secs(1))
+                .expect_err("early delivery error must be preserved");
+
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+
+        let (_reader, stream) = UnixStream::pair().expect("pipe fixture");
+        let writer = DelayedBrokenPipe {
+            stream,
+            delay: Duration::from_millis(20),
+        };
+
+        let error = write_provider_input(
+            writer,
+            b"request",
+            Instant::now() + Duration::from_millis(5),
+        )
+        .expect_err("late delivery error must not outrank the timeout");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_request_pipe_is_made_nonblocking() {
+        use std::os::unix::net::UnixStream;
+
+        let (_reader, writer) = UnixStream::pair().expect("pipe fixture");
+
+        enable_nonblocking(writer.as_raw_fd()).expect("enable nonblocking I/O");
+
+        let flags = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0, "read descriptor flags");
+        assert_ne!(flags & libc::O_NONBLOCK, 0);
     }
 
     #[test]
