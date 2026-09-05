@@ -893,19 +893,13 @@ fn invoke_raw(
     let stdout = drain_bounded(child.stdout.take().context("provider stdout")?);
     let stderr = drain_bounded(child.stderr.take().context("provider stderr")?);
     let stdin = child.stdin.take().context("provider stdin")?;
-    let input_cancel = Arc::new(AtomicBool::new(false));
-    let input_cancel_writer = Arc::clone(&input_cancel);
-    let (input_sender, input_receiver) = mpsc::channel();
-    let input = thread::spawn(move || {
-        let _ = input_sender.send(write_provider_input(stdin, &payload, &input_cancel_writer));
-    });
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let input_result = input_receiver.recv_timeout(remaining);
-    if matches!(input_result, Err(RecvTimeoutError::Timeout)) {
-        input_cancel.store(true, Ordering::Relaxed);
+    let input_result = write_provider_input(stdin, &payload, deadline);
+    if input_result
+        .as_ref()
+        .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut)
+    {
         let cleanup = finish_process_control(&mut tracker, &mut process_group, tracker_directory);
         let wait = child.wait();
-        let writer_panicked = input.join().is_err();
         discard_drain(stdout);
         discard_drain(stderr);
         let cleanup_failure = cleanup
@@ -914,8 +908,7 @@ fn invoke_raw(
             .or_else(|| {
                 wait.err()
                     .map(|error| format!("process reap failed: {error:#}"))
-            })
-            .or_else(|| writer_panicked.then(|| "request writer panicked".to_owned()));
+            });
         let message = cleanup_failure.map_or_else(
             || "timed out while reading its request".to_owned(),
             |failure| format!("timed out while reading its request; {failure}"),
@@ -929,19 +922,10 @@ fn invoke_raw(
         );
         bail!("{} {message}", provider.name);
     }
-    let writer_panicked = input.join().is_err();
-    let input_failure = if writer_panicked {
-        Some("provider stdin writer panicked".to_owned())
-    } else {
-        match input_result {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(format!("provider request failed: {error}")),
-            Err(RecvTimeoutError::Disconnected) => Some("provider request writer stopped".into()),
-            Err(RecvTimeoutError::Timeout) => unreachable!("handled provider request timeout"),
-        }
-    };
+    let input_failure = input_result
+        .err()
+        .map(|error| format!("provider request failed: {error}"));
     if let Some(message) = input_failure {
-        input_cancel.store(true, Ordering::Relaxed);
         let cleanup = finish_process_control(&mut tracker, &mut process_group, tracker_directory);
         let _ = child.wait();
         discard_drain(stdout);
@@ -965,7 +949,6 @@ fn invoke_raw(
     let status = match child.wait_timeout(remaining)? {
         Some(status) => status,
         None => {
-            input_cancel.store(true, Ordering::Relaxed);
             finish_process_control(&mut tracker, &mut process_group, tracker_directory)?;
             let _ = child.wait();
             discard_drain(stdout);
@@ -1090,7 +1073,7 @@ fn validate_protocol_response(provider: &Manifest, request: &Value, value: Value
 }
 
 #[cfg(unix)]
-fn write_provider_input<W>(mut writer: W, payload: &[u8], cancel: &AtomicBool) -> io::Result<()>
+fn write_provider_input<W>(mut writer: W, payload: &[u8], deadline: Instant) -> io::Result<()>
 where
     W: AsRawFd + Write,
 {
@@ -1109,17 +1092,18 @@ where
     }
     let mut written = 0;
     while written < payload.len() {
-        if cancel.load(Ordering::Relaxed) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "provider request delivery cancelled",
+                io::ErrorKind::TimedOut,
+                "provider request delivery timed out",
             ));
         }
         match writer.write(&payload[written..]) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(count) => written += count,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(std::time::Duration::from_millis(5));
+                thread::sleep(remaining.min(Duration::from_millis(5)));
             }
             Err(error) => return Err(error),
         }
@@ -1128,11 +1112,26 @@ where
 }
 
 #[cfg(not(unix))]
-fn write_provider_input<W>(mut writer: W, payload: &[u8], _cancel: &AtomicBool) -> io::Result<()>
+fn write_provider_input<W>(mut writer: W, payload: &[u8], deadline: Instant) -> io::Result<()>
 where
-    W: Write,
+    W: Send + Write + 'static,
 {
-    writer.write_all(payload)
+    let payload = payload.to_vec();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = sender.send(writer.write_all(&payload));
+    });
+    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "provider request delivery timed out",
+        )),
+        Err(RecvTimeoutError::Disconnected) => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "provider request writer stopped",
+        )),
+    }
 }
 
 fn record_invocation(
