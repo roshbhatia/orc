@@ -38,6 +38,10 @@ rustPlatform.buildRustPackage {
     makeWrapper
   ];
 
+  postPatch = ''
+    patchShebangs extras
+  '';
+
   nativeCheckInputs = [
     git
     jq
