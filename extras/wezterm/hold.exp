@@ -3,6 +3,7 @@ set timeout 5
 
 set provider [lindex $argv 0]
 set scenario [lindex $argv 1]
+set duration [lindex $argv 2]
 
 if {$scenario eq "failure"} {
   set command "exit 19"
@@ -12,15 +13,36 @@ if {$scenario eq "failure"} {
   set command "exit 0"
   set message "Command exited before an interactive session was ready. Press Enter to close."
   set expected_status 0
+} elseif {$scenario eq "success-hold"} {
+  set command "sleep $duration; exit 0"
+  set message "Command exited before an interactive session was ready. Press Enter to close."
+  set expected_status 0
+} elseif {$scenario eq "success-close"} {
+  set command "sleep $duration; exit 0"
+  set message ""
+  set expected_status 0
+} elseif {$scenario eq "failure-hold"} {
+  set command "sleep $duration; exit 19"
+  set message "Command exited with 19. Press Enter to close."
+  set expected_status 19
 } else {
   error "unknown scenario: $scenario"
 }
 
 # Keep a controlling terminal while reproducing Zmx's closed standard input.
 spawn -noecho bash -c {exec </dev/null; exec bash "$1" hold bash -c "$2"} hold-test $provider $command
-expect -exact $message
-send "\r"
-expect eof
+if {$scenario eq "success-close"} {
+  expect {
+    -exact "Command exited before an interactive session was ready. Press Enter to close." {
+      error "long successful command unexpectedly held its pane"
+    }
+    eof {}
+  }
+} else {
+  expect -exact $message
+  send "\r"
+  expect eof
+}
 
 set result [wait]
 set status [lindex $result 3]

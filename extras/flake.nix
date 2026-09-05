@@ -280,6 +280,31 @@
                 bash ${./wezterm/test.sh}
                 touch "$out"
               '';
+          weztermZmxEarlyExit =
+            pkgs.runCommand "orc-wezterm-zmx-early-exit"
+              {
+                nativeBuildInputs = [
+                  pkgs.bash
+                  pkgs.coreutils
+                  pkgs.expect
+                  pkgs.zmx
+                  providerPackages.wezterm.adapter
+                ];
+              }
+              ''
+                export HOME="$TMPDIR/home"
+                for trial in 1 2 3 4 5 6; do
+                  zmx_dir="$TMPDIR/zmx-$trial"
+                  mkdir -p "$zmx_dir"
+                  expect ${./wezterm/zmx-hold.exp} \
+                    ${providerPackages.wezterm.adapter}/bin/orc-provider-wezterm \
+                    ${lib.getExe pkgs.zmx} \
+                    ${lib.getExe pkgs.bash} \
+                    "$zmx_dir" \
+                    "orc-stale-attach-$trial"
+                done
+                touch "$out"
+              '';
           zmxLifecycle =
             pkgs.runCommand "orc-zmx-lifecycle"
               {
@@ -348,6 +373,7 @@
           installed-provider-discovery = installedProviderDiscovery;
           harness-registry-requirement = harnessRegistry;
           wezterm-composed-environment = weztermEnvironment;
+          wezterm-zmx-early-exit = weztermZmxEarlyExit;
           zmx-lifecycle = zmxLifecycle;
           zmx-process-tree = zmxProcessTree;
         }

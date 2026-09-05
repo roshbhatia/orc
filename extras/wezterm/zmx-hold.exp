@@ -1,0 +1,25 @@
+#!/usr/bin/env expect
+set timeout 8
+
+set provider [lindex $argv 0]
+set zmx [lindex $argv 1]
+set bash [lindex $argv 2]
+set zmx_dir [lindex $argv 3]
+set session_name [lindex $argv 4]
+set message "Command exited before an interactive session was ready. Press Enter to close."
+
+spawn -noecho env ZMX_DIR=$zmx_dir ZMX_SESSION_PREFIX= $provider hold $zmx attach $session_name $bash -c {sleep 1.5; exit 0}
+expect -exact $message
+
+set sessions [exec env ZMX_DIR=$zmx_dir $zmx list 2>@1]
+if {[string first "name=$session_name" $sessions] >= 0} {
+  error "stale Zmx session still exists after its child exited"
+}
+
+send "\r"
+expect eof
+set result [wait]
+set status [lindex $result 3]
+if {$status != 0} {
+  error "expected exit status 0, got $status"
+}

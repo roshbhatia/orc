@@ -31,7 +31,7 @@ request() {
 for direction in right left top bottom; do
   plan="$test_scope/$direction.json"
   request "$direction" |
-    ORC_PROVIDER_LIB="$provider_library" WEZTERM_PANE=42 bash "$provider_script" >"$plan"
+    ORC_PROVIDER_LIB="$provider_library" WEZTERM_PANE=42 bash "$provider_script" > "$plan"
   jq -e \
     --arg direction "--$direction" \
     --arg provider "$provider_script" \
@@ -49,21 +49,21 @@ for direction in right left top bottom; do
       and $command[$separator + 3] == $provider
       and $command[$separator + 4] == "hold"
       and $command[$separator + 5:] == ["printenv", "ORC_COMPOSED_TEST"]
-    ' "$plan" >/dev/null
+    ' "$plan" > /dev/null
 done
 
 request right |
-  env -u WEZTERM_PANE ORC_PROVIDER_LIB="$provider_library" bash "$provider_script" >"$test_scope/outside.json"
+  env -u WEZTERM_PANE ORC_PROVIDER_LIB="$provider_library" bash "$provider_script" > "$test_scope/outside.json"
 jq -e '
   .command[1:4] == ["cli", "--no-auto-start", "spawn"]
   and (.command | index("split-pane")) == null
-' "$test_scope/outside.json" >/dev/null
+' "$test_scope/outside.json" > /dev/null
 
-printf '\n' | bash "$provider_script" hold true >"$test_scope/short-success.txt"
+printf '\n' | bash "$provider_script" hold true > "$test_scope/short-success.txt"
 grep -Fq 'Command exited before an interactive session was ready. Press Enter to close.' \
   "$test_scope/short-success.txt"
 
-bash "$provider_script" hold false </dev/null >"$test_scope/noninteractive-failure.txt" 2>&1 ||
+bash "$provider_script" hold false < /dev/null > "$test_scope/noninteractive-failure.txt" 2>&1 ||
   noninteractive_failure_code=$?
 test "${noninteractive_failure_code:-0}" -eq 1
 grep -Fq 'Command exited with 1. Press Enter to close.' \
@@ -75,7 +75,7 @@ pipe_release=$pipe_scope/release
 provider_done=$pipe_scope/done
 mkfifo "$open_pipe"
 (
-  exec 3>"$open_pipe"
+  exec 3> "$open_pipe"
   while [[ ! -e $pipe_release ]]; do
     sleep 0.05
   done
@@ -83,8 +83,8 @@ mkfifo "$open_pipe"
 pipe_writer=$!
 (
   set +e
-  bash "$provider_script" hold false <"$open_pipe" >"$pipe_scope/failure.txt" 2>&1
-  printf '%s\n' "$?" >"$pipe_scope/code"
+  bash "$provider_script" hold false < "$open_pipe" > "$pipe_scope/failure.txt" 2>&1
+  printf '%s\n' "$?" > "$pipe_scope/code"
   touch "$provider_done"
 ) &
 provider_process=$!
@@ -98,16 +98,22 @@ touch "$pipe_release"
 wait "$pipe_writer"
 wait "$provider_process"
 [[ $noninteractive_blocked == false ]]
-test "$(<"$pipe_scope/code")" -eq 1
+test "$(< "$pipe_scope/code")" -eq 1
 
 expect "$expect_script" "$provider_script" failure
 expect "$expect_script" "$provider_script" short-success
 
-bash "$provider_script" hold sleep 3 >"$test_scope/long-success.txt"
-test ! -s "$test_scope/long-success.txt"
+for duration in 1.1 1.5 1.9; do
+  for _ in 1 2 3; do
+    expect "$expect_script" "$provider_script" success-hold "$duration"
+  done
+done
+expect "$expect_script" "$provider_script" success-close 2.1
+expect "$expect_script" "$provider_script" failure-hold 0.1
+expect "$expect_script" "$provider_script" failure-hold 2.1
 
 set +e
-printf '\n' | bash "$provider_script" hold false >"$test_scope/failure.txt"
+printf '\n' | bash "$provider_script" hold false > "$test_scope/failure.txt"
 failure_code=$?
 set -e
 test "$failure_code" -eq 1
