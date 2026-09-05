@@ -53,21 +53,30 @@ class StopTreeTest(unittest.TestCase):
     def record(self) -> str:
         return f"name=resume-test\tpid={self.child.pid}\tcreated={self.created}\n"
 
-    def test_creation_second_boundary_is_valid(self) -> None:
+    def assert_creation_time_is_valid(self, process_created: float) -> None:
         process = mock.Mock()
-        process.create_time.return_value = 101.25
+        process.create_time.return_value = process_created
         process.environ.return_value = {"ZMX_SESSION": "resume-test"}
         with mock.patch.object(PROCESS_TREE.psutil, "Process", return_value=process):
             identity = PROCESS_TREE.inspect_identity("resume-test", 42, "100")
-        self.assertEqual(101.25, identity)
+        self.assertEqual(process_created, identity)
 
-    def test_creation_outside_boundary_is_rejected(self) -> None:
+    def assert_creation_time_is_rejected(self, process_created: float) -> None:
         process = mock.Mock()
-        process.create_time.return_value = 102.0
+        process.create_time.return_value = process_created
         process.environ.return_value = {"ZMX_SESSION": "resume-test"}
         with mock.patch.object(PROCESS_TREE.psutil, "Process", return_value=process):
             with self.assertRaisesRegex(PROCESS_TREE.StopError, "ambiguous"):
                 PROCESS_TREE.inspect_identity("resume-test", 42, "100")
+
+    def test_creation_adjacent_seconds_are_valid(self) -> None:
+        self.assert_creation_time_is_valid(99.75)
+        self.assert_creation_time_is_valid(100.25)
+        self.assert_creation_time_is_valid(101.25)
+
+    def test_creation_outside_adjacent_seconds_is_rejected(self) -> None:
+        self.assert_creation_time_is_rejected(98.999)
+        self.assert_creation_time_is_rejected(102.0)
 
     def test_precise_identity_mismatch_signals_nothing(self) -> None:
         with mock.patch.object(PROCESS_TREE, "zmx_records", return_value=self.record()):

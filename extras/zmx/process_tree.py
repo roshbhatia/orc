@@ -179,9 +179,19 @@ def inspect_identity(name: str, pid: int, created: str) -> float:
         raise StopError(f"Zmx leader {pid} is missing while its record is active") from error
     except (psutil.AccessDenied, psutil.Error) as error:
         raise StopError(f"cannot establish identity for Zmx leader {pid}: {error}") from error
-    # Zmx timestamps precede the PTY fork, so crossing a wall-clock second is valid.
-    if int(process_created) not in {expected_created, expected_created + 1}:
-        raise StopError(f"Zmx leader {pid} has an ambiguous creation identity")
+    # Zmx records integer wall time before forking the PTY leader. Linux derives
+    # process birth time from an integer boot time and scheduler ticks. These two
+    # truncations can place the valid leader in the preceding or following second.
+    process_second = int(process_created)
+    if process_second not in {
+        expected_created - 1,
+        expected_created,
+        expected_created + 1,
+    }:
+        raise StopError(
+            f"Zmx leader {pid} has an ambiguous creation identity "
+            f"(recorded {expected_created}, process {process_created:.9f})"
+        )
     if session_name != name:
         raise StopError(f"Zmx leader {pid} does not advertise session {name}")
     return process_created
