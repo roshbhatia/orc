@@ -1636,8 +1636,10 @@ fn reconcile_with(
                     Err(error) => {
                         let message = format!("{error:#}");
                         let resource = store.resource_mut(&key).context("resource disappeared")?;
-                        resource.status.phase = "Failed".into();
-                        resource.status.observed_generation = resource.metadata.generation;
+                        if capability != Capability::ExecutionCancel {
+                            resource.status.phase = "Failed".into();
+                            resource.status.observed_generation = resource.metadata.generation;
+                        }
                         resource.status.message = Some(message.clone());
                         store.emit("Warning", "ReconcileFailed", key.clone(), message.clone());
                         actions.push(ProviderAction {
