@@ -81,7 +81,7 @@
       "type": "object"
     },
     "EventBindingSpec": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "properties": {
         "actions": {
           "additionalProperties": {
@@ -140,7 +140,7 @@
       "type": "object"
     },
     "ExecutionSpec": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "properties": {
         "actions": {
           "additionalProperties": {
@@ -278,6 +278,12 @@
                   "executionRef"
                 ],
                 "type": "object"
+              },
+              {
+                "required": [
+                  "output"
+                ],
+                "type": "object"
               }
             ]
           },
@@ -313,6 +319,7 @@
           "type": "object"
         },
         "name": {
+          "pattern": "^[A-Za-z0-9.-]+$",
           "type": "string"
         },
         "resourceVersion": {
@@ -400,7 +407,7 @@
       "type": "object"
     },
     "RunSpec": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "properties": {
         "desiredState": {
           "enum": [
@@ -423,7 +430,7 @@
       "type": "object"
     },
     "SessionSpec": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "properties": {
         "actions": {
           "additionalProperties": {
@@ -476,7 +483,7 @@
       "type": "object"
     },
     "WorkflowSpec": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "properties": {
         "expectedOutput": {
           "minLength": 1,
@@ -507,7 +514,7 @@
       "type": "object"
     },
     "WorkflowStage": {
-      "additionalProperties": true,
+      "additionalProperties": false,
       "properties": {
         "actions": {
           "additionalProperties": {

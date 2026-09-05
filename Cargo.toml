@@ -33,6 +33,7 @@ which = "8"
 
 [dev-dependencies]
 insta = "1"
+jsonschema = { version = "0.53", default-features = false }
 
 [profile.release]
 lto = "thin"

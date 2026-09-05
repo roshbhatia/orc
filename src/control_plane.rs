@@ -78,6 +78,7 @@ impl FromStr for ResourceKind {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectMeta {
+    #[schemars(regex(pattern = r"^[A-Za-z0-9.-]+$"))]
     pub name: String,
     #[serde(default)]
     pub uid: String,
@@ -491,6 +492,7 @@ fn input_value_schema() -> Value {
                     "anyOf": [
                         {"type": "object", "required": ["artifactRef"]},
                         {"type": "object", "required": ["executionRef"]},
+                        {"type": "object", "required": ["output"]},
                     ],
                 },
             },
@@ -552,7 +554,7 @@ fn workflow_stage_schema() -> Value {
     properties.insert("name".into(), nonempty_string_schema());
     json!({
         "type": "object",
-        "additionalProperties": true,
+        "additionalProperties": false,
         "required": ["name"],
         "properties": properties,
     })
@@ -561,7 +563,7 @@ fn workflow_stage_schema() -> Value {
 fn workflow_spec_schema() -> Value {
     json!({
         "type": "object",
-        "additionalProperties": true,
+        "additionalProperties": false,
         "required": ["stages"],
         "properties": {
             "goal": nonempty_string_schema(),
@@ -578,7 +580,7 @@ fn workflow_spec_schema() -> Value {
 fn run_spec_schema() -> Value {
     json!({
         "type": "object",
-        "additionalProperties": true,
+        "additionalProperties": false,
         "required": ["workflowRef"],
         "properties": {
             "workflowRef": nonempty_string_schema(),
@@ -600,7 +602,7 @@ fn session_spec_schema() -> Value {
     ]);
     json!({
         "type": "object",
-        "additionalProperties": true,
+        "additionalProperties": false,
         "properties": properties,
     })
 }
@@ -608,7 +610,7 @@ fn session_spec_schema() -> Value {
 fn execution_spec_schema() -> Value {
     json!({
         "type": "object",
-        "additionalProperties": true,
+        "additionalProperties": false,
         "properties": execution_properties(),
     })
 }
@@ -639,7 +641,7 @@ fn event_binding_spec_schema() -> Value {
     ]);
     json!({
         "type": "object",
-        "additionalProperties": true,
+        "additionalProperties": false,
         "properties": properties,
     })
 }
@@ -2535,6 +2537,66 @@ mod tests {
         assert!(schema["$defs"]["ExecutionSpec"]["properties"]["actions"].is_object());
         assert!(schema["$defs"]["EventBindingSpec"]["properties"]["reasons"].is_object());
         assert!(schema["$defs"]["ArtifactSpec"]["properties"]["digest"].is_object());
+    }
+
+    #[test]
+    fn generated_schema_rejects_spec_typos_invalid_inputs_and_names() {
+        let schema = schema();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let resource = |kind: &str, name: &str, spec: Value| {
+            json!({
+                "apiVersion": API_VERSION,
+                "kind": kind,
+                "metadata": {"name": name},
+                "spec": spec,
+            })
+        };
+        let valid = [
+            resource("Workflow", "release", json!({"stages": []})),
+            resource("Run", "release-1", json!({"workflowRef": "release"})),
+            resource("Session", "orchestrator", json!({})),
+            resource("Execution", "build", json!({})),
+            resource("EventBinding", "notify", json!({})),
+            resource("Artifact", "goal", json!({"content": "ship"})),
+        ];
+        for instance in valid {
+            assert!(
+                validator.is_valid(&instance),
+                "invalid resource: {instance}"
+            );
+        }
+
+        let typos = [
+            resource("Workflow", "release", json!({"stages": [], "stagez": []})),
+            resource(
+                "Workflow",
+                "release",
+                json!({"stages": [{"name": "build", "dependzOn": []}]}),
+            ),
+            resource(
+                "Run",
+                "release-1",
+                json!({"workflowRef": "release", "parameterz": {}}),
+            ),
+            resource("Session", "orchestrator", json!({"harnes": "codex"})),
+            resource("Execution", "build", json!({"dependzOn": []})),
+            resource("EventBinding", "notify", json!({"reasonz": []})),
+            resource("Artifact", "goal", json!({"content": "ship", "typo": true})),
+        ];
+        for instance in typos {
+            assert!(!validator.is_valid(&instance), "accepted typo: {instance}");
+        }
+
+        let output_only = resource(
+            "Execution",
+            "consume",
+            json!({"inputs": {"result": {"output": "result"}}}),
+        );
+        assert!(!validator.is_valid(&output_only));
+        for name in ["", "bad_name", "bad/name"] {
+            assert!(!validator.is_valid(&resource("Execution", name, json!({}))));
+        }
+        assert!(validator.is_valid(&resource("Execution", "Build.v2-1", json!({}))));
     }
 
     #[test]
