@@ -3782,7 +3782,12 @@ fn wait_for_execution_identity_release(path: &Path, timeout: Duration) -> Result
 
 #[cfg(unix)]
 fn process_target_is_live(target: i32) -> bool {
-    signal_target(target, 0).is_ok()
+    match signal_target(target, 0) {
+        Ok(()) => true,
+        Err(error) => !error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.raw_os_error() == Some(libc::ESRCH)),
+    }
 }
 
 #[cfg(not(unix))]
@@ -5838,14 +5843,23 @@ steps:
         let tracker_directory = directory.path().join("trackers");
         let worker_directory = tracker_directory.clone();
         let ready = directory.path().join("ready");
+        let descendant = directory.path().join("descendant");
         let plan = CommandPlan {
             version: "orc.provider/v1".into(),
             command: vec![
                 "sh".into(),
                 "-c".into(),
-                "trap '' TERM; : > \"$1\"; while :; do sleep 3600; done".into(),
+                concat!(
+                    "trap '' TERM; ",
+                    "sh -c 'trap \"\" TERM; while :; do sleep 3600; done' & ",
+                    "printf '%s\\n' \"$!\" > \"$2\"; ",
+                    ": > \"$1\"; ",
+                    "while :; do sleep 3600; done"
+                )
+                .into(),
                 "orc-cancellation-fixture".into(),
                 ready.display().to_string(),
+                descendant.display().to_string(),
             ],
             cwd: None,
             environment: BTreeMap::new(),
@@ -5877,10 +5891,23 @@ steps:
         let started = Instant::now();
         terminate_tracked_processes(&tracker_directory).expect("terminate tracked process");
         let result = worker.join().expect("tracked command thread");
+        let descendant = fs::read_to_string(descendant)
+            .expect("read descendant process")
+            .trim()
+            .parse::<u32>()
+            .expect("descendant process id");
+        let leak_deadline = Instant::now() + Duration::from_secs(2);
+        while process_is_live(descendant) && Instant::now() < leak_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
 
         assert!(
             result.is_ok(),
             "tracked runner must reconcile after cancellation: {result:?}"
+        );
+        assert!(
+            !process_is_live(descendant),
+            "tracked command descendant {descendant} survived cancellation"
         );
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(

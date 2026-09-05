@@ -2477,12 +2477,10 @@ fn terminate_process_group(child: &mut Child) -> Result<()> {
         const SIGKILL: i32 = 9;
         if unsafe { kill(-(child.id() as i32), SIGKILL) } != 0 {
             let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
+            if child.wait_timeout(Duration::from_secs(1))?.is_some() {
                 return Ok(());
             }
-            if child.try_wait()?.is_none() {
-                return Err(error).context("terminate command process group");
-            }
+            return Err(error).context("terminate command process group");
         }
         Ok(())
     }
