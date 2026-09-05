@@ -33,9 +33,9 @@ Install the provider-neutral release with Homebrew:
 brew install roshbhatia/tap/orc
 ```
 
-Each GitHub release also contains provider-neutral archives for x86_64 and
-aarch64 Linux and macOS. Verify the adjacent `.sha256` file, unpack
-the archive, and add its `bin` directory to `PATH`. Copy the directories under
+Each GitHub release also contains provider-neutral archives for x86_64 Linux,
+aarch64 Linux, and Apple Silicon macOS. Verify the adjacent `.sha256` file,
+unpack the archive, and add its `bin` directory to `PATH`. Copy the directories under
 `share` into the matching system or user data directories for completions and
 schemas. The standalone archive requires Git on `PATH` for the versioned
 workflow catalog. Install optional providers separately; each provider owns its
