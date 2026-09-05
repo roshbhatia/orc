@@ -20,6 +20,10 @@ case ${1:-} in
   kill)
     printf '%s\n' "${2:?}" > "${ZMX_TEST_KILL_LOG:?}"
     ;;
+  attach)
+    printf '%s\n' "${ZMX_SESSION_PREFIX-unset}" > "${ZMX_TEST_PREFIX_LOG:?}"
+    printf '%s\n' "${@:2}" > "${ZMX_TEST_ATTACH_LOG:?}"
+    ;;
   *) exit 2 ;;
 esac
 SCRIPT
@@ -52,11 +56,34 @@ launch_request=$(jq -n \
     }
   }')
 PATH="$fake_bin:$PATH" ORC_PROVIDER_LIB="$provider_library" \
+  ZMX_SESSION_PREFIX=seshy- \
   bash "$provider_script" <<< "$launch_request" > "$test_scope/launch-plan.json"
 jq -e --arg zmx "$fake_bin/zmx" '
-  .command == [$zmx, "attach", "session-1", "harness", "--flag"]
+  .command == ["env", "ZMX_SESSION_PREFIX=", $zmx, "attach", "session-1", "harness", "--flag"]
   and .environment == {BASE: "value"}
 ' "$test_scope/launch-plan.json" > /dev/null
+
+prefix_log=$test_scope/prefix
+attach_log=$test_scope/attached
+mapfile -t launch_command < <(jq -r '.command[]' "$test_scope/launch-plan.json")
+PATH="$fake_bin:$PATH" \
+  ZMX_SESSION_PREFIX=seshy- \
+  ZMX_TEST_PREFIX_LOG="$prefix_log" \
+  ZMX_TEST_ATTACH_LOG="$attach_log" \
+  "${launch_command[@]}"
+test -z "$(< "$prefix_log")"
+printf '%s\n' session-1 harness --flag | diff -u - "$attach_log"
+
+attach_request=$(jq '
+  .action = "attach"
+  | .session.providers[0].ref = "explicit-ref@123@456"
+' <<< "$launch_request")
+PATH="$fake_bin:$PATH" ORC_PROVIDER_LIB="$provider_library" \
+  ZMX_SESSION_PREFIX=seshy- \
+  bash "$provider_script" <<< "$attach_request" > "$test_scope/attach-plan.json"
+jq -e --arg zmx "$fake_bin/zmx" '
+  .command == ["env", "ZMX_SESSION_PREFIX=", $zmx, "attach", "explicit-ref"]
+' "$test_scope/attach-plan.json" > /dev/null
 
 request=$(jq -n \
   --arg scope "$test_scope" \

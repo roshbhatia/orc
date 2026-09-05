@@ -157,7 +157,7 @@ case "$capability" in
       managed_id=$(jq -r '.session.id' <<< "$request")
       managed_id=${managed_id//[^[:alnum:]_.-]/-}
       prior_environment=$(jq -ce '.plan.environment // {}' <<< "$request")
-      emit_plan "$scope" "$prior_environment" "$executable" attach "$managed_id" "${plan_command[@]}"
+      emit_plan "$scope" "$prior_environment" env ZMX_SESSION_PREFIX= "$executable" attach "$managed_id" "${plan_command[@]}"
     fi
     ;;
   session.stop)
