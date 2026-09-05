@@ -1,5 +1,32 @@
 {
   "$defs": {
+    "ActionSpec": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "cwd": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "environment": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "type": "object"
+    },
     "ArtifactReference": {
       "properties": {
         "digest": {
@@ -20,6 +47,243 @@
         "mediaType"
       ],
       "type": "object"
+    },
+    "ArtifactSpec": {
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "required": [
+            "content"
+          ]
+        },
+        {
+          "required": [
+            "digest",
+            "size"
+          ]
+        }
+      ],
+      "properties": {
+        "content": {},
+        "digest": {
+          "pattern": "^sha256:[0-9a-fA-F]{64}$",
+          "type": "string"
+        },
+        "mediaType": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "size": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "EventBindingSpec": {
+      "additionalProperties": true,
+      "properties": {
+        "actions": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ActionSpec"
+          },
+          "propertyNames": {
+            "minLength": 1
+          },
+          "type": "object"
+        },
+        "eventTypes": {
+          "items": {
+            "enum": [
+              "Normal",
+              "Warning"
+            ],
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "inputs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/InputValue"
+          },
+          "type": "object"
+        },
+        "provider": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reasons": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "subjectKinds": {
+          "items": {
+            "enum": [
+              "Workflow",
+              "Run",
+              "Session",
+              "Execution",
+              "EventBinding",
+              "Artifact"
+            ],
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "type": "object"
+    },
+    "ExecutionSpec": {
+      "additionalProperties": true,
+      "properties": {
+        "actions": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ActionSpec"
+          },
+          "propertyNames": {
+            "minLength": 1
+          },
+          "type": "object"
+        },
+        "command": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "cwd": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "dependsOn": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "desiredState": {
+          "enum": [
+            "running",
+            "cancelled"
+          ],
+          "type": "string"
+        },
+        "environment": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "expectedOutput": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "goal": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "harness": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "inputs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/InputValue"
+          },
+          "type": "object"
+        },
+        "model": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "provider": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "role": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "runRef": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "successCriteria": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "type": "object"
+    },
+    "InputValue": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "artifactRef": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "artifactRef"
+          ],
+          "title": "Artifact input",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "executionRef": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "output": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "executionRef",
+            "output"
+          ],
+          "title": "Execution output input",
+          "type": "object"
+        },
+        {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "artifactRef"
+                ],
+                "type": "object"
+              },
+              {
+                "required": [
+                  "executionRef"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "title": "Literal input"
+        }
+      ]
     },
     "ObjectMeta": {
       "properties": {
@@ -134,43 +398,395 @@
         }
       },
       "type": "object"
+    },
+    "RunSpec": {
+      "additionalProperties": true,
+      "properties": {
+        "desiredState": {
+          "enum": [
+            "running",
+            "cancelled"
+          ],
+          "type": "string"
+        },
+        "parameters": {
+          "type": "object"
+        },
+        "workflowRef": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "workflowRef"
+      ],
+      "type": "object"
+    },
+    "SessionSpec": {
+      "additionalProperties": true,
+      "properties": {
+        "actions": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ActionSpec"
+          },
+          "propertyNames": {
+            "minLength": 1
+          },
+          "type": "object"
+        },
+        "expectedOutput": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "goal": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "harness": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "inputs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/InputValue"
+          },
+          "type": "object"
+        },
+        "model": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "provider": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "role": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "successCriteria": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "type": "object"
+    },
+    "WorkflowSpec": {
+      "additionalProperties": true,
+      "properties": {
+        "expectedOutput": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "goal": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "stages": {
+          "items": {
+            "$ref": "#/$defs/WorkflowStage"
+          },
+          "type": "array"
+        },
+        "successCriteria": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "stages"
+      ],
+      "type": "object"
+    },
+    "WorkflowStage": {
+      "additionalProperties": true,
+      "properties": {
+        "actions": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ActionSpec"
+          },
+          "propertyNames": {
+            "minLength": 1
+          },
+          "type": "object"
+        },
+        "command": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "cwd": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "dependsOn": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "desiredState": {
+          "enum": [
+            "running",
+            "cancelled"
+          ],
+          "type": "string"
+        },
+        "environment": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "expectedOutput": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "goal": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "harness": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "inputs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/InputValue"
+          },
+          "type": "object"
+        },
+        "model": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "provider": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "role": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "runRef": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "successCriteria": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "properties": {
-    "apiVersion": {
-      "const": "orc.dev/v1alpha1",
-      "type": "string"
-    },
-    "kind": {
-      "$ref": "#/$defs/ResourceKind"
-    },
-    "metadata": {
-      "$ref": "#/$defs/ObjectMeta"
-    },
-    "spec": {
-      "additionalProperties": true,
+  "description": "One Orc desired-state resource. YAML streams may contain multiple documents.",
+  "oneOf": [
+    {
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "orc.dev/v1alpha1",
+          "type": "string"
+        },
+        "kind": {
+          "const": "Workflow",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/ObjectMeta"
+        },
+        "spec": {
+          "$ref": "#/$defs/WorkflowSpec"
+        },
+        "status": {
+          "$ref": "#/$defs/ResourceStatus"
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata",
+        "spec"
+      ],
+      "title": "Workflow resource",
       "type": "object"
     },
-    "status": {
-      "$ref": "#/$defs/ResourceStatus",
-      "default": {
-        "deliveredEvents": [],
-        "externalRef": null,
-        "message": null,
-        "observedGeneration": 0,
-        "outputs": {},
-        "phase": "",
-        "provider": null
-      }
+    {
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "orc.dev/v1alpha1",
+          "type": "string"
+        },
+        "kind": {
+          "const": "Run",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/ObjectMeta"
+        },
+        "spec": {
+          "$ref": "#/$defs/RunSpec"
+        },
+        "status": {
+          "$ref": "#/$defs/ResourceStatus"
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata",
+        "spec"
+      ],
+      "title": "Run resource",
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "orc.dev/v1alpha1",
+          "type": "string"
+        },
+        "kind": {
+          "const": "Session",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/ObjectMeta"
+        },
+        "spec": {
+          "$ref": "#/$defs/SessionSpec"
+        },
+        "status": {
+          "$ref": "#/$defs/ResourceStatus"
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata",
+        "spec"
+      ],
+      "title": "Session resource",
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "orc.dev/v1alpha1",
+          "type": "string"
+        },
+        "kind": {
+          "const": "Execution",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/ObjectMeta"
+        },
+        "spec": {
+          "$ref": "#/$defs/ExecutionSpec"
+        },
+        "status": {
+          "$ref": "#/$defs/ResourceStatus"
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata",
+        "spec"
+      ],
+      "title": "Execution resource",
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "orc.dev/v1alpha1",
+          "type": "string"
+        },
+        "kind": {
+          "const": "EventBinding",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/ObjectMeta"
+        },
+        "spec": {
+          "$ref": "#/$defs/EventBindingSpec"
+        },
+        "status": {
+          "$ref": "#/$defs/ResourceStatus"
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata",
+        "spec"
+      ],
+      "title": "EventBinding resource",
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "apiVersion": {
+          "const": "orc.dev/v1alpha1",
+          "type": "string"
+        },
+        "kind": {
+          "const": "Artifact",
+          "type": "string"
+        },
+        "metadata": {
+          "$ref": "#/$defs/ObjectMeta"
+        },
+        "spec": {
+          "$ref": "#/$defs/ArtifactSpec"
+        },
+        "status": {
+          "$ref": "#/$defs/ResourceStatus"
+        }
+      },
+      "required": [
+        "apiVersion",
+        "kind",
+        "metadata",
+        "spec"
+      ],
+      "title": "Artifact resource",
+      "type": "object"
     }
-  },
-  "required": [
-    "apiVersion",
-    "kind",
-    "metadata",
-    "spec"
   ],
-  "title": "Resource",
-  "type": "object"
+  "title": "Orc resource"
 }

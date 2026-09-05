@@ -376,10 +376,292 @@ fn update_store<T>(
 }
 
 pub fn schema() -> Value {
-    let mut schema =
+    let generated =
         serde_json::to_value(schema_for!(Resource)).expect("resource schema serializes");
-    schema["properties"]["apiVersion"] = json!({"const": API_VERSION, "type": "string"});
-    schema
+    let mut definitions = generated["$defs"]
+        .as_object()
+        .cloned()
+        .expect("resource definitions are an object");
+    definitions.extend([
+        ("ActionSpec".into(), action_spec_schema()),
+        ("InputValue".into(), input_value_schema()),
+        ("WorkflowStage".into(), workflow_stage_schema()),
+        ("WorkflowSpec".into(), workflow_spec_schema()),
+        ("RunSpec".into(), run_spec_schema()),
+        ("SessionSpec".into(), session_spec_schema()),
+        ("ExecutionSpec".into(), execution_spec_schema()),
+        ("EventBindingSpec".into(), event_binding_spec_schema()),
+        ("ArtifactSpec".into(), artifact_spec_schema()),
+    ]);
+    let variants = [
+        ("Workflow", "WorkflowSpec"),
+        ("Run", "RunSpec"),
+        ("Session", "SessionSpec"),
+        ("Execution", "ExecutionSpec"),
+        ("EventBinding", "EventBindingSpec"),
+        ("Artifact", "ArtifactSpec"),
+    ]
+    .into_iter()
+    .map(|(kind, spec)| resource_variant_schema(kind, spec))
+    .collect::<Vec<_>>();
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "Orc resource",
+        "description": "One Orc desired-state resource. YAML streams may contain multiple documents.",
+        "oneOf": variants,
+        "$defs": definitions,
+    })
+}
+
+fn resource_variant_schema(kind: &str, spec: &str) -> Value {
+    json!({
+        "title": format!("{kind} resource"),
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["apiVersion", "kind", "metadata", "spec"],
+        "properties": {
+            "apiVersion": {"const": API_VERSION, "type": "string"},
+            "kind": {"const": kind, "type": "string"},
+            "metadata": {"$ref": "#/$defs/ObjectMeta"},
+            "spec": {"$ref": format!("#/$defs/{spec}")},
+            "status": {"$ref": "#/$defs/ResourceStatus"},
+        },
+    })
+}
+
+fn nonempty_string_schema() -> Value {
+    json!({"type": "string", "minLength": 1})
+}
+
+fn string_array_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": nonempty_string_schema(),
+        "uniqueItems": true,
+    })
+}
+
+fn command_schema() -> Value {
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "items": nonempty_string_schema(),
+    })
+}
+
+fn action_spec_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command"],
+        "properties": {
+            "command": command_schema(),
+            "cwd": nonempty_string_schema(),
+            "environment": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+            },
+        },
+    })
+}
+
+fn input_value_schema() -> Value {
+    json!({
+        "anyOf": [
+            {
+                "title": "Artifact input",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["artifactRef"],
+                "properties": {"artifactRef": nonempty_string_schema()},
+            },
+            {
+                "title": "Execution output input",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["executionRef", "output"],
+                "properties": {
+                    "executionRef": nonempty_string_schema(),
+                    "output": nonempty_string_schema(),
+                },
+            },
+            {
+                "title": "Literal input",
+                "not": {
+                    "anyOf": [
+                        {"type": "object", "required": ["artifactRef"]},
+                        {"type": "object", "required": ["executionRef"]},
+                    ],
+                },
+            },
+        ],
+    })
+}
+
+fn provider_properties() -> serde_json::Map<String, Value> {
+    serde_json::Map::from_iter([
+        ("provider".into(), nonempty_string_schema()),
+        (
+            "inputs".into(),
+            json!({
+                "type": "object",
+                "additionalProperties": {"$ref": "#/$defs/InputValue"},
+            }),
+        ),
+        (
+            "actions".into(),
+            json!({
+                "type": "object",
+                "propertyNames": {"minLength": 1},
+                "additionalProperties": {"$ref": "#/$defs/ActionSpec"},
+            }),
+        ),
+    ])
+}
+
+fn execution_properties() -> serde_json::Map<String, Value> {
+    let mut properties = provider_properties();
+    properties.extend([
+        ("command".into(), command_schema()),
+        ("cwd".into(), nonempty_string_schema()),
+        (
+            "environment".into(),
+            json!({
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+            }),
+        ),
+        ("dependsOn".into(), string_array_schema()),
+        (
+            "desiredState".into(),
+            json!({"type": "string", "enum": ["running", "cancelled"]}),
+        ),
+        ("runRef".into(), nonempty_string_schema()),
+        ("harness".into(), nonempty_string_schema()),
+        ("model".into(), nonempty_string_schema()),
+        ("role".into(), nonempty_string_schema()),
+        ("goal".into(), nonempty_string_schema()),
+        ("expectedOutput".into(), nonempty_string_schema()),
+        ("successCriteria".into(), string_array_schema()),
+    ]);
+    properties
+}
+
+fn workflow_stage_schema() -> Value {
+    let mut properties = execution_properties();
+    properties.insert("name".into(), nonempty_string_schema());
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["name"],
+        "properties": properties,
+    })
+}
+
+fn workflow_spec_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["stages"],
+        "properties": {
+            "goal": nonempty_string_schema(),
+            "expectedOutput": nonempty_string_schema(),
+            "successCriteria": string_array_schema(),
+            "stages": {
+                "type": "array",
+                "items": {"$ref": "#/$defs/WorkflowStage"},
+            },
+        },
+    })
+}
+
+fn run_spec_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["workflowRef"],
+        "properties": {
+            "workflowRef": nonempty_string_schema(),
+            "parameters": {"type": "object"},
+            "desiredState": {"type": "string", "enum": ["running", "cancelled"]},
+        },
+    })
+}
+
+fn session_spec_schema() -> Value {
+    let mut properties = provider_properties();
+    properties.extend([
+        ("harness".into(), nonempty_string_schema()),
+        ("role".into(), nonempty_string_schema()),
+        ("model".into(), nonempty_string_schema()),
+        ("goal".into(), nonempty_string_schema()),
+        ("expectedOutput".into(), nonempty_string_schema()),
+        ("successCriteria".into(), string_array_schema()),
+    ]);
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "properties": properties,
+    })
+}
+
+fn execution_spec_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "properties": execution_properties(),
+    })
+}
+
+fn event_binding_spec_schema() -> Value {
+    let mut properties = provider_properties();
+    properties.extend([
+        (
+            "eventTypes".into(),
+            json!({
+                "type": "array",
+                "items": {"type": "string", "enum": ["Normal", "Warning"]},
+                "uniqueItems": true,
+            }),
+        ),
+        ("reasons".into(), string_array_schema()),
+        (
+            "subjectKinds".into(),
+            json!({
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["Workflow", "Run", "Session", "Execution", "EventBinding", "Artifact"],
+                },
+                "uniqueItems": true,
+            }),
+        ),
+    ]);
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "properties": properties,
+    })
+}
+
+fn artifact_spec_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "content": {},
+            "digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-fA-F]{64}$",
+            },
+            "size": {"type": "integer", "minimum": 0},
+            "mediaType": nonempty_string_schema(),
+        },
+        "anyOf": [
+            {"required": ["content"]},
+            {"required": ["digest", "size"]},
+        ],
+    })
 }
 
 pub fn load_documents(path: &Path) -> Result<Vec<Resource>> {
@@ -2033,6 +2315,71 @@ mod tests {
 
     fn scope() -> TempDir {
         TempDir::new().unwrap()
+    }
+
+    #[test]
+    fn generated_schema_discriminates_resource_specs() {
+        let schema = schema();
+        let variants = schema["oneOf"].as_array().unwrap();
+        let expected = [
+            ("Workflow", "WorkflowSpec"),
+            ("Run", "RunSpec"),
+            ("Session", "SessionSpec"),
+            ("Execution", "ExecutionSpec"),
+            ("EventBinding", "EventBindingSpec"),
+            ("Artifact", "ArtifactSpec"),
+        ];
+
+        assert_eq!(variants.len(), expected.len());
+        for (kind, spec) in expected {
+            let variant = variants
+                .iter()
+                .find(|variant| variant["properties"]["kind"]["const"] == kind)
+                .unwrap();
+            assert_eq!(
+                variant["properties"]["spec"]["$ref"],
+                format!("#/$defs/{spec}")
+            );
+        }
+        assert_eq!(
+            schema["$defs"]["WorkflowSpec"]["required"],
+            json!(["stages"])
+        );
+        assert!(schema["$defs"]["WorkflowSpec"]["properties"]["stages"].is_object());
+        assert!(schema["$defs"]["ExecutionSpec"]["properties"]["actions"].is_object());
+        assert!(schema["$defs"]["EventBindingSpec"]["properties"]["reasons"].is_object());
+        assert!(schema["$defs"]["ArtifactSpec"]["properties"]["digest"].is_object());
+    }
+
+    #[test]
+    fn resource_schema_remains_a_per_document_yaml_schema() {
+        let scope = scope();
+        let path = scope.path().join("resources.yaml");
+        fs::write(
+            &path,
+            r#"apiVersion: orc.dev/v1alpha1
+kind: Workflow
+metadata:
+  name: build
+spec:
+  stages: []
+---
+apiVersion: orc.dev/v1alpha1
+kind: Run
+metadata:
+  name: build-1
+spec:
+  workflowRef: build
+"#,
+        )
+        .unwrap();
+
+        let resources = load_documents(&path).unwrap();
+
+        assert!(schema()["oneOf"].is_array());
+        assert_eq!(resources.len(), 2);
+        assert_eq!(resources[0].kind, ResourceKind::Workflow);
+        assert_eq!(resources[1].kind, ResourceKind::Run);
     }
 
     #[test]
