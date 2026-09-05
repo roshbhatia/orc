@@ -117,6 +117,106 @@ class StopTreeTest(unittest.TestCase):
         self.assertTrue(self.process.is_running())
         self.assertNotEqual(self.process.status(), psutil.STATUS_STOPPED)
 
+    def test_freeze_completes_a_stable_scan_started_before_the_deadline(self) -> None:
+        leader = PROCESS_TREE.Identity(42, 100.0)
+        process = mock.Mock()
+        process.status.return_value = psutil.STATUS_STOPPED
+        clock = [0.0]
+
+        def slow_snapshot(_leader: object) -> set[PROCESS_TREE.Identity]:
+            clock[0] += 0.6
+            return {leader}
+
+        with mock.patch.object(PROCESS_TREE, "process_snapshot", side_effect=slow_snapshot):
+            with mock.patch.object(PROCESS_TREE, "current_process", return_value=process):
+                with mock.patch.object(
+                    PROCESS_TREE.time, "monotonic", side_effect=lambda: clock[0]
+                ):
+                    snapshot = PROCESS_TREE.freeze_tree(leader, 1.0)
+
+        self.assertEqual(snapshot, {leader})
+        process.suspend.assert_called_once_with()
+
+    def test_freeze_does_not_start_a_stability_scan_after_the_deadline(self) -> None:
+        leader = PROCESS_TREE.Identity(42, 100.0)
+        process = mock.Mock()
+        process.status.return_value = psutil.STATUS_STOPPED
+        clock = [0.0]
+
+        def snapshot_crossing_deadline(
+            _leader: object,
+        ) -> set[PROCESS_TREE.Identity]:
+            clock[0] += 1.1
+            return {leader}
+
+        with mock.patch.object(
+            PROCESS_TREE, "process_snapshot", side_effect=snapshot_crossing_deadline
+        ) as process_snapshot:
+            with mock.patch.object(PROCESS_TREE, "current_process", return_value=process):
+                with mock.patch.object(
+                    PROCESS_TREE.time, "monotonic", side_effect=lambda: clock[0]
+                ):
+                    with self.assertRaisesRegex(
+                        PROCESS_TREE.StopError, "did not stabilize"
+                    ):
+                        PROCESS_TREE.freeze_tree(leader, 1.0)
+
+        process_snapshot.assert_called_once_with(leader)
+        process.suspend.assert_called_once_with()
+        process.resume.assert_called_once_with()
+
+    def test_freeze_retries_when_a_new_descendant_appears(self) -> None:
+        leader = PROCESS_TREE.Identity(42, 100.0)
+        child = PROCESS_TREE.Identity(43, 101.0)
+        processes = {leader: mock.Mock(), child: mock.Mock()}
+        for process in processes.values():
+            process.status.return_value = psutil.STATUS_STOPPED
+        snapshots = [
+            {leader},
+            {leader, child},
+            {leader, child},
+            {leader, child},
+        ]
+
+        with mock.patch.object(PROCESS_TREE, "process_snapshot", side_effect=snapshots):
+            with mock.patch.object(
+                PROCESS_TREE,
+                "current_process",
+                side_effect=lambda identity: processes[identity],
+            ):
+                snapshot = PROCESS_TREE.freeze_tree(
+                    leader, time.monotonic() + 1.0
+                )
+
+        self.assertEqual(snapshot, {leader, child})
+        processes[leader].suspend.assert_called_once_with()
+        processes[child].suspend.assert_called_once_with()
+
+    def test_freeze_resumes_exact_identities_when_they_never_stop(self) -> None:
+        leader = PROCESS_TREE.Identity(42, 100.0)
+        process = mock.Mock()
+        process.status.return_value = psutil.STATUS_RUNNING
+        clock = [0.0]
+
+        def advancing_snapshot(_leader: object) -> set[PROCESS_TREE.Identity]:
+            clock[0] += 0.01
+            return {leader}
+
+        with mock.patch.object(
+            PROCESS_TREE, "process_snapshot", side_effect=advancing_snapshot
+        ):
+            with mock.patch.object(PROCESS_TREE, "current_process", return_value=process):
+                with mock.patch.object(
+                    PROCESS_TREE.time, "monotonic", side_effect=lambda: clock[0]
+                ):
+                    with self.assertRaisesRegex(
+                        PROCESS_TREE.StopError, "did not stabilize"
+                    ):
+                        PROCESS_TREE.freeze_tree(leader, 0.025)
+
+        process.suspend.assert_called_once_with()
+        process.resume.assert_called_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()

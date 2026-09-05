@@ -80,9 +80,21 @@ def resume_snapshot(snapshot: set[Identity]) -> None:
             continue
 
 
+def snapshot_is_stopped(snapshot: set[Identity]) -> bool:
+    for identity in snapshot:
+        process = current_process(identity)
+        if process is None:
+            continue
+        try:
+            if process.status() != psutil.STATUS_STOPPED:
+                return False
+        except psutil.NoSuchProcess:
+            continue
+    return True
+
+
 def freeze_tree(leader: Identity, deadline: float) -> set[Identity]:
     frozen: set[Identity] = set()
-    stable_scans = 0
     try:
         while time.monotonic() < deadline:
             snapshot = process_snapshot(leader)
@@ -96,13 +108,14 @@ def freeze_tree(leader: Identity, deadline: float) -> set[Identity]:
                     continue
                 frozen.add(identity)
 
+            if not snapshot_is_stopped(snapshot):
+                continue
+            if time.monotonic() >= deadline:
+                break
+
             next_snapshot = process_snapshot(leader)
-            if next_snapshot.issubset(frozen):
-                stable_scans += 1
-                if stable_scans == 2:
-                    return frozen
-            else:
-                stable_scans = 0
+            if next_snapshot.issubset(frozen) and snapshot_is_stopped(next_snapshot):
+                return frozen
         raise StopError("process tree did not stabilize before the stop deadline")
     except BaseException:
         resume_snapshot(frozen)
