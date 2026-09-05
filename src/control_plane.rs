@@ -1221,6 +1221,17 @@ pub fn list(scope: &Path, kind: Option<ResourceKind>, name: Option<&str>) -> Res
     Ok(resources)
 }
 
+pub fn exists(scope: &Path, kind: ResourceKind, name: &str) -> Result<bool> {
+    let scope = state::resolve_scope(scope)?;
+    Ok(read_store(&scope)?.resources.contains_key(
+        &ResourceKey {
+            kind,
+            name: name.into(),
+        }
+        .to_string(),
+    ))
+}
+
 pub fn artifact_body(scope: &Path, name: &str) -> Result<String> {
     let scope = state::resolve_scope(scope)?;
     let store = read_store(&scope)?;
@@ -1242,6 +1253,63 @@ pub fn artifact_body(scope: &Path, name: &str) -> Result<String> {
         .context("artifact body is missing")
 }
 
+fn value_references(value: &Value, field: &str, name: &str) -> bool {
+    match value {
+        Value::Object(object) => {
+            object.get(field).and_then(Value::as_str) == Some(name)
+                || object
+                    .values()
+                    .any(|value| value_references(value, field, name))
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|value| value_references(value, field, name)),
+        _ => false,
+    }
+}
+
+fn resource_references(resource: &Resource, target: &ResourceKey) -> bool {
+    match target.kind {
+        ResourceKind::Artifact => value_references(&resource.spec, "artifactRef", &target.name),
+        ResourceKind::Execution => {
+            value_references(&resource.spec, "executionRef", &target.name)
+                || (resource.kind == ResourceKind::Execution
+                    && resource
+                        .spec
+                        .get("dependsOn")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .any(|dependency| dependency == target.name))
+        }
+        _ => false,
+    }
+}
+
+fn referrers(
+    store: &ControlStore,
+    target: &ResourceKey,
+    excluded: &BTreeSet<ResourceKey>,
+) -> Vec<ResourceKey> {
+    store
+        .resources
+        .values()
+        .filter(|resource| resource.key() != *target)
+        .filter(|resource| !excluded.contains(&resource.key()))
+        .filter(|resource| resource_references(resource, target))
+        .map(Resource::key)
+        .collect()
+}
+
+fn deletion_requested(resource: &Resource) -> bool {
+    resource
+        .spec
+        .get("deletionRequested")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 pub fn delete(
     scope: &Path,
     kind: ResourceKind,
@@ -1257,6 +1325,19 @@ pub fn delete(
         if !store.resources.contains_key(&key.to_string()) {
             bail!("{key} not found");
         }
+        if matches!(kind, ResourceKind::Artifact | ResourceKind::Execution) {
+            let references = referrers(store, &key, &BTreeSet::new());
+            if !references.is_empty() {
+                bail!(
+                    "{key} is referenced by {}",
+                    references
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
         if kind == ResourceKind::Workflow {
             let dependents = store
                 .resources
@@ -1271,6 +1352,45 @@ pub fn delete(
                 bail!("{key} is referenced by runs/{}", dependents.join(", runs/"));
             }
         }
+        if kind == ResourceKind::Execution {
+            let execution = store.resource(&key).context("execution disappeared")?;
+            if let Some(run_name) = execution.spec.get("runRef").and_then(Value::as_str)
+                && generated_for_run(execution, run_name)
+                && store
+                    .resource(&ResourceKey {
+                        kind: ResourceKind::Run,
+                        name: run_name.into(),
+                    })
+                    .is_some()
+            {
+                bail!("{key} is owned by runs/{run_name}; delete the run instead");
+            }
+            if !execution_is_terminal(execution) {
+                let needs_update =
+                    desired_state(execution) != "cancelled" || !deletion_requested(execution);
+                if needs_update {
+                    store.resource_version += 1;
+                    let resource_version = store.resource_version;
+                    let execution = store.resource_mut(&key).context("execution disappeared")?;
+                    execution.spec["desiredState"] = Value::String("cancelled".into());
+                    execution.spec["deletionRequested"] = Value::Bool(true);
+                    execution.metadata.generation += 1;
+                    execution.metadata.resource_version = resource_version;
+                    execution.metadata.updated_at = Utc::now();
+                }
+                store.emit(
+                    "Normal",
+                    "DeletionRequested",
+                    key.clone(),
+                    format!("{key} deletion is waiting for execution cancellation"),
+                );
+                return Ok(ResourceChange {
+                    resource: key.clone(),
+                    action: ChangeAction::Delete,
+                    paths: vec!["spec.desiredState".into(), "spec.deletionRequested".into()],
+                });
+            }
+        }
         if kind == ResourceKind::Run {
             let children = store
                 .resources
@@ -1278,6 +1398,21 @@ pub fn delete(
                 .filter(|resource| generated_for_run(resource, name))
                 .map(Resource::key)
                 .collect::<Vec<_>>();
+            let mut owned = children.iter().cloned().collect::<BTreeSet<_>>();
+            owned.insert(key.clone());
+            for child in &children {
+                let references = referrers(store, child, &owned);
+                if !references.is_empty() {
+                    bail!(
+                        "{child} is referenced outside {key} by {}",
+                        references
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+            }
             if children.iter().any(|child| {
                 store
                     .resource(child)
@@ -1343,7 +1478,24 @@ pub fn delete(
                 );
             }
         }
+        let artifact_digest = (kind == ResourceKind::Artifact)
+            .then(|| {
+                store
+                    .resource(&key)
+                    .and_then(|resource| resource.spec.get("digest"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .flatten();
         store.resources.remove(&key.to_string());
+        if let Some(digest) = artifact_digest
+            && !store.resources.values().any(|resource| {
+                resource.kind == ResourceKind::Artifact
+                    && resource.spec.get("digest").and_then(Value::as_str) == Some(digest.as_str())
+            })
+        {
+            store.artifacts.remove(&digest);
+        }
         store.resource_version += 1;
         store.emit("Normal", "Deleted", key.clone(), format!("{key} deleted"));
         Ok(ResourceChange {
@@ -1584,6 +1736,39 @@ fn generated_for_run(resource: &Resource, run_name: &str) -> bool {
             .field_owners
             .get("spec")
             .is_some_and(|owner| owner == "orc-reconciler")
+}
+
+fn finalize_execution_deletions(store: &mut ControlStore) -> bool {
+    let pending = store
+        .resources
+        .values()
+        .filter(|resource| resource.kind == ResourceKind::Execution)
+        .filter(|resource| deletion_requested(resource) && execution_is_terminal(resource))
+        .filter(|resource| {
+            resource
+                .spec
+                .get("runRef")
+                .and_then(Value::as_str)
+                .is_none_or(|run_name| !generated_for_run(resource, run_name))
+        })
+        .map(Resource::key)
+        .collect::<Vec<_>>();
+    let mut changed = false;
+    for key in pending {
+        if !referrers(store, &key, &BTreeSet::new()).is_empty() {
+            continue;
+        }
+        store.resources.remove(&key.to_string());
+        store.resource_version += 1;
+        store.emit(
+            "Normal",
+            "Deleted",
+            key.clone(),
+            format!("{key} deleted after cancellation"),
+        );
+        changed = true;
+    }
+    changed
 }
 
 fn reconcile_runs(store: &mut ControlStore) -> Result<bool> {
@@ -2045,6 +2230,7 @@ fn reconcile_with(
         for pass in 0..max_passes {
             passes = pass + 1;
             let mut changed = reconcile_runs(store)?;
+            changed |= finalize_execution_deletions(store);
             let levels = execution_levels(store)?;
             let mut ordered = store
                 .resources
@@ -2983,6 +3169,218 @@ spec:
 
         assert!(error.to_string().contains("referenced by runs/release-1"));
         assert!(list(scope.path(), Some(ResourceKind::Workflow), Some("release")).is_ok());
+    }
+
+    #[test]
+    fn referenced_artifacts_and_executions_cannot_be_deleted() {
+        let scope = scope();
+        apply(
+            scope.path(),
+            vec![
+                resource(
+                    ResourceKind::Artifact,
+                    "requirements",
+                    json!({"content": "ship it"}),
+                ),
+                resource(
+                    ResourceKind::Execution,
+                    "build",
+                    json!({
+                        "desiredState": "running",
+                        "inputs": {"requirements": {"artifactRef": "requirements"}}
+                    }),
+                ),
+                resource(
+                    ResourceKind::Execution,
+                    "verify",
+                    json!({
+                        "desiredState": "running",
+                        "dependsOn": ["build"]
+                    }),
+                ),
+            ],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+
+        let artifact =
+            delete(scope.path(), ResourceKind::Artifact, "requirements", false).unwrap_err();
+        let execution = delete(scope.path(), ResourceKind::Execution, "build", false).unwrap_err();
+
+        assert!(
+            artifact
+                .to_string()
+                .contains("referenced by executions/build")
+        );
+        assert!(
+            execution
+                .to_string()
+                .contains("referenced by executions/verify")
+        );
+    }
+
+    #[test]
+    fn active_execution_deletion_cancels_before_removal() {
+        let scope = scope();
+        apply(
+            scope.path(),
+            vec![resource(
+                ResourceKind::Execution,
+                "build",
+                json!({"desiredState": "running"}),
+            )],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+        reconcile_with(scope.path(), 1, false, |capability, _| {
+            assert_eq!(capability, Capability::ExecutionEnsure);
+            Ok(ActionOutput {
+                provider: "fake".into(),
+                value: json!({"phase": "Running"}),
+            })
+        })
+        .unwrap();
+
+        let change = delete(scope.path(), ResourceKind::Execution, "build", false).unwrap();
+        let pending = list(scope.path(), Some(ResourceKind::Execution), Some("build"))
+            .unwrap()
+            .remove(0);
+        assert_eq!(change.paths.len(), 2);
+        assert_eq!(pending.spec["desiredState"], "cancelled");
+        assert_eq!(pending.spec["deletionRequested"], true);
+
+        let result = reconcile_with(scope.path(), 4, false, |capability, _| {
+            assert_eq!(capability, Capability::ExecutionCancel);
+            Ok(ActionOutput {
+                provider: "fake".into(),
+                value: json!({"phase": "Cancelled"}),
+            })
+        })
+        .unwrap();
+
+        assert_eq!(result.actions.len(), 1);
+        assert!(!exists(scope.path(), ResourceKind::Execution, "build").unwrap());
+        assert!(
+            events(
+                scope.path(),
+                Some(ResourceKind::Execution),
+                Some("build"),
+                0
+            )
+            .unwrap()
+            .iter()
+            .any(|event| event.message.contains("deleted after cancellation"))
+        );
+    }
+
+    #[test]
+    fn generated_execution_must_be_deleted_through_its_run() {
+        let scope = scope();
+        apply(
+            scope.path(),
+            vec![
+                resource(
+                    ResourceKind::Workflow,
+                    "release",
+                    json!({"stages": [{"name": "build"}]}),
+                ),
+                resource(
+                    ResourceKind::Run,
+                    "release-1",
+                    json!({"workflowRef": "release"}),
+                ),
+            ],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+        reconcile_with(scope.path(), 1, false, |_, _| {
+            Ok(ActionOutput {
+                provider: "fake".into(),
+                value: json!({"phase": "Succeeded"}),
+            })
+        })
+        .unwrap();
+
+        let error = delete(
+            scope.path(),
+            ResourceKind::Execution,
+            "release-1-build",
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("owned by runs/release-1; delete the run instead")
+        );
+    }
+
+    #[test]
+    fn run_deletion_preserves_owned_executions_referenced_elsewhere() {
+        let scope = scope();
+        apply(
+            scope.path(),
+            vec![
+                resource(
+                    ResourceKind::Workflow,
+                    "release",
+                    json!({"stages": [{"name": "build"}]}),
+                ),
+                resource(
+                    ResourceKind::Run,
+                    "release-1",
+                    json!({"workflowRef": "release"}),
+                ),
+            ],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+        reconcile_with(scope.path(), 2, false, |_, _| {
+            Ok(ActionOutput {
+                provider: "fake".into(),
+                value: json!({"phase": "Succeeded", "outputs": {"result": "built"}}),
+            })
+        })
+        .unwrap();
+        apply(
+            scope.path(),
+            vec![resource(
+                ResourceKind::Execution,
+                "publish",
+                json!({
+                    "desiredState": "running",
+                    "inputs": {
+                        "build": {
+                            "executionRef": "release-1-build",
+                            "output": "result"
+                        }
+                    }
+                }),
+            )],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+
+        let error = delete(scope.path(), ResourceKind::Run, "release-1", false).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("referenced outside runs/release-1 by executions/publish")
+        );
+        assert!(exists(scope.path(), ResourceKind::Run, "release-1").unwrap());
+        assert!(exists(scope.path(), ResourceKind::Execution, "release-1-build").unwrap());
     }
 
     #[test]

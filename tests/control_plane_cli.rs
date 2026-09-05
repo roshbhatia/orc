@@ -240,6 +240,91 @@ spec:
 
 #[cfg(unix)]
 #[test]
+fn delete_run_reconciles_owned_execution_before_returning() {
+    let state = TempDir::new().unwrap();
+    let scope = TempDir::new().unwrap();
+    let providers = local_provider_directory(state.path());
+    let resources = scope.path().join("resources.yaml");
+    let cancelled = state.path().join("cancelled");
+    let cancelled_value = serde_json::to_string(&cancelled.display().to_string()).unwrap();
+    fs::write(
+        &resources,
+        format!(
+            r#"apiVersion: orc.dev/v1alpha1
+kind: Workflow
+metadata:
+  name: release
+spec:
+  stages:
+    - name: build
+      provider: local
+      command: [/bin/sh, -c, "printf '%s\\n' '{{\"phase\":\"Running\"}}'"]
+      actions:
+        execution.observe:
+          command: [/bin/sh, -c, "printf '%s\\n' '{{\"phase\":\"Running\"}}'"]
+        execution.cancel:
+          command:
+            - /bin/sh
+            - -c
+            - |
+              touch "$CANCELLED"
+              printf '%s\n' '{{"phase":"Cancelled"}}'
+          environment:
+            CANCELLED: {cancelled_value}
+---
+apiVersion: orc.dev/v1alpha1
+kind: Run
+metadata:
+  name: release-1
+spec:
+  workflowRef: release
+"#,
+        ),
+    )
+    .unwrap();
+    let applied = command_with_provider(
+        state.path(),
+        scope.path(),
+        &providers,
+        &["apply", "-f", resources.to_str().unwrap()],
+    );
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+
+    let deleted = command_with_provider(
+        state.path(),
+        scope.path(),
+        &providers,
+        &["delete", "run", "release-1"],
+    );
+
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    assert!(cancelled.exists());
+    assert!(
+        !command(state.path(), scope.path(), &["get", "run", "release-1"])
+            .status
+            .success()
+    );
+    assert!(
+        !command(
+            state.path(),
+            scope.path(),
+            &["get", "execution", "release-1-build"]
+        )
+        .status
+        .success()
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn failed_local_cancel_retries_with_the_same_operation() {
     let state = TempDir::new().unwrap();
     let scope = TempDir::new().unwrap();

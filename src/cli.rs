@@ -1051,7 +1051,39 @@ pub fn run() -> Result<u8> {
                 &args.resource.name,
                 args.dry_run,
             )?;
+            let should_reconcile = !args.dry_run && !change.paths.is_empty();
             print_changes(&[change], args.json)?;
+            if should_reconcile {
+                let reconciled =
+                    control_plane::reconcile(&config, &args.resource.scope.scope, 16, false)?;
+                let failed = reconciled
+                    .actions
+                    .iter()
+                    .filter_map(|action| {
+                        action
+                            .error
+                            .as_ref()
+                            .map(|error| format!("{}: {error}", action.resource))
+                    })
+                    .collect::<Vec<_>>();
+                if !failed.is_empty() {
+                    for error in failed {
+                        eprintln!("{error}");
+                    }
+                    return Ok(1);
+                }
+                if control_plane::exists(
+                    &args.resource.scope.scope,
+                    args.resource.kind,
+                    &args.resource.name,
+                )? {
+                    eprintln!(
+                        "{}/{} deletion remains pending after 16 reconcile passes",
+                        args.resource.kind, args.resource.name
+                    );
+                    return Ok(1);
+                }
+            }
         }
         Commands::Events(args) => {
             let events = control_plane::events(
