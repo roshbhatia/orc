@@ -402,10 +402,6 @@ dependencies. The extras flake default installs all providers. Its `#full`
 output installs provider-neutral core plus that bundle. The root flake contains
 only Orc core.
 
-On Intel macOS, the extras flake includes the harness, local, and WezTerm
-providers. Changes, Traces, and Zmx do not publish compatible Nix packages for
-that platform.
-
 Orc reads provider manifests in precedence order. It checks the configured
 provider directory first, then `$XDG_DATA_HOME/orc/providers`, then each
 `orc/providers` directory under `$XDG_DATA_DIRS`. A higher-precedence provider

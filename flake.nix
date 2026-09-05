@@ -10,7 +10,6 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    nixpkgs-x86_64-darwin.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
     systems.url = "github:nix-systems/default";
   };
 
@@ -21,16 +20,10 @@
       supportedSystems = [
         "aarch64-darwin"
         "aarch64-linux"
-        "x86_64-darwin"
         "x86_64-linux"
       ];
       eachSystem = lib.genAttrs supportedSystems;
-      pkgsFor = eachSystem (
-        system:
-        import (if system == "x86_64-darwin" then inputs.nixpkgs-x86_64-darwin else inputs.nixpkgs) {
-          inherit system;
-        }
-      );
+      pkgsFor = eachSystem (system: import inputs.nixpkgs { inherit system; });
     in
     {
       formatter = eachSystem (

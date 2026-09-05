@@ -39,11 +39,6 @@ jobs:
             target: aarch64-apple-darwin
             release_os: darwin
             release_arch: arm64
-          - runner: macos-15
-            system: x86_64-darwin
-            target: x86_64-apple-darwin
-            release_os: darwin
-            release_arch: amd64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7

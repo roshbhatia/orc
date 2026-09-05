@@ -10,12 +10,10 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    nixpkgs-x86_64-darwin.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
     systems.url = "github:nix-systems/default";
     orc = {
       url = "path:..";
       inputs.nixpkgs.follows = "nixpkgs";
-      inputs.nixpkgs-x86_64-darwin.follows = "nixpkgs-x86_64-darwin";
       inputs.systems.follows = "systems";
     };
     changes = {
@@ -37,19 +35,11 @@
       supportedSystems = [
         "aarch64-darwin"
         "aarch64-linux"
-        "x86_64-darwin"
         "x86_64-linux"
       ];
       eachSystem = lib.genAttrs supportedSystems;
-      pkgsFor = eachSystem (
-        system:
-        import (if system == "x86_64-darwin" then inputs.nixpkgs-x86_64-darwin else inputs.nixpkgs) {
-          inherit system;
-        }
-      );
-      optionalPackageFor =
-        input: system:
-        if system == "x86_64-darwin" then null else lib.attrByPath [ system "default" ] null input.packages;
+      pkgsFor = eachSystem (system: import inputs.nixpkgs { inherit system; });
+      optionalPackageFor = input: system: lib.attrByPath [ system "default" ] null input.packages;
     in
     {
       formatter = eachSystem (system: inputs.orc.formatter.${system});
@@ -63,11 +53,6 @@
           tracesPackage = optionalPackageFor inputs.traces system;
           providerRegistry = pkgs.callPackage ./. {
             inherit changesPackage tracesPackage;
-            excludedProviders = lib.optionals (system == "x86_64-darwin") [
-              "changes"
-              "traces"
-              "zmx"
-            ];
           };
           providers = providerRegistry.all.providers;
           full = pkgs.symlinkJoin {
@@ -364,8 +349,6 @@
           harness-registry-requirement = harnessRegistry;
           wezterm-composed-environment = weztermEnvironment;
           zmx-lifecycle = zmxLifecycle;
-        }
-        // lib.optionalAttrs (providerPackages ? zmx && pkgs ? zmx) {
           zmx-process-tree = zmxProcessTree;
         }
         // validationChecks
