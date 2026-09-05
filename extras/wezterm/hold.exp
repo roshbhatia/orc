@@ -1,0 +1,29 @@
+#!/usr/bin/env expect
+set timeout 5
+
+set provider [lindex $argv 0]
+set scenario [lindex $argv 1]
+
+if {$scenario eq "failure"} {
+  set command "exit 19"
+  set message "Command exited with 19. Press Enter to close."
+  set expected_status 19
+} elseif {$scenario eq "short-success"} {
+  set command "exit 0"
+  set message "Command exited before an interactive session was ready. Press Enter to close."
+  set expected_status 0
+} else {
+  error "unknown scenario: $scenario"
+}
+
+# Keep a controlling terminal while reproducing Zmx's closed standard input.
+spawn -noecho bash -c {exec </dev/null; exec bash "$1" hold bash -c "$2"} hold-test $provider $command
+expect -exact $message
+send "\r"
+expect eof
+
+set result [wait]
+set status [lindex $result 3]
+if {$status != $expected_status} {
+  error "expected exit status $expected_status, got $status"
+}

@@ -282,6 +282,7 @@
                 nativeBuildInputs = [
                   pkgs.bash
                   pkgs.coreutils
+                  pkgs.expect
                   pkgs.jq
                   fakeWezterm
                 ];
@@ -290,6 +291,7 @@
                 export HOME="$TMPDIR/home"
                 export ORC_PROVIDER_LIB=${./lib/provider.sh}
                 export ORC_PROVIDER_WEZTERM_SCRIPT=${./wezterm/provider.sh}
+                export ORC_PROVIDER_WEZTERM_EXPECT=${./wezterm/hold.exp}
                 bash ${./wezterm/test.sh}
                 touch "$out"
               '';
