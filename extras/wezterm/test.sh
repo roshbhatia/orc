@@ -4,6 +4,8 @@ set -euo pipefail
 provider_script=${ORC_PROVIDER_WEZTERM_SCRIPT:?}
 provider_library=${ORC_PROVIDER_LIB:?}
 expect_script=${ORC_PROVIDER_WEZTERM_EXPECT:?}
+packaged_expect_script=${ORC_PROVIDER_WEZTERM_PACKAGED_EXPECT:?}
+packaged_provider=${ORC_PROVIDER_WEZTERM_PACKAGED:?}
 test_scope=${TMPDIR:?}/wezterm-provider-test
 mkdir -p "$test_scope"
 
@@ -51,6 +53,20 @@ for direction in right left top bottom; do
       and $command[$separator + 5:] == ["printenv", "ORC_COMPOSED_TEST"]
     ' "$plan" > /dev/null
 done
+
+request right |
+  WEZTERM_PANE=42 "$packaged_provider" > "$test_scope/packaged.json"
+packaged_command=$(jq -er \
+  --arg provider "$packaged_provider" \
+  '
+    .command as $command
+    | ($command | index("--")) as $separator
+    | ($command[$separator + 1:] | index($provider)) as $provider_offset
+    | select($provider_offset != null)
+    | select($command[$separator + $provider_offset + 2] == "hold")
+    | $provider
+  ' "$test_scope/packaged.json")
+expect "$packaged_expect_script" "$(command -v env)" "$packaged_command"
 
 request right |
   env -u WEZTERM_PANE ORC_PROVIDER_LIB="$provider_library" bash "$provider_script" > "$test_scope/outside.json"

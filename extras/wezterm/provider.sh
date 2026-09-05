@@ -126,7 +126,8 @@ case "$capability" in
         | (.key + "=" + (.value | tostring)), "\u0000"
       ' <<< "$request"
     )
-    session_command+=("$0" hold "${plan_command[@]}")
+    provider_self=${ORC_PROVIDER_SELF:-$0}
+    session_command+=("$provider_self" hold "${plan_command[@]}")
     if [[ -n ${WEZTERM_PANE:-} ]]; then
       split_command=("$executable" cli --no-auto-start split-pane "--$direction" --cwd "$prior_cwd")
       split_command+=(--pane-id "$WEZTERM_PANE")

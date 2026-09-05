@@ -277,6 +277,8 @@
                 export ORC_PROVIDER_LIB=${./lib/provider.sh}
                 export ORC_PROVIDER_WEZTERM_SCRIPT=${./wezterm/provider.sh}
                 export ORC_PROVIDER_WEZTERM_EXPECT=${./wezterm/hold.exp}
+                export ORC_PROVIDER_WEZTERM_PACKAGED=${providerPackages.wezterm.adapter}/bin/orc-provider-wezterm
+                export ORC_PROVIDER_WEZTERM_PACKAGED_EXPECT=${./wezterm/packaged-hold.exp}
                 bash ${./wezterm/test.sh}
                 touch "$out"
               '';
