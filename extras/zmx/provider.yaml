@@ -10,5 +10,5 @@ actions:
   session.persist: Wrap a harness command in a persistent session
   session.stop: Stop a persistent agent process
 requires:
-  commands: [zmx]
+  commands: [orc-provider-zmx-process-tree, zmx]
 priority: 100

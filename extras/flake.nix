@@ -312,6 +312,30 @@
                 bash ${./zmx/test.sh}
                 touch "$out"
               '';
+          zmxProcessTree =
+            let
+              python = pkgs.python3.withPackages (packages: [ packages.psutil ]);
+            in
+            pkgs.runCommand "orc-zmx-process-tree"
+              {
+                nativeBuildInputs = [
+                  pkgs.bash
+                  pkgs.coreutils
+                  pkgs.gnused
+                  pkgs.zmx
+                  providerPackages.zmx.adapter
+                ];
+              }
+              ''
+                export HOME="$TMPDIR/home"
+                export ORC_PROVIDER_ZMX_COMMAND=${providerPackages.zmx.adapter}/bin/orc-provider-zmx
+                export ORC_TEST_PYTHON=${python}/bin/python
+                export ORC_TEST_TREE_FIXTURE=${./zmx/tree_fixture.py}
+                export ORC_ZMX_PROCESS_TREE_MODULE=${./zmx/process_tree.py}
+                "$ORC_TEST_PYTHON" ${./zmx/process_tree_test.py}
+                bash ${./zmx/real_test.sh}
+                touch "$out"
+              '';
           harnessRegistry =
             pkgs.runCommand "orc-harness-registry-requirement"
               {
@@ -340,6 +364,7 @@
           harness-registry-requirement = harnessRegistry;
           wezterm-composed-environment = weztermEnvironment;
           zmx-lifecycle = zmxLifecycle;
+          zmx-process-tree = zmxProcessTree;
         }
         // validationChecks
         // closureChecks
