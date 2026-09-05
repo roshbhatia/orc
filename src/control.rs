@@ -283,13 +283,28 @@ pub fn register(scope: &Path, mut contract: Contract, link: SessionLink) -> Resu
 pub fn register_managed(
     config: &Config,
     scope: &Path,
+    contract: Contract,
+    link: SessionLink,
+) -> Result<Session> {
+    register_managed_with_execution(config, scope, contract, link, None)
+}
+
+pub(crate) fn register_managed_with_execution(
+    config: &Config,
+    scope: &Path,
     mut contract: Contract,
     mut link: SessionLink,
+    execution_provider: Option<&str>,
 ) -> Result<Session> {
     let providers = provider::discover(config)?;
     let scope = state::resolve_scope(scope)?;
-    let lifecycle_bindings =
-        provider::launch_lifecycle_bindings(config, &providers, &scope, "pending")?;
+    let lifecycle_bindings = provider::launch_lifecycle_bindings(
+        config,
+        &providers,
+        &scope,
+        "pending",
+        execution_provider,
+    )?;
     let environment_id = env::var("ORC_SESSION_ID").ok();
     link.source = RegistrationSource::Managed;
     register_for_caller(

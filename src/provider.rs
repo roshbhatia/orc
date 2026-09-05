@@ -565,6 +565,7 @@ pub fn launch_lifecycle_bindings(
     providers: &[Manifest],
     scope: &Path,
     session_id: &str,
+    execution_provider: Option<&str>,
 ) -> Result<Vec<ProviderBinding>> {
     let mut bindings = Vec::new();
     let mut rejections = Vec::new();
@@ -582,6 +583,10 @@ pub fn launch_lifecycle_bindings(
     ] {
         let candidates = candidates(providers, lifecycle)
             .into_iter()
+            .filter(|provider| {
+                lifecycle != Capability::ExecutionCancel
+                    || execution_provider.is_none_or(|selected| provider.name == selected)
+            })
             .filter(|provider| {
                 launch_capabilities
                     .iter()
@@ -3534,10 +3539,44 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
             &[first, second],
             directory.path(),
             "managed",
+            None,
         )
         .expect_err("ambiguous owners");
 
         assert!(error.to_string().contains("ambiguous launch ownership"));
+    }
+
+    #[test]
+    fn managed_launch_honors_the_selected_execution_owner() {
+        let directory = tempfile::tempdir().expect("provider directory");
+        let command = write_provider(
+            directory.path(),
+            "provider",
+            r#"#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
+"#,
+        );
+        let actions = BTreeMap::from([
+            (Capability::ExecutionRun, "Run work".into()),
+            (Capability::ExecutionCancel, "Cancel work".into()),
+        ]);
+        let mut higher_priority = provider_manifest("higher-priority", &command, 100);
+        higher_priority.actions = actions.clone();
+        let mut selected = provider_manifest("selected", &command, 0);
+        selected.actions = actions;
+
+        let owners = launch_lifecycle_bindings(
+            &Config::default(),
+            &[higher_priority, selected],
+            directory.path(),
+            "managed",
+            Some("selected"),
+        )
+        .expect("selected execution owner");
+
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].provider, "selected");
     }
 
     #[test]

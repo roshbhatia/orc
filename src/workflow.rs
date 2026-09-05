@@ -2526,7 +2526,12 @@ Success criteria:
                 )
             });
             let native_id = Uuid::new_v4().to_string();
-            let session = control::register_managed(
+            let execution_provider = step.runtime.execution.as_ref().or(definition
+                .defaults
+                .runtime
+                .execution
+                .as_ref());
+            let session = control::register_managed_with_execution(
                 config,
                 scope,
                 Contract {
@@ -2551,6 +2556,7 @@ Success criteria:
                     source: RegistrationSource::Managed,
                     ..SessionLink::default()
                 },
+                execution_provider.map(String::as_str),
             )?;
             assign_node_session(scope, &run.id, &step.name, &session.id)?;
             let mut request = agent_launch_request(AgentLaunchRequest {
@@ -2563,12 +2569,7 @@ Success criteria:
                 step,
                 direction: context.display_direction,
             });
-            if let Some(execution) = step.runtime.execution.as_ref().or(definition
-                .defaults
-                .runtime
-                .execution
-                .as_ref())
-            {
+            if let Some(execution) = execution_provider {
                 request["providers"][provider::Capability::ExecutionRun.to_string()] =
                     serde_json::Value::String(execution.clone());
             }
