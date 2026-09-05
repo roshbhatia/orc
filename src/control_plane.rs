@@ -608,10 +608,19 @@ fn session_spec_schema() -> Value {
 }
 
 fn execution_spec_schema() -> Value {
+    let mut properties = execution_properties();
+    properties.insert(
+        "deletionRequested".into(),
+        json!({
+            "type": "boolean",
+            "readOnly": true,
+            "description": "Controller-owned marker for deletion after execution cancellation",
+        }),
+    );
     json!({
         "type": "object",
         "additionalProperties": false,
-        "properties": execution_properties(),
+        "properties": properties,
     })
 }
 
@@ -3314,6 +3323,19 @@ spec:
         assert_eq!(change.paths.len(), 2);
         assert_eq!(pending.spec["desiredState"], "cancelled");
         assert_eq!(pending.spec["deletionRequested"], true);
+
+        let failed = reconcile_with(scope.path(), 1, false, |capability, _| {
+            assert_eq!(capability, Capability::ExecutionCancel);
+            Err(anyhow::anyhow!("cancel unavailable"))
+        })
+        .unwrap();
+        assert_eq!(failed.actions.len(), 1);
+        assert!(failed.actions[0].error.is_some());
+        let pending = list(scope.path(), Some(ResourceKind::Execution), Some("build"))
+            .unwrap()
+            .remove(0);
+        let validator = jsonschema::validator_for(&schema()).unwrap();
+        assert!(validator.is_valid(&serde_json::to_value(&pending).unwrap()));
 
         let result = reconcile_with(scope.path(), 4, false, |capability, _| {
             assert_eq!(capability, Capability::ExecutionCancel);

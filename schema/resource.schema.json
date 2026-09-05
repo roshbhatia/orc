@@ -163,6 +163,11 @@
           "minLength": 1,
           "type": "string"
         },
+        "deletionRequested": {
+          "description": "Controller-owned marker for deletion after execution cancellation",
+          "readOnly": true,
+          "type": "boolean"
+        },
         "dependsOn": {
           "items": {
             "minLength": 1,
