@@ -1,6 +1,7 @@
 {
   callPackage,
   changesPackage,
+  excludedProviders ? [ ],
   lib,
   symlinkJoin,
   tracesPackage,
@@ -9,7 +10,10 @@ let
   mkProvider = callPackage ./lib/mk-provider.nix { };
   entries = builtins.readDir ./.;
   providerNames = builtins.filter (
-    name: entries.${name} == "directory" && builtins.pathExists (./. + "/${name}/default.nix")
+    name:
+    entries.${name} == "directory"
+    && builtins.pathExists (./. + "/${name}/default.nix")
+    && !builtins.elem name excludedProviders
   ) (builtins.attrNames entries);
   providers = lib.genAttrs providerNames (
     name:

@@ -10,10 +10,12 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    nixpkgs-x86_64-darwin.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
     systems.url = "github:nix-systems/default";
     orc = {
       url = "path:..";
       inputs.nixpkgs.follows = "nixpkgs";
+      inputs.nixpkgs-x86_64-darwin.follows = "nixpkgs-x86_64-darwin";
       inputs.systems.follows = "systems";
     };
     changes = {
@@ -35,15 +37,19 @@
       supportedSystems = [
         "aarch64-darwin"
         "aarch64-linux"
+        "x86_64-darwin"
         "x86_64-linux"
       ];
       eachSystem = lib.genAttrs supportedSystems;
       pkgsFor = eachSystem (
         system:
-        import inputs.nixpkgs {
+        import (if system == "x86_64-darwin" then inputs.nixpkgs-x86_64-darwin else inputs.nixpkgs) {
           inherit system;
         }
       );
+      optionalPackageFor =
+        input: system:
+        if system == "x86_64-darwin" then null else lib.attrByPath [ system "default" ] null input.packages;
     in
     {
       formatter = eachSystem (system: inputs.orc.formatter.${system});
@@ -53,9 +59,15 @@
         let
           pkgs = pkgsFor.${system};
           core = inputs.orc.packages.${system}.core;
+          changesPackage = optionalPackageFor inputs.changes system;
+          tracesPackage = optionalPackageFor inputs.traces system;
           providerRegistry = pkgs.callPackage ./. {
-            changesPackage = inputs.changes.packages.${system}.default;
-            tracesPackage = inputs.traces.packages.${system}.default;
+            inherit changesPackage tracesPackage;
+            excludedProviders = lib.optionals (system == "x86_64-darwin") [
+              "changes"
+              "traces"
+              "zmx"
+            ];
           };
           providers = providerRegistry.all.providers;
           full = pkgs.symlinkJoin {
@@ -94,11 +106,13 @@
           core = inputs.orc.packages.${system}.core;
           providerPackages = packages.all.providers;
           providerNames = builtins.attrNames providerPackages;
-          productPackages = {
-            changes = inputs.changes.packages.${system}.default;
-            traces = inputs.traces.packages.${system}.default;
+          changesPackage = optionalPackageFor inputs.changes system;
+          tracesPackage = optionalPackageFor inputs.traces system;
+          productPackages = lib.filterAttrs (_: package: package != null) {
+            changes = changesPackage;
+            traces = tracesPackage;
             wezterm = pkgs.wezterm;
-            zmx = pkgs.zmx;
+            zmx = lib.attrByPath [ "zmx" ] null pkgs;
           };
           validationHarness = pkgs.writeShellScriptBin "orc-provider-validation" ''
             exit 0
