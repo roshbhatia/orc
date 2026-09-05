@@ -287,11 +287,13 @@ pub fn register_managed(
     mut link: SessionLink,
 ) -> Result<Session> {
     let providers = provider::discover(config)?;
-    let lifecycle_bindings = provider::launch_lifecycle_bindings(&providers, "pending")?;
+    let scope = state::resolve_scope(scope)?;
+    let lifecycle_bindings =
+        provider::launch_lifecycle_bindings(config, &providers, &scope, "pending")?;
     let environment_id = env::var("ORC_SESSION_ID").ok();
     link.source = RegistrationSource::Managed;
     register_for_caller(
-        scope,
+        &scope,
         &mut contract,
         link,
         environment_id.as_deref(),
@@ -2333,6 +2335,44 @@ cat <<JSON
 JSON
 "#;
 
+    const PREFLIGHT_STOP_PROVIDER: &str = r#"#!/bin/sh
+request=$(cat)
+case "$request" in
+  *session.stop*)
+    cat <<'JSON'
+{"version":"orc.provider/v1","command":["sh","-c","touch '{{ stopped }}'"]}
+JSON
+    ;;
+  *) printf '%s\n' 'null' ;;
+esac
+"#;
+
+    const RESOURCE_ONLY_CANCEL_PROVIDER: &str = r#"#!/bin/sh
+request=$(cat)
+case "$request" in
+  *execution.cancel*'"resource"'*)
+    printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
+    ;;
+  *execution.cancel*)
+    printf '%s\n' '{"version":"orc.provider/v1","status":"declined","reason":"resource required"}'
+    ;;
+  *) printf '%s\n' 'null' ;;
+esac
+"#;
+
+    const PREFLIGHT_ONLY_CANCEL_PROVIDER: &str = r#"#!/bin/sh
+request=$(cat)
+case "$request" in
+  *execution.cancel*'"preflight":true'*)
+    printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
+    ;;
+  *execution.cancel*)
+    printf '%s\n' '{"version":"orc.provider/v1","status":"declined","reason":"owned execution disappeared"}'
+    ;;
+  *) printf '%s\n' 'null' ;;
+esac
+"#;
+
     const TERMINATION_RECORDER: &str = r#"#!/bin/sh
 printf '%s\n' "$1" >> '{{ log }}'
 "#;
@@ -2343,6 +2383,15 @@ kind: {{ kind }}
 command: {{ command }}
 actions:
   {{ capability }}: Terminate owned work
+"#;
+
+    const EXECUTION_OWNER_MANIFEST: &str = r#"version: orc.provider/v1
+name: {{ name }}
+kind: execution
+command: {{ command }}
+actions:
+  execution.run: Run work
+  execution.cancel: Cancel owned work
 "#;
 
     const PROVIDER_MANIFEST: &str = r#"version: orc.provider/v1
@@ -2491,6 +2540,7 @@ actions:
         assert!(error.to_string().contains("lifecycle owner"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn managed_registration_persists_its_lifecycle_owner() {
         let directory = tempfile::tempdir().expect("fixture");
@@ -2499,19 +2549,38 @@ actions:
         fs::create_dir_all(&scope_directory).expect("scope");
         fs::create_dir_all(&provider_directory).expect("providers");
         let scope = fs::canonicalize(scope_directory).expect("canonical scope");
+        let provider = directory.path().join("owner.sh");
         fs::write(
-            provider_directory.join("owner.yaml"),
-            r#"version: orc.provider/v1
-name: owner
-description: Test lifecycle owner
-kind: harness
-command: "true"
-actions:
-  session.launch: Launch a session
-  session.stop: Stop a session
+            &provider,
+            r#"#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
 "#,
         )
-        .expect("provider");
+        .expect("provider command");
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o755))
+            .expect("provider executable");
+        fs::write(
+            provider_directory.join("owner.yaml"),
+            render_fixture(
+                PROVIDER_MANIFEST,
+                serde_json::json!({
+                    "name": "owner",
+                    "command": provider.display().to_string(),
+                    "actions": [
+                        {
+                            "capability": "session.launch",
+                            "description": "Launch a session",
+                        },
+                        {
+                            "capability": "session.stop",
+                            "description": "Stop a session",
+                        },
+                    ],
+                }),
+            ),
+        )
+        .expect("provider manifest");
         let config = Config {
             providers: crate::config::ProviderConfig {
                 directory: provider_directory,
@@ -2538,6 +2607,155 @@ actions:
             session.providers[0].r#ref.as_deref(),
             Some(session.id.as_str())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_registration_excludes_resource_only_cancellation() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let scope_directory = directory.path().join("scope");
+        let provider_directory = directory.path().join("providers");
+        fs::create_dir_all(&scope_directory).expect("scope");
+        fs::create_dir_all(&provider_directory).expect("providers");
+        let scope = fs::canonicalize(scope_directory).expect("canonical scope");
+        let stopped = directory.path().join("stopped");
+        let stop_provider = directory.path().join("stop-provider.sh");
+        let cancel_provider = directory.path().join("cancel-provider.sh");
+        fs::write(
+            &stop_provider,
+            render_fixture(
+                PREFLIGHT_STOP_PROVIDER,
+                serde_json::json!({ "stopped": stopped.display().to_string() }),
+            ),
+        )
+        .expect("stop provider");
+        fs::write(&cancel_provider, RESOURCE_ONLY_CANCEL_PROVIDER).expect("cancel provider");
+        for provider in [&stop_provider, &cancel_provider] {
+            fs::set_permissions(provider, fs::Permissions::from_mode(0o755))
+                .expect("provider executable");
+        }
+        fs::write(
+            provider_directory.join("persistence.yaml"),
+            render_fixture(
+                PROVIDER_MANIFEST,
+                serde_json::json!({
+                    "name": "persistence",
+                    "command": stop_provider.display().to_string(),
+                    "actions": [
+                        {
+                            "capability": "session.persist",
+                            "description": "Persist a session",
+                        },
+                        {
+                            "capability": "session.stop",
+                            "description": "Stop a session",
+                        },
+                    ],
+                }),
+            ),
+        )
+        .expect("persistence manifest");
+        fs::write(
+            provider_directory.join("local.yaml"),
+            render_fixture(
+                EXECUTION_OWNER_MANIFEST,
+                serde_json::json!({
+                    "name": "local",
+                    "command": cancel_provider.display().to_string(),
+                }),
+            ),
+        )
+        .expect("local manifest");
+        let config = Config {
+            providers: crate::config::ProviderConfig {
+                directory: provider_directory,
+                ..crate::config::ProviderConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let session = register_managed(
+            &config,
+            &scope,
+            Contract::default(),
+            SessionLink {
+                native_id: Some("managed-native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("managed session");
+
+        assert_eq!(session.providers.len(), 1);
+        assert_eq!(session.providers[0].provider, "persistence");
+        let terminated = terminate(&config, &scope, &session.id, "operator request")
+            .expect("terminate through the accepted owner");
+        assert_eq!(terminated.status, LifecycleStatus::Cancelled);
+        assert!(stopped.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_cancellation_owner_failure_preserves_termination_state() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let scope_directory = directory.path().join("scope");
+        let provider_directory = directory.path().join("providers");
+        fs::create_dir_all(&scope_directory).expect("scope");
+        fs::create_dir_all(&provider_directory).expect("providers");
+        let scope = fs::canonicalize(scope_directory).expect("canonical scope");
+        let provider = directory.path().join("cancel-provider.sh");
+        fs::write(&provider, PREFLIGHT_ONLY_CANCEL_PROVIDER).expect("cancel provider");
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o755))
+            .expect("provider executable");
+        fs::write(
+            provider_directory.join("execution.yaml"),
+            render_fixture(
+                EXECUTION_OWNER_MANIFEST,
+                serde_json::json!({
+                    "name": "executor",
+                    "command": provider.display().to_string(),
+                }),
+            ),
+        )
+        .expect("execution manifest");
+        let config = Config {
+            providers: crate::config::ProviderConfig {
+                directory: provider_directory,
+                ..crate::config::ProviderConfig::default()
+            },
+            ..Config::default()
+        };
+        let session = register_managed(
+            &config,
+            &scope,
+            Contract::default(),
+            SessionLink {
+                native_id: Some("managed-native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("managed session");
+
+        let error = terminate(&config, &scope, &session.id, "operator request")
+            .expect_err("selected owner must remain authoritative");
+        assert!(
+            error.to_string().contains("owned execution disappeared"),
+            "{error:#}"
+        );
+        let restored = selected_session(&state::read(&scope).expect("workspace"), &session.id)
+            .expect("restored session")
+            .clone();
+        assert_eq!(restored.status, LifecycleStatus::Working);
+        assert!(
+            restored
+                .termination_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("owned execution disappeared"))
+        );
+        assert_eq!(
+            restored.termination_cause.as_deref(),
+            Some("operator request")
+        );
+        assert!(restored.termination_operation_id.is_some());
     }
 
     #[test]

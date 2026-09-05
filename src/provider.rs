@@ -561,18 +561,26 @@ fn fingerprint_environment(
 }
 
 pub fn launch_lifecycle_bindings(
+    config: &Config,
     providers: &[Manifest],
+    scope: &Path,
     session_id: &str,
 ) -> Result<Vec<ProviderBinding>> {
     let mut bindings = Vec::new();
-    for (lifecycle, launch_capabilities) in [
+    let mut rejections = Vec::new();
+    for (action, lifecycle, launch_capabilities) in [
         (
+            Action::Stop,
             Capability::SessionStop,
             &[Capability::SessionLaunch, Capability::SessionPersist][..],
         ),
-        (Capability::ExecutionCancel, &[Capability::ExecutionRun][..]),
+        (
+            Action::Cancel,
+            Capability::ExecutionCancel,
+            &[Capability::ExecutionRun][..],
+        ),
     ] {
-        let owners = candidates(providers, lifecycle)
+        let candidates = candidates(providers, lifecycle)
             .into_iter()
             .filter(|provider| {
                 launch_capabilities
@@ -580,27 +588,61 @@ pub fn launch_lifecycle_bindings(
                     .any(|capability| provider.supports(*capability))
             })
             .collect::<Vec<_>>();
-        match owners.as_slice() {
-            [] => {}
-            [owner] => bindings.push(ProviderBinding {
-                provider: owner.name.clone(),
-                kind: owner.kind,
+        let mut owners = Vec::new();
+        for provider in candidates {
+            let binding = ProviderBinding {
+                provider: provider.name.clone(),
+                kind: provider.kind,
                 r#ref: Some(session_id.to_owned()),
                 status: BindingStatus::Active,
-                label: format!("{LAUNCH_OWNERSHIP_LABEL_PREFIX}{}", owner.description),
-            }),
+                label: format!("{LAUNCH_OWNERSHIP_LABEL_PREFIX}{}", provider.description),
+            };
+            let request = json!({
+                "version": "orc.provider/v1",
+                "action": action.name(),
+                "capability": lifecycle,
+                "scope": scope,
+                "direction": "right",
+                "session": {
+                    "id": session_id,
+                    "nativeId": session_id,
+                    "registration": "managed",
+                    "providers": [&binding],
+                },
+                "plan": null,
+                "operationId": "launch-lifecycle-preflight",
+                "preflight": true,
+            });
+            match invoke_raw(provider, &request, config, None)
+                .and_then(|value| parse_plan(provider, value))
+            {
+                Ok(Some(_)) => owners.push(binding),
+                Ok(None) => rejections.push(format!("{} declined {lifecycle}", provider.name)),
+                Err(error) => {
+                    rejections.push(format!("{} rejected {lifecycle}: {error:#}", provider.name));
+                }
+            }
+        }
+        match owners.as_slice() {
+            [] => {}
+            [owner] => bindings.push(owner.clone()),
             _ => bail!(
                 "ambiguous launch ownership for capability {lifecycle}: {}",
                 owners
                     .into_iter()
-                    .map(|provider| provider.name.as_str())
+                    .map(|binding| binding.provider)
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
         }
     }
     if bindings.is_empty() {
-        bail!("managed launch has no provider with stop or cancel ownership");
+        let details = if rejections.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", rejections.join("; "))
+        };
+        bail!("managed launch has no provider that accepts session stop or cancel{details}");
     }
     Ok(bindings)
 }
@@ -1884,16 +1926,28 @@ pub(crate) fn resolve_plan_from_tracked(
             }
             request["capability"] = Value::String(capability.to_string());
             request["plan"] = serde_json::to_value(&plan)?;
-            match invoke_raw(provider, &request, config, tracker_directory)
-                .and_then(|value| parse_plan(provider, value))
-            {
-                Ok(Some(candidate)) => {
-                    accepted = Some(candidate);
-                    break;
+            let response = invoke_raw(provider, &request, config, tracker_directory);
+            match response {
+                Ok(value) if value.get("status").and_then(Value::as_str) == Some("declined") => {
+                    failures.push(format!(
+                        "{} declined: {}",
+                        provider.name,
+                        value
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("no reason supplied")
+                    ));
                 }
-                Ok(None) => failures.push(format!("{} declined", provider.name)),
+                Ok(value) => match parse_plan(provider, value) {
+                    Ok(Some(candidate)) => {
+                        accepted = Some(candidate);
+                        break;
+                    }
+                    Ok(None) => failures.push(format!("{} declined", provider.name)),
+                    Err(error) => failures.push(format!("{}: {error:#}", provider.name)),
+                },
                 Err(error) => failures.push(format!("{}: {error:#}", provider.name)),
-            }
+            };
         }
         plan = Some(accepted.ok_or_else(|| {
             anyhow!(
@@ -3458,17 +3512,30 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["owner"]}'
 
     #[test]
     fn managed_launch_rejects_ambiguous_lifecycle_ownership() {
-        let command = Path::new("provider");
-        let mut first = provider_manifest("first", command, 100);
+        let directory = tempfile::tempdir().expect("provider directory");
+        let command = write_provider(
+            directory.path(),
+            "provider",
+            r#"#!/bin/sh
+cat >/dev/null
+printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
+"#,
+        );
+        let mut first = provider_manifest("first", &command, 100);
         first.actions = BTreeMap::from([
             (Capability::SessionPersist, "Persist a session".into()),
             (Capability::SessionStop, "Stop a session".into()),
         ]);
-        let mut second = provider_manifest("second", command, 0);
+        let mut second = provider_manifest("second", &command, 0);
         second.actions = first.actions.clone();
 
-        let error =
-            launch_lifecycle_bindings(&[first, second], "managed").expect_err("ambiguous owners");
+        let error = launch_lifecycle_bindings(
+            &Config::default(),
+            &[first, second],
+            directory.path(),
+            "managed",
+        )
+        .expect_err("ambiguous owners");
 
         assert!(error.to_string().contains("ambiguous launch ownership"));
     }
