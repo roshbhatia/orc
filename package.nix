@@ -11,7 +11,7 @@
 }:
 rustPlatform.buildRustPackage {
   pname = "orc";
-  version = "0.10.2";
+  version = "0.10.3";
   src = lib.fileset.toSource {
     root = ./.;
     fileset = lib.fileset.unions [
