@@ -9,7 +9,7 @@ Set TypingSpeed 0
 
 Sleep 1s
 
-Type "$ORC_SCREENSHOT_BIN tui --scope $ORC_SCREENSHOT_SCOPE"
+Type "orc tui --scope $ORC_SCREENSHOT_SCOPE"
 Enter
 Wait+Screen /renderer-provider-migration/
 Sleep 1s
