@@ -944,6 +944,92 @@ pub fn delete(
         if !store.resources.contains_key(&key.to_string()) {
             bail!("{key} not found");
         }
+        if kind == ResourceKind::Workflow {
+            let dependents = store
+                .resources
+                .values()
+                .filter(|resource| resource.kind == ResourceKind::Run)
+                .filter(|resource| {
+                    resource.spec.get("workflowRef").and_then(Value::as_str) == Some(name)
+                })
+                .map(|resource| resource.metadata.name.clone())
+                .collect::<Vec<_>>();
+            if !dependents.is_empty() {
+                bail!("{key} is referenced by runs/{}", dependents.join(", runs/"));
+            }
+        }
+        if kind == ResourceKind::Run {
+            let children = store
+                .resources
+                .values()
+                .filter(|resource| generated_for_run(resource, name))
+                .map(Resource::key)
+                .collect::<Vec<_>>();
+            if children.iter().any(|child| {
+                store
+                    .resource(child)
+                    .is_some_and(|resource| !execution_is_terminal(resource))
+            }) {
+                let now = Utc::now();
+                let mut retired = Vec::new();
+                for child in &children {
+                    if store
+                        .resource(child)
+                        .is_some_and(|resource| desired_state(resource) != "cancelled")
+                    {
+                        store.resource_version += 1;
+                        let resource_version = store.resource_version;
+                        let execution = store
+                            .resource_mut(child)
+                            .context("generated execution disappeared")?;
+                        execution.spec["desiredState"] = Value::String("cancelled".into());
+                        execution.metadata.generation += 1;
+                        execution.metadata.resource_version = resource_version;
+                        execution.metadata.updated_at = now;
+                        retired.push(child.clone());
+                    }
+                }
+                let run = store.resource_mut(&key).context("run disappeared")?;
+                if desired_state(run) != "cancelled" {
+                    store.resource_version += 1;
+                    let resource_version = store.resource_version;
+                    let run = store.resource_mut(&key).context("run disappeared")?;
+                    run.spec["desiredState"] = Value::String("cancelled".into());
+                    run.metadata.generation += 1;
+                    run.metadata.resource_version = resource_version;
+                    run.metadata.updated_at = now;
+                }
+                for child in retired {
+                    store.emit(
+                        "Normal",
+                        "Retired",
+                        child.clone(),
+                        format!("{child} is stopping before {key} deletion"),
+                    );
+                }
+                store.emit(
+                    "Normal",
+                    "DeletionRequested",
+                    key.clone(),
+                    format!("{key} deletion is waiting for owned executions"),
+                );
+                return Ok(ResourceChange {
+                    resource: key.clone(),
+                    action: ChangeAction::Delete,
+                    paths: vec!["spec.desiredState".into()],
+                });
+            }
+            for child in children {
+                store.resources.remove(&child.to_string());
+                store.resource_version += 1;
+                store.emit(
+                    "Normal",
+                    "Deleted",
+                    child.clone(),
+                    format!("{child} deleted with {key}"),
+                );
+            }
+        }
         store.resources.remove(&key.to_string());
         store.resource_version += 1;
         store.emit("Normal", "Deleted", key.clone(), format!("{key} deleted"));
@@ -1196,6 +1282,67 @@ fn reconcile_runs(store: &mut ControlStore) -> Result<bool> {
         .collect::<Vec<_>>();
     let mut changed = false;
     for run in runs {
+        if desired_state(&run) == "cancelled" {
+            let run_key = run.key();
+            let children = store
+                .resources
+                .values()
+                .filter(|resource| generated_for_run(resource, &run.metadata.name))
+                .map(Resource::key)
+                .collect::<Vec<_>>();
+            for child in &children {
+                if store
+                    .resource(child)
+                    .is_some_and(|resource| desired_state(resource) != "cancelled")
+                {
+                    let terminal = store.resource(child).is_some_and(execution_is_terminal);
+                    store.resource_version += 1;
+                    let resource_version = store.resource_version;
+                    let execution = store
+                        .resource_mut(child)
+                        .context("generated execution disappeared")?;
+                    execution.spec["desiredState"] = Value::String("cancelled".into());
+                    execution.metadata.generation += 1;
+                    execution.metadata.resource_version = resource_version;
+                    execution.metadata.updated_at = Utc::now();
+                    if terminal {
+                        execution.status.observed_generation = execution.metadata.generation;
+                    }
+                    store.emit(
+                        "Normal",
+                        "Retired",
+                        child.clone(),
+                        format!("{child} is stopping before {run_key} deletion"),
+                    );
+                    changed = true;
+                }
+            }
+            if children
+                .iter()
+                .all(|child| store.resource(child).is_some_and(execution_is_terminal))
+            {
+                for child in children {
+                    store.resources.remove(&child.to_string());
+                    store.resource_version += 1;
+                    store.emit(
+                        "Normal",
+                        "Deleted",
+                        child.clone(),
+                        format!("{child} deleted with {run_key}"),
+                    );
+                }
+                store.resources.remove(&run_key.to_string());
+                store.resource_version += 1;
+                store.emit(
+                    "Normal",
+                    "Deleted",
+                    run_key.clone(),
+                    format!("{run_key} deleted after owned executions stopped"),
+                );
+                changed = true;
+            }
+            continue;
+        }
         let workflow_name = run
             .spec
             .get("workflowRef")
@@ -1387,16 +1534,19 @@ fn invoke_provider(
     let mut value = invocation.value;
     if let Some(plan) = invocation.plan {
         let output = provider::capture_plan(&plan, scope, config.provider_timeout())?;
-        value = if output.trim().is_empty() {
-            json!({"status": "accepted"})
-        } else {
-            serde_json::from_str(&output).context("provider action output is not JSON")?
-        };
+        value = parse_action_observation(&output)?;
     }
     Ok(ActionOutput {
         provider: invocation.provider,
         value,
     })
+}
+
+fn parse_action_observation(output: &str) -> Result<Value> {
+    if output.trim().is_empty() {
+        bail!("provider action command returned no observation");
+    }
+    serde_json::from_str(output).context("provider action output is not JSON")
 }
 
 fn desired_state(resource: &Resource) -> &str {
@@ -1700,6 +1850,7 @@ fn deliver_events(
         for event in events.iter().filter(|event| {
             !binding.status.delivered_events.contains(&event.sequence)
                 && event.subject != binding.key()
+                && event.reason != "EventDeliveryFailed"
                 && binding_matches(&binding, event)
         }) {
             if !attempted.insert((binding.metadata.uid.clone(), event.sequence)) {
@@ -2009,6 +2160,54 @@ mod tests {
     }
 
     #[test]
+    fn successful_action_command_requires_an_observation() {
+        let scope = scope();
+        apply(
+            scope.path(),
+            vec![resource(
+                ResourceKind::Execution,
+                "build",
+                json!({"desiredState": "running"}),
+            )],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+        let plan = provider::CommandPlan {
+            version: "orc.command/v1".into(),
+            command: vec!["/bin/sh".into(), "-c".into(), ":".into()],
+            cwd: None,
+            environment: BTreeMap::new(),
+            success_codes: vec![0],
+        };
+
+        let result = reconcile_with(scope.path(), 2, false, |capability, _| {
+            assert_eq!(capability, Capability::ExecutionEnsure);
+            let output = provider::capture_plan(&plan, scope.path(), Duration::from_secs(1))?;
+            Ok(ActionOutput {
+                provider: "fake".into(),
+                value: parse_action_observation(&output)?,
+            })
+        })
+        .unwrap();
+
+        assert_eq!(result.actions.len(), 1);
+        assert!(
+            result.actions[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("returned no observation"))
+        );
+        assert_eq!(
+            list(scope.path(), Some(ResourceKind::Execution), Some("build")).unwrap()[0]
+                .status
+                .phase,
+            "Failed"
+        );
+    }
+
+    #[test]
     fn reconcile_is_level_ordered_and_idempotent() {
         let scope = scope();
         apply(
@@ -2112,6 +2311,98 @@ mod tests {
                 .status
                 .phase,
             "Succeeded"
+        );
+    }
+
+    #[test]
+    fn referenced_workflow_cannot_be_deleted() {
+        let scope = scope();
+        apply(
+            scope.path(),
+            vec![
+                resource(ResourceKind::Workflow, "release", json!({"stages": []})),
+                resource(
+                    ResourceKind::Run,
+                    "release-1",
+                    json!({"workflowRef": "release"}),
+                ),
+            ],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+
+        let error = delete(scope.path(), ResourceKind::Workflow, "release", false).unwrap_err();
+
+        assert!(error.to_string().contains("referenced by runs/release-1"));
+        assert!(list(scope.path(), Some(ResourceKind::Workflow), Some("release")).is_ok());
+    }
+
+    #[test]
+    fn run_deletion_stops_and_removes_owned_executions() {
+        let scope = scope();
+        apply(
+            scope.path(),
+            vec![
+                resource(
+                    ResourceKind::Workflow,
+                    "release",
+                    json!({"stages": [{"name": "build"}]}),
+                ),
+                resource(
+                    ResourceKind::Run,
+                    "release-1",
+                    json!({"workflowRef": "release"}),
+                ),
+            ],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+        reconcile_with(scope.path(), 1, false, |capability, _| {
+            assert_eq!(capability, Capability::ExecutionEnsure);
+            Ok(ActionOutput {
+                provider: "fake".into(),
+                value: json!({"phase": "Running"}),
+            })
+        })
+        .unwrap();
+
+        delete(scope.path(), ResourceKind::Run, "release-1", false).unwrap();
+
+        let run = list(scope.path(), Some(ResourceKind::Run), Some("release-1"))
+            .unwrap()
+            .remove(0);
+        let execution = list(
+            scope.path(),
+            Some(ResourceKind::Execution),
+            Some("release-1-build"),
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(run.spec["desiredState"], "cancelled");
+        assert_eq!(execution.spec["desiredState"], "cancelled");
+
+        let result = reconcile_with(scope.path(), 4, false, |capability, _| {
+            assert_eq!(capability, Capability::ExecutionCancel);
+            Ok(ActionOutput {
+                provider: "fake".into(),
+                value: json!({"phase": "Cancelled"}),
+            })
+        })
+        .unwrap();
+
+        assert_eq!(result.actions.len(), 1);
+        assert!(list(scope.path(), Some(ResourceKind::Run), Some("release-1")).is_err());
+        assert!(
+            list(
+                scope.path(),
+                Some(ResourceKind::Execution),
+                Some("release-1-build")
+            )
+            .is_err()
         );
     }
 
@@ -2583,6 +2874,38 @@ mod tests {
         assert_eq!(second.actions.len(), 1);
         assert_eq!(operation_ids.len(), 2);
         assert_eq!(operation_ids[0], operation_ids[1]);
+    }
+
+    #[test]
+    fn failed_event_bindings_do_not_deliver_each_others_failures() {
+        let scope = scope();
+        apply(
+            scope.path(),
+            vec![
+                resource(ResourceKind::EventBinding, "first", json!({})),
+                resource(ResourceKind::EventBinding, "second", json!({})),
+                resource(
+                    ResourceKind::Workflow,
+                    "build",
+                    json!({"goal": "ship", "stages": []}),
+                ),
+            ],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+
+        let result = reconcile_with(scope.path(), 8, false, |capability, request| {
+            assert_eq!(capability, Capability::EventDeliver);
+            assert_ne!(request["event"]["reason"], "EventDeliveryFailed");
+            Err(anyhow::anyhow!("hook unavailable"))
+        })
+        .unwrap();
+
+        assert_eq!(result.passes, 2);
+        assert_eq!(result.actions.len(), 4);
+        assert_eq!(events(scope.path(), None, None, 0).unwrap().len(), 7);
     }
 
     #[test]
