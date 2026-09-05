@@ -622,14 +622,33 @@ fn validate_workflow_spec(
             validate_string_array(stage, "dependsOn", &stage_context)?,
         ));
     }
-    for (stage, stage_dependencies) in dependencies {
+    for (stage, stage_dependencies) in &dependencies {
         for dependency in stage_dependencies {
             if dependency == stage {
                 bail!("{context} stage {stage} cannot depend on itself");
             }
-            if !names.contains(&dependency) {
+            if !names.contains(dependency) {
                 bail!("{context} stage {stage} depends on missing stage {dependency}");
             }
+        }
+    }
+    let mut remaining = dependencies
+        .into_iter()
+        .map(|(stage, dependencies)| (stage, dependencies.into_iter().collect::<BTreeSet<_>>()))
+        .collect::<BTreeMap<_, _>>();
+    let mut resolved = BTreeSet::new();
+    while !remaining.is_empty() {
+        let ready = remaining
+            .iter()
+            .filter(|(_, dependencies)| dependencies.is_subset(&resolved))
+            .map(|(stage, _)| stage.clone())
+            .collect::<Vec<_>>();
+        if ready.is_empty() {
+            bail!("{context} stage dependency graph contains a cycle");
+        }
+        for stage in ready {
+            remaining.remove(&stage);
+            resolved.insert(stage);
         }
     }
     Ok(())
@@ -694,19 +713,20 @@ fn flatten(value: &Value, prefix: &str, output: &mut BTreeMap<String, Value>) {
     }
 }
 
-fn changed_paths(old: Option<&Resource>, incoming: &Resource) -> Vec<String> {
-    let mut before = BTreeMap::new();
-    let mut after = BTreeMap::new();
-    if let Some(old) = old {
-        flatten(&old.spec, "spec", &mut before);
-        flatten(&json!(old.metadata.labels), "metadata.labels", &mut before);
-    }
-    flatten(&incoming.spec, "spec", &mut after);
+fn managed_fields(resource: &Resource) -> BTreeMap<String, Value> {
+    let mut fields = BTreeMap::new();
+    flatten(&resource.spec, "spec", &mut fields);
     flatten(
-        &json!(incoming.metadata.labels),
+        &json!(resource.metadata.labels),
         "metadata.labels",
-        &mut after,
+        &mut fields,
     );
+    fields
+}
+
+fn changed_paths(old: Option<&Resource>, incoming: &Resource) -> Vec<String> {
+    let before = old.map(managed_fields).unwrap_or_default();
+    let after = managed_fields(incoming);
     before
         .keys()
         .chain(after.keys())
@@ -765,6 +785,10 @@ pub fn apply(
             let key = incoming.key();
             let current = store.resource(&key).cloned();
             let paths = changed_paths(current.as_ref(), &incoming);
+            let incoming_fields = managed_fields(&incoming);
+            let spec_changed = paths
+                .iter()
+                .any(|path| path == "spec" || path.starts_with("spec."));
             for path in &paths {
                 if let Some(owner) = current
                     .as_ref()
@@ -790,9 +814,9 @@ pub fn apply(
                     .map(|resource| resource.metadata.uid.clone())
                     .filter(|uid| !uid.is_empty())
                     .unwrap_or_else(|| Uuid::new_v4().to_string());
-                incoming.metadata.generation = current
-                    .as_ref()
-                    .map_or(1, |resource| resource.metadata.generation + 1);
+                incoming.metadata.generation = current.as_ref().map_or(1, |resource| {
+                    resource.metadata.generation + u64::from(spec_changed)
+                });
                 incoming.metadata.resource_version = store.resource_version;
                 incoming.metadata.created_at = current
                     .as_ref()
@@ -801,14 +825,21 @@ pub fn apply(
                 if let Some(current) = current {
                     incoming.metadata.field_owners = current.metadata.field_owners;
                     incoming.status = current.status;
+                    if spec_changed {
+                        incoming.status.outputs.clear();
+                    }
                 } else {
                     incoming.status = ResourceStatus::default();
                 }
                 for path in &paths {
-                    incoming
-                        .metadata
-                        .field_owners
-                        .insert(path.clone(), field_manager.into());
+                    if incoming_fields.contains_key(path) {
+                        incoming
+                            .metadata
+                            .field_owners
+                            .insert(path.clone(), field_manager.into());
+                    } else {
+                        incoming.metadata.field_owners.remove(path);
+                    }
                 }
                 if let Some((body, reference)) = artifact {
                     store
@@ -1443,6 +1474,7 @@ fn reconcile_runs(store: &mut ControlStore) -> Result<bool> {
                     execution.metadata.generation += 1;
                     execution.metadata.resource_version = resource_version;
                     execution.metadata.updated_at = Utc::now();
+                    execution.status.outputs.clear();
                     store.emit(
                         "Normal",
                         "Configured",
@@ -1614,6 +1646,7 @@ fn apply_action_output(
 ) -> Result<bool> {
     let resource = store.resource_mut(key).context("resource disappeared")?;
     let before = resource.status.clone();
+    let replace_outputs = capability == Capability::ExecutionEnsure;
     resource.status.provider = Some(output.provider);
     resource.status.observed_generation = resource.metadata.generation;
     resource.status.phase = output
@@ -1660,7 +1693,11 @@ fn apply_action_output(
         stored_outputs.push((name, reference));
     }
     let resource = store.resource_mut(key).context("resource disappeared")?;
-    resource.status.outputs.extend(stored_outputs);
+    if replace_outputs {
+        resource.status.outputs = stored_outputs.into_iter().collect();
+    } else {
+        resource.status.outputs.extend(stored_outputs);
+    }
     Ok(resource.status != before)
 }
 
@@ -1748,8 +1785,30 @@ fn reconcile_with(
                 if !attempted.insert((key.clone(), capability)) {
                     continue;
                 }
-                let request = provider_request(store, &scope, &resource, capability, None)?;
                 let operation_id = operation_id(&resource, capability);
+                let request = match provider_request(store, &scope, &resource, capability, None) {
+                    Ok(request) => request,
+                    Err(error) if dry_run => return Err(error),
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        let resource = store.resource_mut(&key).context("resource disappeared")?;
+                        resource.status.phase = "Failed".into();
+                        resource.status.observed_generation = resource.metadata.generation;
+                        resource.status.message = Some(message.clone());
+                        store.emit("Warning", "ReconcileFailed", key.clone(), message.clone());
+                        actions.push(ProviderAction {
+                            operation_id,
+                            capability,
+                            resource: key,
+                            provider: None,
+                            changed: true,
+                            error: Some(message),
+                        });
+                        changed = true;
+                        write_store(&scope, store)?;
+                        continue;
+                    }
+                };
                 if dry_run {
                     actions.push(ProviderAction {
                         operation_id,
@@ -1803,6 +1862,7 @@ fn reconcile_with(
                         changed = true;
                     }
                 }
+                write_store(&scope, store)?;
             }
             if !dry_run {
                 changed |= deliver_events(
@@ -1914,6 +1974,7 @@ fn deliver_events(
                     });
                 }
             }
+            write_store(scope, store)?;
             changed = true;
         }
     }
@@ -2013,6 +2074,28 @@ mod tests {
         assert!(!control_path(scope.path()).exists());
     }
 
+    #[test]
+    fn workflow_dependency_cycles_are_rejected_before_state_changes() {
+        let scope = scope();
+        let invalid = resource(
+            ResourceKind::Workflow,
+            "build",
+            json!({"stages": [
+                {"name": "compile", "dependsOn": ["verify"]},
+                {"name": "verify", "dependsOn": ["compile"]}
+            ]}),
+        );
+
+        let error = apply(scope.path(), vec![invalid], "test", false, false).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("dependency graph contains a cycle")
+        );
+        assert!(!control_path(scope.path()).exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn control_state_remains_private_across_atomic_replacement() {
@@ -2086,6 +2169,54 @@ mod tests {
         assert_eq!(
             list(scope.path(), Some(ResourceKind::Workflow), Some("build")).unwrap()[0].spec["goal"],
             "one"
+        );
+    }
+
+    #[test]
+    fn removing_an_owned_field_releases_its_ownership() {
+        let scope = scope();
+        let execution = |provider: Option<&str>| {
+            let mut spec = json!({"desiredState": "running"});
+            if let Some(provider) = provider {
+                spec["provider"] = Value::String(provider.into());
+            }
+            resource(ResourceKind::Execution, "build", spec)
+        };
+        apply(
+            scope.path(),
+            vec![execution(Some("local"))],
+            "first",
+            false,
+            false,
+        )
+        .unwrap();
+        apply(scope.path(), vec![execution(None)], "first", false, false).unwrap();
+
+        let without_provider = list(scope.path(), Some(ResourceKind::Execution), Some("build"))
+            .unwrap()
+            .remove(0);
+        assert!(
+            !without_provider
+                .metadata
+                .field_owners
+                .contains_key("spec.provider")
+        );
+
+        apply(
+            scope.path(),
+            vec![execution(Some("remote"))],
+            "second",
+            false,
+            false,
+        )
+        .unwrap();
+        let with_provider = list(scope.path(), Some(ResourceKind::Execution), Some("build"))
+            .unwrap()
+            .remove(0);
+        assert_eq!(with_provider.spec["provider"], "remote");
+        assert_eq!(
+            with_provider.metadata.field_owners["spec.provider"],
+            "second"
         );
     }
 
@@ -2208,6 +2339,98 @@ mod tests {
     }
 
     #[test]
+    fn metadata_only_changes_do_not_rerun_an_execution() {
+        let scope = scope();
+        let mut execution = resource(
+            ResourceKind::Execution,
+            "build",
+            json!({"desiredState": "running"}),
+        );
+        apply(scope.path(), vec![execution.clone()], "test", false, false).unwrap();
+        reconcile_with(scope.path(), 2, false, |_, _| {
+            Ok(ActionOutput {
+                provider: "fake".into(),
+                value: json!({"phase": "Succeeded"}),
+            })
+        })
+        .unwrap();
+        let before = list(scope.path(), Some(ResourceKind::Execution), Some("build"))
+            .unwrap()
+            .remove(0);
+
+        execution
+            .metadata
+            .labels
+            .insert("team".into(), "infra".into());
+        apply(scope.path(), vec![execution], "test", false, false).unwrap();
+        let after = list(scope.path(), Some(ResourceKind::Execution), Some("build"))
+            .unwrap()
+            .remove(0);
+        let result = reconcile_with(scope.path(), 2, false, |_, _| {
+            panic!("metadata-only changes must not invoke providers")
+        })
+        .unwrap();
+
+        assert_eq!(after.metadata.generation, before.metadata.generation);
+        assert_eq!(
+            after.status.observed_generation,
+            before.status.observed_generation
+        );
+        assert_eq!(after.status.phase, "Succeeded");
+        assert!(result.actions.is_empty());
+    }
+
+    #[test]
+    fn a_new_generation_replaces_old_outputs() {
+        let scope = scope();
+        let execution = |provider: Option<&str>| {
+            let mut spec = json!({"desiredState": "running"});
+            if let Some(provider) = provider {
+                spec["provider"] = Value::String(provider.into());
+            }
+            resource(ResourceKind::Execution, "build", spec)
+        };
+        apply(scope.path(), vec![execution(None)], "test", false, false).unwrap();
+        reconcile_with(scope.path(), 2, false, |_, _| {
+            Ok(ActionOutput {
+                provider: "fake".into(),
+                value: json!({"phase": "Succeeded", "outputs": {
+                    "old": "stale",
+                    "shared": "first"
+                }}),
+            })
+        })
+        .unwrap();
+
+        apply(
+            scope.path(),
+            vec![execution(Some("remote"))],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+        let pending = list(scope.path(), Some(ResourceKind::Execution), Some("build"))
+            .unwrap()
+            .remove(0);
+        assert!(pending.status.outputs.is_empty());
+
+        reconcile_with(scope.path(), 2, false, |_, _| {
+            Ok(ActionOutput {
+                provider: "fake".into(),
+                value: json!({"phase": "Succeeded", "outputs": {"shared": "second"}}),
+            })
+        })
+        .unwrap();
+        let completed = list(scope.path(), Some(ResourceKind::Execution), Some("build"))
+            .unwrap()
+            .remove(0);
+        assert_eq!(completed.status.outputs.len(), 1);
+        assert!(completed.status.outputs.contains_key("shared"));
+        assert!(!completed.status.outputs.contains_key("old"));
+    }
+
+    #[test]
     fn reconcile_is_level_ordered_and_idempotent() {
         let scope = scope();
         apply(
@@ -2312,6 +2535,82 @@ mod tests {
                 .phase,
             "Succeeded"
         );
+    }
+
+    #[test]
+    fn later_input_failure_does_not_replay_completed_provider_work() {
+        let scope = scope();
+        apply(
+            scope.path(),
+            vec![
+                resource(
+                    ResourceKind::Workflow,
+                    "release",
+                    json!({"stages": [
+                        {"name": "produce"},
+                        {
+                            "name": "consume",
+                            "dependsOn": ["produce"],
+                            "inputs": {
+                                "result": {
+                                    "executionRef": "release-1-produce",
+                                    "output": "result"
+                                }
+                            }
+                        }
+                    ]}),
+                ),
+                resource(
+                    ResourceKind::Run,
+                    "release-1",
+                    json!({"workflowRef": "release"}),
+                ),
+            ],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
+        let mut invocations = 0;
+
+        let first = reconcile_with(scope.path(), 4, false, |capability, request| {
+            assert_eq!(capability, Capability::ExecutionEnsure);
+            assert_eq!(request["resource"]["metadata"]["name"], "release-1-produce");
+            invocations += 1;
+            Ok(ActionOutput {
+                provider: "fake".into(),
+                value: json!({"phase": "Succeeded"}),
+            })
+        })
+        .unwrap();
+
+        assert_eq!(invocations, 1);
+        assert_eq!(first.actions.len(), 2);
+        assert!(
+            first.actions[1]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("has no output result"))
+        );
+        assert_eq!(
+            list(
+                scope.path(),
+                Some(ResourceKind::Execution),
+                Some("release-1-produce")
+            )
+            .unwrap()[0]
+                .status
+                .phase,
+            "Succeeded"
+        );
+
+        let retry = reconcile_with(scope.path(), 2, false, |_, _| {
+            panic!("completed provider work must not replay")
+        })
+        .unwrap();
+        assert_eq!(invocations, 1);
+        assert_eq!(retry.actions.len(), 1);
+        assert!(retry.actions[0].error.is_some());
     }
 
     #[test]
