@@ -168,7 +168,7 @@ def matching_zmx_record(records: str, name: str, pid: int, created: str) -> bool
 
 def inspect_identity(name: str, pid: int, created: str) -> float:
     try:
-        expected_created = float(created)
+        expected_created = int(created)
     except ValueError as error:
         raise StopError(f"invalid Zmx creation time: {created}") from error
     try:
@@ -179,7 +179,8 @@ def inspect_identity(name: str, pid: int, created: str) -> float:
         raise StopError(f"Zmx leader {pid} is missing while its record is active") from error
     except (psutil.AccessDenied, psutil.Error) as error:
         raise StopError(f"cannot establish identity for Zmx leader {pid}: {error}") from error
-    if int(process_created) != int(expected_created):
+    # Zmx timestamps precede the PTY fork, so crossing a wall-clock second is valid.
+    if int(process_created) not in {expected_created, expected_created + 1}:
         raise StopError(f"Zmx leader {pid} has an ambiguous creation identity")
     if session_name != name:
         raise StopError(f"Zmx leader {pid} does not advertise session {name}")

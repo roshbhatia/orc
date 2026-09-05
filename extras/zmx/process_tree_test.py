@@ -53,6 +53,22 @@ class StopTreeTest(unittest.TestCase):
     def record(self) -> str:
         return f"name=resume-test\tpid={self.child.pid}\tcreated={self.created}\n"
 
+    def test_creation_second_boundary_is_valid(self) -> None:
+        process = mock.Mock()
+        process.create_time.return_value = 101.25
+        process.environ.return_value = {"ZMX_SESSION": "resume-test"}
+        with mock.patch.object(PROCESS_TREE.psutil, "Process", return_value=process):
+            identity = PROCESS_TREE.inspect_identity("resume-test", 42, "100")
+        self.assertEqual(101.25, identity)
+
+    def test_creation_outside_boundary_is_rejected(self) -> None:
+        process = mock.Mock()
+        process.create_time.return_value = 102.0
+        process.environ.return_value = {"ZMX_SESSION": "resume-test"}
+        with mock.patch.object(PROCESS_TREE.psutil, "Process", return_value=process):
+            with self.assertRaisesRegex(PROCESS_TREE.StopError, "ambiguous"):
+                PROCESS_TREE.inspect_identity("resume-test", 42, "100")
+
     def test_precise_identity_mismatch_signals_nothing(self) -> None:
         with mock.patch.object(PROCESS_TREE, "zmx_records", return_value=self.record()):
             with self.assertRaises(PROCESS_TREE.StopError):
