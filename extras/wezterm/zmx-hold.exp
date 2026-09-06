@@ -6,9 +6,9 @@ set zmx [lindex $argv 1]
 set bash [lindex $argv 2]
 set zmx_dir [lindex $argv 3]
 set session_name [lindex $argv 4]
-set message "Command exited before an interactive session was ready. Press Enter to close."
+set message "Command exited with 0. Press Enter to close."
 
-spawn -noecho env ZMX_DIR=$zmx_dir ZMX_SESSION_PREFIX= $provider hold $zmx attach $session_name $bash -c {sleep 1.5; exit 0}
+spawn -noecho env ZMX_DIR=$zmx_dir ZMX_SESSION_PREFIX= $provider hold $zmx attach $session_name $bash -c {sleep 2.5; exit 0}
 expect -exact $message
 
 set sessions [exec env ZMX_DIR=$zmx_dir $zmx list 2>@1]

@@ -258,7 +258,6 @@
             '';
           weztermEnvironment =
             let
-              controlledSleep = pkgs.writeShellScriptBin "sleep" (builtins.readFile ./wezterm/watchdog-sleep.sh);
               fakeWezterm = pkgs.writeShellScriptBin "wezterm" ''
                 exit 0
               '';
@@ -280,7 +279,6 @@
                 export ORC_PROVIDER_WEZTERM_EXPECT=${./wezterm/hold.exp}
                 export ORC_PROVIDER_WEZTERM_PACKAGED=${providerPackages.wezterm.adapter}/bin/orc-provider-wezterm
                 export ORC_PROVIDER_WEZTERM_PACKAGED_EXPECT=${./wezterm/packaged-hold.exp}
-                export ORC_PROVIDER_WEZTERM_CONTROLLED_PATH=${controlledSleep}/bin
                 export ORC_PROVIDER_WEZTERM_REAL_SLEEP=${lib.getExe' pkgs.coreutils "sleep"}
                 bash ${./wezterm/test.sh}
                 touch "$out"

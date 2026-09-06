@@ -6,7 +6,6 @@ provider_library=${ORC_PROVIDER_LIB:?}
 expect_script=${ORC_PROVIDER_WEZTERM_EXPECT:?}
 packaged_expect_script=${ORC_PROVIDER_WEZTERM_PACKAGED_EXPECT:?}
 packaged_provider=${ORC_PROVIDER_WEZTERM_PACKAGED:?}
-controlled_path=${ORC_PROVIDER_WEZTERM_CONTROLLED_PATH:?}
 real_sleep=${ORC_PROVIDER_WEZTERM_REAL_SLEEP:?}
 test_scope=${TMPDIR:?}/wezterm-provider-test
 mkdir -p "$test_scope"
@@ -78,7 +77,7 @@ jq -e '
 ' "$test_scope/outside.json" > /dev/null
 
 printf '\n' | bash "$provider_script" hold true > "$test_scope/short-success.txt"
-grep -Fq 'Command exited before an interactive session was ready. Press Enter to close.' \
+grep -Fq 'Command exited with 0. Press Enter to close.' \
   "$test_scope/short-success.txt"
 
 bash "$provider_script" hold false < /dev/null > "$test_scope/noninteractive-failure.txt" 2>&1 ||
@@ -118,19 +117,15 @@ wait "$provider_process"
 [[ $noninteractive_blocked == false ]]
 test "$(< "$pipe_scope/code")" -eq 1
 
-expect "$expect_script" "$provider_script" failure 0 "$controlled_path" "$real_sleep"
-expect "$expect_script" "$provider_script" short-success 0 "$controlled_path" "$real_sleep"
-
-for duration in 1.1 1.5 1.9; do
-  for _ in 1 2 3; do
-    expect "$expect_script" "$provider_script" success-hold "$duration" "$controlled_path" "$real_sleep"
+for duration in 0.1 2.5; do
+  for status in 0 19; do
+    for _ in 1 2 3; do
+      expect "$expect_script" "$provider_script" hold "$status" "$duration" "$real_sleep"
+    done
   done
 done
-expect "$expect_script" "$provider_script" success-close 2.1 "$controlled_path" "$real_sleep"
-expect "$expect_script" "$provider_script" failure-hold-running 0.1 "$controlled_path" "$real_sleep"
-expect "$expect_script" "$provider_script" failure-hold-expired 2.1 "$controlled_path" "$real_sleep"
-expect "$expect_script" "$provider_script" real-success-hold 0.5 "$controlled_path" "$real_sleep"
-expect "$expect_script" "$provider_script" real-success-close 3 "$controlled_path" "$real_sleep"
+expect "$expect_script" "$provider_script" run 0 0.1 "$real_sleep"
+expect "$expect_script" "$provider_script" run 19 0.1 "$real_sleep"
 
 set +e
 printf '\n' | bash "$provider_script" hold false > "$test_scope/failure.txt"

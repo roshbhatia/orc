@@ -288,16 +288,21 @@ Each provider advertises one kind and a set of capabilities:
 # yaml-language-server: $schema=https://raw.githubusercontent.com/roshbhatia/orc/main/schema/provider.schema.json
 version: orc.provider/v1
 name: wezterm
-description: Open provider command plans in a WezTerm pane
+description: Open command plans in a WezTerm pane and keep exit results visible
 kind: display
 command: /path/to/orc-provider-wezterm
 actions:
   provider.validate: Validate the adapter and its dependencies
   session.bind: Detect the current WezTerm pane
-  terminal.open: Open a command in a split pane
+  terminal.open: Open a command in a split pane and hold its exit result
   terminal.focus: Focus an existing pane
 priority: 100
 ```
+
+The WezTerm adapter uses `hold` for `terminal.open`. It always shows the child
+exit status and waits for Enter, even when the child succeeds or runs for a
+long time. Its separate `run` helper exits with the child without holding the
+pane. Duration never decides whether an exit result stays visible.
 
 The manifest is the language-neutral shim. Its `actions` map advertises what
 the provider does. The command can use Bash, TypeScript, Go, Rust, or any other

@@ -3,7 +3,7 @@ set timeout 5
 
 set environment [lindex $argv 0]
 set provider [lindex $argv 1]
-set message "Command exited before an interactive session was ready. Press Enter to close."
+set message "Command exited with 0. Press Enter to close."
 
 spawn -noecho $environment PATH=/nonexistent $provider hold true
 expect -exact $message

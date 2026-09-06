@@ -12,42 +12,28 @@ wait_for_close() {
   fi
 }
 
-stop_hold_watchdog() {
-  if [[ -n ${hold_watchdog:-} ]]; then
-    kill "$hold_watchdog" 2> /dev/null || true
-    wait "$hold_watchdog" 2> /dev/null || true
-    hold_watchdog=
-  fi
-}
-
 if [[ ${1:-} == hold ]]; then
   shift
-  hold_watchdog=
-  trap stop_hold_watchdog EXIT
-  sleep 2 &
-  hold_watchdog=$!
+  if (($# == 0)); then
+    printf 'orc-provider-wezterm: hold requires a command\n' >&2
+    exit 2
+  fi
   set +e
   "$@"
   code=$?
   set -e
-  mapfile -t running_jobs < <(jobs -pr)
-  exited_quickly=false
-  for running_job in "${running_jobs[@]}"; do
-    if [[ $running_job == "$hold_watchdog" ]]; then
-      exited_quickly=true
-      break
-    fi
-  done
-  stop_hold_watchdog
-  trap - EXIT
-  if ((code != 0)); then
-    printf '\nCommand exited with %s. Press Enter to close.\n' "$code"
-    wait_for_close
-  elif [[ $exited_quickly == true ]]; then
-    printf '\nCommand exited before an interactive session was ready. Press Enter to close.\n'
-    wait_for_close
-  fi
+  printf '\nCommand exited with %s. Press Enter to close.\n' "$code"
+  wait_for_close
   exit "$code"
+fi
+
+if [[ ${1:-} == run ]]; then
+  shift
+  if (($# == 0)); then
+    printf 'orc-provider-wezterm: run requires a command\n' >&2
+    exit 2
+  fi
+  exec "$@"
 fi
 
 provider_init "wezterm"
