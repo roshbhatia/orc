@@ -27,7 +27,7 @@ use crate::{
 };
 
 const MAX_NODE_OUTPUT_BYTES: usize = 1024 * 1024;
-const CURRENT_BIND_PROVIDER_TIMEOUT_MS: u64 = 500;
+const CURRENT_BIND_PROVIDER_TIMEOUT_MS: u64 = 1_500;
 
 #[derive(Debug, Error)]
 #[error("no matching active session")]
@@ -2530,6 +2530,7 @@ esac
     const CURRENT_BIND_PROVIDER: &str = r#"#!/bin/sh
 request=$(cat)
 if printf '%s' "$request" | jq -e '.rebindCurrent == true and .currentSessionId == .session.id' >/dev/null; then
+    sleep 1
     cat <<'JSON'
 {"version":"orc.provider/v1","binding":{"kind":"display","status":"active","ref":"pane-7"}}
 JSON
@@ -3027,7 +3028,7 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
 
     #[cfg(unix)]
     #[test]
-    fn current_registration_can_request_a_bounded_provider_binding() {
+    fn current_registration_binding_allows_bounded_cold_start() {
         let directory = tempfile::tempdir().expect("binding fixture");
         let scope_directory = directory.path().join("scope");
         let provider_directory = directory.path().join("providers");
