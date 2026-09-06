@@ -172,6 +172,15 @@
       ],
       "type": "string"
     },
+    "ReportedOutput": {
+      "properties": {
+        "value": true
+      },
+      "required": [
+        "value"
+      ],
+      "type": "object"
+    },
     "RunMode": {
       "enum": [
         "foreground",
@@ -259,6 +268,16 @@
         },
         "registration": {
           "$ref": "#/$defs/RegistrationSource"
+        },
+        "reportedOutput": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReportedOutput"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "reviewBy": {
           "type": [

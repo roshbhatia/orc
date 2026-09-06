@@ -20,13 +20,14 @@ use crate::{
     daemon,
     domain::{
         AgentConfig, BindingStatus, CompletionTarget, JudgePolicy, LifecycleStatus,
-        LifecycleSubject, ProviderBinding, ProviderKind, RegistrationSource, Session, SessionRole,
-        WorkflowEdge, WorkflowNode, WorkflowRun, WorkspaceState,
+        LifecycleSubject, ProviderBinding, ProviderKind, RegistrationSource, ReportedOutput,
+        Session, SessionOutputReceipt, SessionOutputStatus, SessionRole, WorkflowEdge,
+        WorkflowNode, WorkflowRun, WorkspaceState,
     },
     provider, state,
 };
 
-const MAX_NODE_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const CURRENT_BIND_PROVIDER_TIMEOUT_MS: u64 = 1_500;
 
 #[derive(Debug, Error)]
@@ -567,6 +568,9 @@ fn register_for_caller(
                 || contract.expected_output.clone(),
                 |session| session.expected_output.clone(),
             ),
+            reported_output: current
+                .as_ref()
+                .and_then(|session| session.reported_output.clone()),
             success_criteria: governed.map_or_else(
                 || contract.success_criteria.clone(),
                 |session| session.success_criteria.clone(),
@@ -748,6 +752,7 @@ pub fn adopt(scope: &Path, mut contract: Contract, native_id: Option<String>) ->
             purpose: contract.purpose.clone(),
             goal: contract.goal.clone(),
             expected_output: contract.expected_output.clone(),
+            reported_output: None,
             success_criteria: contract.success_criteria.clone(),
             completion: contract.completion,
             review_by: contract.review_by.clone(),
@@ -1947,6 +1952,43 @@ pub fn update_node(
     })
 }
 
+pub fn report_session_output(
+    scope: &Path,
+    session_id: &str,
+    output: serde_json::Value,
+) -> Result<SessionOutputReceipt> {
+    let input_bytes = serde_json::to_vec(&output)?.len();
+    if input_bytes > MAX_OUTPUT_BYTES {
+        bail!("session output exceeds {MAX_OUTPUT_BYTES} bytes");
+    }
+    let scope = state::resolve_scope(scope)?;
+    state::update(&scope, |workspace| {
+        if !workspace.active {
+            bail!("Orc scope is idle");
+        }
+        let session = workspace
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .with_context(|| format!("unknown session: {session_id}"))?;
+        if session.role != SessionRole::Orchestrator
+            || !session.status.active()
+            || session.status == LifecycleStatus::Terminating
+        {
+            bail!("session is not authorized to report orchestrator output: {session_id}");
+        }
+        session.reported_output = Some(ReportedOutput { value: output });
+        session.updated_at = Utc::now();
+        Ok(SessionOutputReceipt {
+            status: SessionOutputStatus::Reported,
+            input_bytes,
+            updated_at: session
+                .updated_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        })
+    })
+}
+
 pub fn report_node(
     scope: &Path,
     run_id: &str,
@@ -1956,9 +1998,9 @@ pub fn report_node(
 ) -> Result<WorkflowNode> {
     let scope = state::resolve_scope(scope)?;
     if let Some(output) = report.output.as_ref()
-        && serde_json::to_vec(output)?.len() > MAX_NODE_OUTPUT_BYTES
+        && serde_json::to_vec(output)?.len() > MAX_OUTPUT_BYTES
     {
-        bail!("workflow node output exceeds {MAX_NODE_OUTPUT_BYTES} bytes");
+        bail!("workflow node output exceeds {MAX_OUTPUT_BYTES} bytes");
     }
     state::update(&scope, |workspace| {
         let reporting = if let Some(session_id) = reporting_session_id {
@@ -2654,6 +2696,7 @@ actions:
             purpose: "test".into(),
             goal: "Complete the assigned work".into(),
             expected_output: "test".into(),
+            reported_output: None,
             success_criteria: Vec::new(),
             completion: CompletionTarget::Orchestrator,
             review_by: None,
@@ -3912,6 +3955,261 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
                 .status,
             LifecycleStatus::Working
         );
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn orchestrator_output_replaces_one_persisted_value() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let session = register(
+            &scope,
+            Contract {
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("root-native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("register orchestrator");
+
+        report_session_output(&scope, &session.id, serde_json::json!({"first": true}))
+            .expect("report first output");
+        let boundary = serde_json::Value::String("x".repeat(MAX_OUTPUT_BYTES - 2));
+        assert_eq!(
+            serde_json::to_vec(&boundary)
+                .expect("serialize boundary output")
+                .len(),
+            MAX_OUTPUT_BYTES
+        );
+        report_session_output(&scope, &session.id, boundary).expect("report boundary output");
+        let receipt = report_session_output(&scope, &session.id, serde_json::Value::Null)
+            .expect("replace output");
+        let restored = read_workspace(&scope).expect("workspace");
+
+        assert_eq!(receipt.status, SessionOutputStatus::Reported);
+        assert_eq!(receipt.input_bytes, 4);
+        assert_eq!(receipt.updated_at.len(), 24);
+        assert!(receipt.updated_at.ends_with('Z'));
+        assert_eq!(
+            serde_json::to_value(&receipt).expect("serialize receipt"),
+            serde_json::json!({
+                "status": "reported",
+                "inputBytes": 4,
+                "updatedAt": receipt.updated_at,
+            })
+        );
+        assert_eq!(
+            selected_session(&restored, &session.id)
+                .expect("persisted session")
+                .reported_output,
+            Some(ReportedOutput {
+                value: serde_json::Value::Null
+            })
+        );
+        assert!(
+            selected_session(&restored, &session.id)
+                .expect("persisted session")
+                .updated_at
+                >= session.updated_at
+        );
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn rejected_session_outputs_leave_workspace_unchanged() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let root = register(
+            &scope,
+            Contract {
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("root-native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("register orchestrator");
+        let worker = register(
+            &scope,
+            Contract::default(),
+            SessionLink {
+                native_id: Some("worker-native".into()),
+                parent_id: Some(root.id.clone()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("register worker");
+
+        for (id, output) in [
+            (
+                worker.id.as_str(),
+                serde_json::json!({"unauthorized": true}),
+            ),
+            (
+                root.id.as_str(),
+                serde_json::Value::String("x".repeat(MAX_OUTPUT_BYTES)),
+            ),
+        ] {
+            let before = read_workspace(&scope).expect("workspace before rejection");
+            report_session_output(&scope, id, output).expect_err("reject report");
+            assert_eq!(
+                read_workspace(&scope).expect("workspace after rejection"),
+                before
+            );
+        }
+
+        state::update(&scope, |workspace| {
+            let root = workspace
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == root.id)
+                .expect("root session");
+            root.status = LifecycleStatus::Terminating;
+            Ok(())
+        })
+        .expect("mark terminating");
+        let before = read_workspace(&scope).expect("terminating workspace");
+        report_session_output(&scope, &root.id, serde_json::json!({"late": true}))
+            .expect_err("reject terminating report");
+        assert_eq!(read_workspace(&scope).expect("unchanged workspace"), before);
+
+        state::update(&scope, |workspace| {
+            workspace
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == root.id)
+                .expect("root session")
+                .status = LifecycleStatus::Archived;
+            Ok(())
+        })
+        .expect("archive root");
+        let before = read_workspace(&scope).expect("archived workspace");
+        report_session_output(&scope, &root.id, serde_json::json!({"later": true}))
+            .expect_err("reject archived report");
+        assert_eq!(read_workspace(&scope).expect("unchanged workspace"), before);
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn idle_workspace_rejects_output_without_rewriting_state() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let root = register(
+            &scope,
+            Contract {
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("root-native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("register orchestrator");
+        let path = state::path(&scope);
+        let mut persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read workspace before making it idle"))
+                .expect("parse workspace");
+        persisted["active"] = serde_json::Value::Bool(false);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&persisted).expect("serialize idle workspace"),
+        )
+        .expect("write idle workspace");
+        let before = fs::read(&path).expect("read idle workspace");
+
+        let error = report_session_output(&scope, &root.id, serde_json::json!({"late": true}))
+            .expect_err("reject idle workspace report");
+
+        assert!(error.to_string().contains("scope is idle"));
+        assert_eq!(fs::read(&path).expect("read unchanged workspace"), before);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn same_session_changes_preserve_reported_output() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let root = register(
+            &scope,
+            Contract {
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("root-native".into()),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect("register orchestrator");
+        let output = ReportedOutput {
+            value: serde_json::json!({"result": "verified"}),
+        };
+        report_session_output(&scope, &root.id, output.value.clone()).expect("report output");
+
+        let reregistered = register(
+            &scope,
+            Contract {
+                harness: "replacement-harness".into(),
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("root-native".into()),
+                source: RegistrationSource::Managed,
+                ..SessionLink::default()
+            },
+        )
+        .expect("repeat registration");
+        let renewed = keepalive(&scope, &root.id).expect("renew idle lease");
+        let waiting = update_session(&scope, &root.id, LifecycleStatus::Waiting)
+            .expect("update lifecycle state");
+
+        assert_eq!(reregistered.reported_output, Some(output.clone()));
+        assert_eq!(renewed.reported_output, Some(output.clone()));
+        assert_eq!(waiting.reported_output, Some(output));
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn replacing_root_keeps_output_only_on_archived_reporter() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let root = register(
+            &scope,
+            Contract {
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("old-native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("register orchestrator");
+        let output = serde_json::json!({"owner": "old root"});
+        report_session_output(&scope, &root.id, output.clone()).expect("report output");
+
+        let replacement = adopt(&scope, Contract::default(), Some("new-native".into()))
+            .expect("replace orchestrator");
+        let workspace = read_workspace(&scope).expect("workspace");
+        let archived = selected_session(&workspace, &root.id).expect("archived reporter");
+
+        assert_eq!(archived.status, LifecycleStatus::Archived);
+        assert_eq!(
+            archived
+                .reported_output
+                .as_ref()
+                .map(|report| &report.value),
+            Some(&output)
+        );
+        assert_eq!(replacement.reported_output, None);
         let _ = std::fs::remove_file(state::path(&scope));
     }
 

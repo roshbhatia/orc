@@ -1171,6 +1171,7 @@ actions:
             purpose: "test".into(),
             goal: "test".into(),
             expected_output: "test".into(),
+            reported_output: None,
             success_criteria: Vec::new(),
             completion: CompletionTarget::Orchestrator,
             review_by: None,

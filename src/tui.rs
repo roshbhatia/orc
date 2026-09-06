@@ -4536,6 +4536,8 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &mut App) {
 
 const MAX_INSPECTOR_BYTES: usize = 128 * 1024;
 const MAX_INSPECTOR_LINES: usize = 2_000;
+const MAX_SESSION_OUTPUT_INSPECTOR_BYTES: usize = 64 * 1024;
+const MAX_SESSION_OUTPUT_INSPECTOR_LINES: usize = 1_000;
 
 fn bounded_inspector_body(body: &str) -> String {
     let line_start = body
@@ -4746,11 +4748,132 @@ fn selected_output(app: &App) -> String {
             .and_then(|node| node.output.as_ref())
             .and_then(|value| serde_json::to_string_pretty(value).ok())
             .unwrap_or_else(|| "No output for this step.".into()),
-        Some(ItemRef::Session(_)) => {
-            "No structured output has been reported for this agent.".into()
-        }
+        Some(ItemRef::Session(id)) => app
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+            .and_then(|session| session.reported_output.as_ref())
+            .map(|output| render_session_output(&output.value, &app.scope, &id))
+            .unwrap_or_else(|| "No structured output has been reported for this agent.".into()),
         _ => "Select a workflow step.".into(),
     }
+}
+
+struct JsonPreviewWriter {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    max_lines: usize,
+    newlines: usize,
+    truncated: bool,
+}
+
+impl JsonPreviewWriter {
+    fn new(max_bytes: usize, max_lines: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes),
+            max_bytes,
+            max_lines,
+            newlines: 0,
+            truncated: false,
+        }
+    }
+
+    fn into_string(mut self) -> String {
+        if let Err(error) = std::str::from_utf8(&self.bytes) {
+            self.bytes.truncate(error.valid_up_to());
+        }
+        String::from_utf8(self.bytes).expect("JSON preview is valid UTF-8")
+    }
+}
+
+impl io::Write for JsonPreviewWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if self.bytes.len() == self.max_bytes {
+            self.truncated = true;
+            return Err(io::Error::other("JSON preview limit reached"));
+        }
+        let remaining = self.max_bytes - self.bytes.len();
+        let mut accepted = buffer.len().min(remaining);
+        let remaining_newlines = self
+            .max_lines
+            .saturating_sub(1)
+            .saturating_sub(self.newlines);
+        if let Some((at, _)) = buffer
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == b'\n')
+            .nth(remaining_newlines)
+        {
+            accepted = accepted.min(at);
+        }
+        while accepted > 0 && std::str::from_utf8(&buffer[..accepted]).is_err() {
+            accepted -= 1;
+        }
+        if accepted == 0 {
+            self.truncated = true;
+            return Err(io::Error::other("JSON preview limit reached"));
+        }
+        self.newlines += buffer[..accepted]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        self.bytes.extend_from_slice(&buffer[..accepted]);
+        if accepted < buffer.len() {
+            self.truncated = true;
+        }
+        Ok(accepted)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn render_session_output(value: &serde_json::Value, scope: &Path, session_id: &str) -> String {
+    let mut writer = JsonPreviewWriter::new(
+        MAX_SESSION_OUTPUT_INSPECTOR_BYTES,
+        MAX_SESSION_OUTPUT_INSPECTOR_LINES,
+    );
+    let result = serde_json::to_writer_pretty(&mut writer, value);
+    let truncated = writer.truncated;
+    let output = writer.into_string();
+    if result.is_ok() && !truncated {
+        return output;
+    }
+
+    let exact_command = format!(
+        "orc session show --json --scope {} -- {}",
+        shell_quote(&scope.to_string_lossy()),
+        shell_quote(session_id)
+    );
+    let exact = format!(
+        "Output preview (first {} rendered bytes)\nFull value: {command}\n\n{}\n… output omitted",
+        output.len(),
+        output,
+        command = exact_command
+    );
+    if inspector_body_fits(&exact) {
+        return exact;
+    }
+    let list_command = format!(
+        "orc session list --json --scope {}",
+        shell_quote(&scope.to_string_lossy())
+    );
+    format!(
+        "Output preview (first {} rendered bytes)\nFull value: {command}\n\n{}\n… output omitted",
+        output.len(),
+        output,
+        command = list_command
+    )
+}
+
+fn inspector_body_fits(body: &str) -> bool {
+    body.len() < MAX_INSPECTOR_BYTES && body.matches('\n').count() < MAX_INSPECTOR_LINES
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn details(app: &App) -> String {
@@ -5852,6 +5975,7 @@ mod tests {
             purpose: format!("Purpose for {id}"),
             goal: format!("Goal for {id}"),
             expected_output: "Verified result".into(),
+            reported_output: None,
             success_criteria: vec!["It passes".into()],
             completion: crate::domain::CompletionTarget::Orchestrator,
             review_by: None,
@@ -7709,6 +7833,148 @@ actions:
         );
         assert!(rendered.contains("Output"));
         assert!(rendered.contains("No structured output has been reported for this agent."));
+    }
+
+    #[test]
+    fn agent_output_tab_renders_complete_reported_json() {
+        let mut app = app();
+        app.state.sessions[0].reported_output = Some(crate::domain::ReportedOutput {
+            value: serde_json::json!({"answer": 42, "verified": true}),
+        });
+        app.output_tab = OutputTab::Result;
+
+        let rendered = selected_result(&app);
+
+        assert_eq!(rendered, "{\n  \"answer\": 42,\n  \"verified\": true\n}");
+        assert!(!rendered.contains("activity"));
+    }
+
+    #[test]
+    fn agent_output_tab_preserves_an_explicit_json_null() {
+        let mut app = app();
+        app.state.sessions[0].reported_output = Some(crate::domain::ReportedOutput {
+            value: serde_json::Value::Null,
+        });
+        app.output_tab = OutputTab::Result;
+
+        assert_eq!(selected_result(&app), "null");
+    }
+
+    #[test]
+    fn large_agent_output_has_an_honest_bounded_preview() {
+        let mut app = app();
+        app.state.sessions[0].reported_output = Some(crate::domain::ReportedOutput {
+            value: serde_json::Value::String("x".repeat(MAX_SESSION_OUTPUT_INSPECTOR_BYTES + 1)),
+        });
+        app.output_tab = OutputTab::Result;
+
+        let rendered = selected_result(&app);
+
+        assert!(rendered.contains("Output preview ("));
+        assert!(rendered.contains("rendered bytes)"));
+        assert!(!rendered.contains(" of "));
+        assert!(
+            rendered
+                .contains("Full value: orc session show --json --scope '/tmp/orc-test' -- 'root'")
+        );
+        assert!(!rendered.contains("orc session list"));
+        assert!(rendered.contains("… output omitted"));
+        assert!(!rendered.contains("earlier activity omitted"));
+        assert!(rendered.len() < MAX_INSPECTOR_BYTES);
+    }
+
+    #[test]
+    fn deeply_nested_wide_output_stops_at_the_inspector_limits() {
+        let mut value = serde_json::Value::Array(vec![serde_json::Value::from(0); 400_000]);
+        for _ in 0..100 {
+            value = serde_json::Value::Array(vec![value]);
+        }
+        assert!(serde_json::to_vec(&value).expect("compact JSON").len() < 1024 * 1024);
+        let rendered = render_session_output(&value, Path::new("/tmp/orc-test"), "root");
+
+        assert!(rendered.contains("Output preview (first "));
+        assert!(
+            rendered
+                .contains("Full value: orc session show --json --scope '/tmp/orc-test' -- 'root'")
+        );
+        assert!(rendered.len() < MAX_INSPECTOR_BYTES);
+        assert!(rendered.lines().count() < MAX_INSPECTOR_LINES);
+    }
+
+    #[test]
+    fn output_preview_uses_selected_session_and_resolved_tui_scope() {
+        let scope = PathBuf::from("/private/tmp/a project's resolved scope");
+        let mut root = session("--json", None, "agent-a");
+        root.reported_output = Some(crate::domain::ReportedOutput {
+            value: serde_json::Value::String("x".repeat(MAX_SESSION_OUTPUT_INSPECTOR_BYTES + 1)),
+        });
+        let mut state = WorkspaceState::empty(scope.display().to_string());
+        state.sessions = vec![root];
+        let mut app = App::new(Config::default(), scope, state, Vec::new());
+        app.output_tab = OutputTab::Result;
+
+        let rendered = selected_result(&app);
+
+        assert!(rendered.contains(
+            "orc session show --json --scope '/private/tmp/a project'\\''s resolved scope' -- '--json'"
+        ));
+        assert_ne!(
+            app.scope,
+            std::env::current_dir().expect("current directory")
+        );
+    }
+
+    #[test]
+    fn oversized_exact_recovery_command_keeps_output_rendering_bounded() {
+        let scope = PathBuf::from("/tmp/orc-test");
+        let id = format!("--{}", "x".repeat(70 * 1024));
+        let mut root = session(&id, None, "agent-a");
+        root.reported_output = Some(crate::domain::ReportedOutput {
+            value: serde_json::Value::String("y".repeat(MAX_SESSION_OUTPUT_INSPECTOR_BYTES + 1)),
+        });
+        let mut state = WorkspaceState::empty(scope.display().to_string());
+        state.sessions = vec![root];
+        let mut app = App::new(Config::default(), scope, state, Vec::new());
+        app.output_tab = OutputTab::Result;
+        app.focus = Focus::Inspector;
+        let body = selected_result(&app);
+        let backend = TestBackend::new(160, 42);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("bounded output renders");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(body.len() < MAX_INSPECTOR_BYTES);
+        assert!(body.contains("orc session list --json --scope '/tmp/orc-test'"));
+        assert!(!body.contains("earlier activity omitted"));
+        assert!(rendered.contains("orc session list --json --scope '/tmp/orc-test'"));
+        assert!(!rendered.contains("earlier activity omitted"));
+    }
+
+    #[test]
+    fn shell_arguments_are_single_quote_safe() {
+        assert_eq!(shell_quote("agent's output"), "'agent'\\''s output'");
+    }
+
+    #[test]
+    fn activity_does_not_become_agent_output() {
+        let mut app = app();
+        app.activity
+            .insert("root".into(), "agent reported a visible message".into());
+        app.output_tab = OutputTab::Result;
+
+        assert_eq!(
+            selected_result(&app),
+            "No structured output has been reported for this agent."
+        );
     }
 
     #[test]

@@ -1,0 +1,37 @@
+version: 2
+change: report-orchestrator-output
+decision: approved
+note: approved after round-4 mediated correction
+change_hash: 03b8fd9ff89282e8
+base_commit: 555051e3f97dd26e1d6a2728cd865e422cdc6fa0
+items:
+    1cf64d9b99141edb:
+        hash: c13a4b8bbb9208a4
+        text: Regenerate schemas, completions, and reference documentation
+    7bd65e8f08fefc8f:
+        hash: 60512d562084676f
+        text: Add equivalent CLI inline/file/stdin and MCP report operations with generated interface coverage writes:` src/cli.rs,src/mcp.rs
+    24cc133e544a3de6:
+        hash: ef4a7704c367d5a6
+        text: Run focused and full checks, strict OpenSpec validation, and mediated adversarial review
+    0538ce559b2b7260:
+        hash: 039081581f81baaf
+        text: Follow up separately on compact or bounded workspace-state persistence; this change does not alter state serialization writes:` src/state.rs
+    4688d7b9bb1a643a:
+        hash: b19fd1e287bfa305
+        text: 'Adversarial review: audit state integrity, authorization, and size enforcement writes:` openspec/changes/report-orchestrator-output/review.md'
+    ac8e4f7371bd7b1a:
+        hash: 821cdf7e57de3451
+        text: Add bounded self-scoped orchestrator reporting with terminating-session, oversized-value, and unchanged-state inverse tests writes:` src/control.rs
+    b6cf430c2643f34f:
+        hash: ee9536efb4a1de21
+        text: Add a backward-compatible reported-output envelope with JSON-null round-trip and preservation tests writes:` src/domain.rs,src/control.rs
+    b455970afa4580d8:
+        hash: 542ee595883d1c8b
+        text: Commit, release, update sysinit and Laurel, switch, and verify the installed flow
+    bc34311d677aa7af:
+        hash: e48ffdabb4438b14
+        text: 'Adversarial review: audit interface parity and inspector behavior writes:` openspec/changes/report-orchestrator-output/review.md'
+    d5628dc63f5ce79d:
+        hash: db1c5b4fb270dafb
+        text: Render complete or honestly bounded session output in the TUI and keep Activity isolated writes:` src/tui.rs

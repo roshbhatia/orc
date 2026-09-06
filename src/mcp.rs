@@ -147,6 +147,10 @@ fn node_report_properties() -> Value {
     })
 }
 
+fn session_report_properties() -> Value {
+    json!({ "output": {} })
+}
+
 fn tools() -> Value {
     const TOOLS: &[ToolDefinition] = &[
         ToolDefinition {
@@ -184,6 +188,12 @@ fn tools() -> Value {
             description: "Stop an active agent through an advertised provider, then archive it.",
             properties: id_property,
             required: &["id"],
+        },
+        ToolDefinition {
+            name: "orc_session_report",
+            description: "Report structured output for this orchestrator session.",
+            properties: session_report_properties,
+            required: &["output"],
         },
         ToolDefinition {
             name: "orc_run_create",
@@ -303,6 +313,22 @@ fn active_context(
         "ORC_SESSION_ID is required for Orc MCP tools; connect this harness session first",
     )?;
     control::ensure_active_context_for(scope, session_id)
+}
+
+fn tools_for_context(scope: Option<&std::path::Path>, session_id: Option<&str>) -> Value {
+    let Some(scope) = scope.and_then(|scope| state::resolve_scope(scope).ok()) else {
+        return Value::Array(Vec::new());
+    };
+    if active_context(&scope, session_id).is_err() {
+        return Value::Array(Vec::new());
+    }
+    tools()
+}
+
+fn tools_for_environment() -> Value {
+    let scope = std::env::var_os("ORC_SCOPE").map(std::path::PathBuf::from);
+    let session_id = std::env::var("ORC_SESSION_ID").ok();
+    tools_for_context(scope.as_deref(), session_id.as_deref())
 }
 
 fn node_spec(input: &Value, default_harness: &str) -> Result<control::NodeSpec> {
@@ -432,6 +458,11 @@ fn call(name: &str, input: &Value, config: &Config) -> Result<Value> {
         "orc_session_prune" => {
             serde_json::to_value(control::prune(config, &scope, &string(input, "id"))?)?
         }
+        "orc_session_report" => serde_json::to_value(control::report_session_output(
+            &scope,
+            &current.id,
+            input.get("output").cloned().context("output is required")?,
+        )?)?,
         "orc_run_create" => serde_json::to_value(control::create_run(
             &scope,
             string(input, "name"),
@@ -553,6 +584,7 @@ fn orchestrator_only(name: &str) -> bool {
             | "orc_session_update"
             | "orc_session_keepalive"
             | "orc_session_prune"
+            | "orc_session_report"
             | "orc_run_create"
             | "orc_run_update"
             | "orc_run_approve"
@@ -584,7 +616,9 @@ pub fn run(config: Config) -> Result<()> {
                 json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"orc","version":crate::VERSION}}})
             }
             "notifications/initialized" => continue,
-            "tools/list" => json!({"jsonrpc":"2.0","id":id,"result":{"tools":tools()}}),
+            "tools/list" => {
+                json!({"jsonrpc":"2.0","id":id,"result":{"tools":tools_for_environment()}})
+            }
             "tools/call" => {
                 let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
                 match call(
@@ -627,7 +661,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert_eq!(catalog.len(), names.len());
-        assert_eq!(names.len(), 18);
+        assert_eq!(names.len(), 19);
         assert!(catalog.iter().all(|tool| {
             tool.pointer("/inputSchema/additionalProperties") == Some(&Value::Bool(false))
         }));
@@ -644,6 +678,19 @@ mod tests {
                 .pointer("/inputSchema/properties/sessionId")
                 .is_some()
         );
+        let report = catalog
+            .iter()
+            .find(|tool| tool.get("name") == Some(&Value::String("orc_session_report".into())))
+            .expect("session report tool");
+        assert_eq!(
+            report.pointer("/inputSchema/required"),
+            Some(&json!(["output"]))
+        );
+        assert!(
+            report
+                .pointer("/inputSchema/properties/sessionId")
+                .is_none()
+        );
     }
 
     #[test]
@@ -652,6 +699,60 @@ mod tests {
             .expect_err("MCP must not inherit the latest orchestrator");
 
         assert!(error.to_string().contains("ORC_SESSION_ID is required"));
+    }
+
+    #[test]
+    fn tool_discovery_is_empty_without_an_active_orc_session() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let root = control::register(
+            &scope,
+            control::Contract {
+                role: SessionRole::Orchestrator,
+                ..control::Contract::default()
+            },
+            control::SessionLink {
+                native_id: Some("root-native".into()),
+                ..control::SessionLink::default()
+            },
+        )
+        .expect("register orchestrator");
+
+        assert_eq!(tools_for_context(None, None), json!([]));
+        assert_eq!(tools_for_context(Some(&scope), None), json!([]));
+        assert_eq!(
+            tools_for_context(Some(&scope), Some("unknown-session")),
+            json!([])
+        );
+        control::archive(&scope, Some(&root.id), None).expect("archive orchestrator");
+        assert_eq!(
+            tools_for_context(Some(&scope), Some(root.id.as_str())),
+            json!([])
+        );
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn tool_discovery_exposes_the_catalog_inside_an_active_orc_session() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let root = control::register(
+            &scope,
+            control::Contract {
+                role: SessionRole::Orchestrator,
+                ..control::Contract::default()
+            },
+            control::SessionLink {
+                native_id: Some("root-native".into()),
+                ..control::SessionLink::default()
+            },
+        )
+        .expect("register orchestrator");
+
+        let available = tools_for_context(Some(&scope), Some(root.id.as_str()));
+
+        assert_eq!(available.as_array().map(Vec::len), Some(19));
+        let _ = std::fs::remove_file(state::path(&scope));
     }
 
     #[test]

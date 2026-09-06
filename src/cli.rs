@@ -19,7 +19,9 @@ use crate::{
     control::{self, Contract, SessionLease, SessionLink},
     control_plane::{self, ResourceKind},
     daemon,
-    domain::{CompletionTarget, JudgePolicy, LifecycleStatus, RegistrationSource, SessionRole},
+    domain::{
+        CompletionTarget, JudgePolicy, LifecycleStatus, RegistrationSource, Session, SessionRole,
+    },
     mcp,
     preferences::{self, AutonomyMode},
     provider::{self, Action},
@@ -379,6 +381,25 @@ struct RegisterArgs {
     quiet: bool,
 }
 
+#[derive(Args)]
+struct SessionReportArgs {
+    #[command(flatten)]
+    scope: ScopeArgs,
+    #[arg(
+        value_name = "JSON",
+        required_unless_present = "file",
+        conflicts_with = "file"
+    )]
+    output: Option<String>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        required_unless_present = "output",
+        conflicts_with = "output"
+    )]
+    file: Option<PathBuf>,
+}
+
 #[derive(Subcommand)]
 enum SessionCommand {
     Register(RegisterArgs),
@@ -409,6 +430,16 @@ enum SessionCommand {
     },
     Current(OutputArgs),
     List(OutputArgs),
+    #[command(about = "Show one session, including retained inactive sessions")]
+    Show {
+        id: String,
+        #[command(flatten)]
+        scope: ScopeArgs,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Report structured output for the current orchestrator session")]
+    Report(SessionReportArgs),
     Update {
         id: String,
         #[command(flatten)]
@@ -838,6 +869,39 @@ fn register(config: &Config, mut args: RegisterArgs) -> Result<Option<String>> {
 fn print_json(value: &impl serde::Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+fn read_session_report(
+    args: &SessionReportArgs,
+    input: &mut dyn Read,
+) -> Result<serde_json::Value> {
+    let source = if let Some(output) = &args.output {
+        output.clone()
+    } else if let Some(path) = &args.file {
+        if path == std::path::Path::new("-") {
+            let mut source = String::new();
+            input.read_to_string(&mut source)?;
+            source
+        } else {
+            fs::read_to_string(path)
+                .with_context(|| format!("read session output from {}", path.display()))?
+        }
+    } else {
+        bail!("structured output is required")
+    };
+    serde_json::from_str(&source).context("session output must be valid JSON")
+}
+
+fn report_session_identity(value: Option<std::ffi::OsString>) -> Result<String> {
+    value
+        .context("ORC_SESSION_ID is required to report orchestrator output")?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("ORC_SESSION_ID must be valid UTF-8"))
+}
+
+fn read_exact_session(scope: &std::path::Path, id: &str) -> Result<Session> {
+    let workspace = control::read_workspace(scope)?;
+    control::selected_session(&workspace, id).cloned()
 }
 
 fn require_orchestrator_or_operator(scope: &std::path::Path) -> Result<()> {
@@ -1294,6 +1358,25 @@ pub fn run() -> Result<u8> {
                 } else {
                     println!("{}", session.id);
                 }
+            }
+            SessionCommand::Show { id, scope, json } => {
+                let session = read_exact_session(&scope.scope, &id)?;
+                if json {
+                    print_json(&session)?;
+                } else {
+                    println!("{}", session.id);
+                }
+            }
+            SessionCommand::Report(args) => {
+                let output = read_session_report(&args, &mut io::stdin().lock())?;
+                let session_id = report_session_identity(env::var_os("ORC_SESSION_ID"))?;
+                let (_, current) =
+                    control::ensure_active_context_for(&args.scope.scope, &session_id)?;
+                print_json(&control::report_session_output(
+                    &args.scope.scope,
+                    &current.id,
+                    output,
+                )?)?;
             }
             SessionCommand::Prune { id, scope } => {
                 require_orchestrator_or_operator(&scope.scope)?;
@@ -1942,9 +2025,10 @@ fn generate_artifacts(root: &std::path::Path, check: bool) -> Result<()> {
 mod tests {
     use super::{
         Cli, Commands, NodeCommand, RegistrationEnrichment, SessionCommand, SplitDirection,
-        WorkflowCommand, registration_enrichment, resolve_workflow_reference,
+        WorkflowCommand, read_exact_session, read_session_report, registration_enrichment,
+        report_session_identity, resolve_workflow_reference,
     };
-    use crate::{config::Config, workflow};
+    use crate::{config::Config, control, workflow};
     use clap::Parser;
     use std::{fs, path::Path};
     use tempfile::TempDir;
@@ -2027,6 +2111,171 @@ mod tests {
             registration_enrichment(args.hook_input, args.bind_current),
             RegistrationEnrichment::Current
         );
+    }
+
+    #[test]
+    fn session_report_accepts_exactly_one_json_source() {
+        assert!(Cli::try_parse_from(["orc", "session", "report", r#"{"ok":true}"#]).is_ok());
+        assert!(Cli::try_parse_from(["orc", "session", "report", "--file", "output.json"]).is_ok());
+        assert!(Cli::try_parse_from(["orc", "session", "report"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "orc",
+                "session",
+                "report",
+                r#"{"ok":true}"#,
+                "--file",
+                "output.json",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "orc",
+                "session",
+                "report",
+                r#"{"ok":true}"#,
+                "--id",
+                "another-session",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn session_report_reads_json_from_standard_input() {
+        let cli = Cli::try_parse_from(["orc", "session", "report", "--file", "-"])
+            .expect("parse stdin report");
+        let Some(Commands::Session {
+            command: SessionCommand::Report(args),
+        }) = cli.command
+        else {
+            panic!("expected session report command");
+        };
+        let mut input = std::io::Cursor::new(br#"{"answer":42}"#);
+
+        let value = read_session_report(&args, &mut input).expect("read stdin report");
+
+        assert_eq!(value, serde_json::json!({"answer": 42}));
+    }
+
+    #[test]
+    fn session_report_reads_json_from_a_file() {
+        let directory = TempDir::new().expect("temporary directory");
+        let path = directory.path().join("output.json");
+        fs::write(&path, r#"{"status":"done"}"#).expect("write output");
+        let cli = Cli::try_parse_from([
+            "orc",
+            "session",
+            "report",
+            "--file",
+            path.to_str().expect("UTF-8 path"),
+        ])
+        .expect("parse file report");
+        let Some(Commands::Session {
+            command: SessionCommand::Report(args),
+        }) = cli.command
+        else {
+            panic!("expected session report command");
+        };
+
+        let value = read_session_report(&args, &mut std::io::empty()).expect("read file report");
+
+        assert_eq!(value, serde_json::json!({"status": "done"}));
+    }
+
+    #[test]
+    fn session_report_rejects_invalid_json_before_control() {
+        let cli = Cli::try_parse_from(["orc", "session", "report", "not-json"])
+            .expect("parse inline report");
+        let Some(Commands::Session {
+            command: SessionCommand::Report(args),
+        }) = cli.command
+        else {
+            panic!("expected session report command");
+        };
+
+        let error =
+            read_session_report(&args, &mut std::io::empty()).expect_err("reject invalid JSON");
+
+        assert!(error.to_string().contains("valid JSON"));
+    }
+
+    #[test]
+    fn session_report_requires_an_explicit_runtime_identity() {
+        let error = report_session_identity(None).expect_err("reject missing session identity");
+
+        assert!(error.to_string().contains("ORC_SESSION_ID is required"));
+    }
+
+    #[test]
+    fn session_show_reads_an_archived_session_by_exact_id() {
+        let option_like = Cli::try_parse_from([
+            "orc",
+            "session",
+            "show",
+            "--json",
+            "--scope",
+            "/tmp/scope",
+            "--",
+            "--json",
+        ])
+        .expect("parse option-like session id after terminator");
+        let Some(Commands::Session {
+            command: SessionCommand::Show { id, json, .. },
+        }) = option_like.command
+        else {
+            panic!("expected option-like session show command");
+        };
+        assert_eq!(id, "--json");
+        assert!(json);
+
+        let cli = Cli::try_parse_from(["orc", "session", "show", "archived-root", "--json"])
+            .expect("parse exact session read");
+        let Some(Commands::Session {
+            command: SessionCommand::Show { id, json, .. },
+        }) = cli.command
+        else {
+            panic!("expected session show command");
+        };
+        assert_eq!(id, "archived-root");
+        assert!(json);
+
+        let directory = TempDir::new().expect("temporary directory");
+        let scope = fs::canonicalize(directory.path()).expect("canonical scope");
+        let root = control::register(
+            &scope,
+            control::Contract {
+                role: crate::domain::SessionRole::Orchestrator,
+                ..control::Contract::default()
+            },
+            control::SessionLink {
+                id: Some("archived-root".into()),
+                native_id: Some("old-native".into()),
+                ..control::SessionLink::default()
+            },
+        )
+        .expect("register root");
+        let output = serde_json::json!({"retained": true});
+        control::report_session_output(&scope, &root.id, output.clone()).expect("report output");
+        control::adopt(
+            &scope,
+            control::Contract::default(),
+            Some("new-native".into()),
+        )
+        .expect("replace root");
+
+        let archived = read_exact_session(&scope, &root.id).expect("read archived session");
+
+        assert_eq!(archived.status, crate::domain::LifecycleStatus::Archived);
+        assert_eq!(
+            archived
+                .reported_output
+                .as_ref()
+                .map(|reported| &reported.value),
+            Some(&output)
+        );
+        let _ = fs::remove_file(crate::state::path(&scope));
     }
 
     #[test]

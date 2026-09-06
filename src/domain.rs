@@ -282,6 +282,26 @@ pub struct AgentConfig {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ReportedOutput {
+    pub value: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionOutputReceipt {
+    pub status: SessionOutputStatus,
+    pub input_bytes: usize,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionOutputStatus {
+    Reported,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Session {
     pub id: String,
     pub native_id: String,
@@ -293,6 +313,8 @@ pub struct Session {
     pub purpose: String,
     pub goal: String,
     pub expected_output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_output: Option<ReportedOutput>,
     #[serde(default)]
     pub success_criteria: Vec<String>,
     pub completion: CompletionTarget,
@@ -608,6 +630,7 @@ mod tests {
             purpose: "test".into(),
             goal: "test".into(),
             expected_output: "test".into(),
+            reported_output: None,
             success_criteria: Vec::new(),
             completion: CompletionTarget::Orchestrator,
             review_by: None,
@@ -714,6 +737,42 @@ mod tests {
 
         assert!(workspace.current_session_for(Some("terminating")).is_none());
         assert!(workspace.current_session_for(None).is_none());
+    }
+
+    #[test]
+    fn legacy_session_without_reported_output_still_deserializes() {
+        let value = serde_json::to_value(session(
+            "legacy",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+            1,
+        ))
+        .expect("serialize session");
+        let mut object = value.as_object().expect("session object").clone();
+        object.remove("reportedOutput");
+
+        let restored: Session =
+            serde_json::from_value(object.into()).expect("deserialize legacy session");
+
+        assert_eq!(restored.reported_output, None);
+    }
+
+    #[test]
+    fn reported_json_null_round_trips_as_present() {
+        let mut original = session(
+            "root",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+            1,
+        );
+        original.reported_output = Some(ReportedOutput {
+            value: serde_json::Value::Null,
+        });
+
+        let encoded = serde_json::to_vec(&original).expect("serialize session");
+        let restored: Session = serde_json::from_slice(&encoded).expect("deserialize session");
+
+        assert_eq!(restored.reported_output, original.reported_output);
     }
 
     #[test]

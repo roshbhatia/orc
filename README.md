@@ -150,6 +150,18 @@ new orchestrator for the current directory. Orc archives the previous active
 orchestrator incarnation. Use `orc session archive` when an unhooked harness
 ends. Harness exit hooks should call `orc session archive --hook-input --quiet`.
 
+An orchestrator reports its structured result through the session identity in
+`ORC_SESSION_ID`:
+
+```bash
+orc session report --file result.json
+```
+
+The command returns a bounded receipt with `status`, compact `inputBytes`, and
+a fixed-width `updatedAt` time. Read the retained value with
+`orc session show --json -- <session-id>`. The dashboard streams a bounded
+pretty-JSON preview into Output and keeps provider activity in Activity.
+
 ## Apply desired state
 
 Users and orchestrator agents use the same resource API. A file contains one or
@@ -252,6 +264,8 @@ An orchestrator can also propose and start definitions through Orc's MCP tools.
 Orc validates the proposal before it commits the YAML definition. Ready nodes
 run concurrently. Each agent node chooses a harness, model, execution provider,
 and judge policy. A nested workflow node composes another definition.
+The MCP server advertises no tools until `ORC_SCOPE` and `ORC_SESSION_ID`
+identify an active Orc session. Direct harness use remains independent of Orc.
 
 Workspace autonomy controls when a proposal starts:
 
@@ -899,6 +913,8 @@ Commands:
   prune      Stop an active agent through its provider, then archive it
   current
   list
+  show       Show one session, including retained inactive sessions
+  report     Report structured output for the current orchestrator session
   update
   keepalive  Renew a managed session's idle lease
   help       Print this message or the help of the given subcommand(s)
@@ -1036,6 +1052,42 @@ Usage: orc session list [OPTIONS]
 Options:
       --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
       --json
+  -h, --help           Print help
+```
+
+### `orc session show`
+
+Show one session, including retained inactive sessions
+
+```text
+Show one session, including retained inactive sessions
+
+Usage: orc session show [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --json
+  -h, --help           Print help
+```
+
+### `orc session report`
+
+Report structured output for the current orchestrator session
+
+```text
+Report structured output for the current orchestrator session
+
+Usage: orc session report [OPTIONS] [JSON]
+
+Arguments:
+  [JSON]
+
+Options:
+      --scope <SCOPE>  [env: ORC_SCOPE=] [default: .]
+      --file <PATH>
   -h, --help           Print help
 ```
 
