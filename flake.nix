@@ -73,7 +73,10 @@
         {
           default = inputs.self.packages.${system}.default;
           workflows = pkgs.runCommand "orc-workflows" { nativeBuildInputs = [ pkgs.actionlint ]; } ''
-            actionlint ${./.github/workflows/ci.yml} ${./.github/workflows/release.yml}
+            actionlint \
+              ${./.github/workflows/ci.yml} \
+              ${./.github/workflows/release.yml} \
+              ${./.github/workflows/update-sources.yml}
             touch "$out"
           '';
         }

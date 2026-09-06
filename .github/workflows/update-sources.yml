@@ -1,0 +1,150 @@
+name: Update sources
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: update-sources
+  cancel-in-progress: false
+
+jobs:
+  update:
+    name: Update locks and open a pull request
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      head-sha: ${{ steps.cpr.outputs.pull-request-head-sha }}
+      operation: ${{ steps.cpr.outputs.pull-request-operation }}
+      pull-request-number: ${{ steps.cpr.outputs.pull-request-number }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update Cargo dependencies
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          GH_TOKEN: ${{ github.token }}
+        run: nix develop --accept-flake-config --command cargo update
+
+      - name: Update every flake lock
+        env:
+          NIX_CONFIG: "access-tokens = github.com=${{ github.token }}"
+        run: |
+          while IFS= read -r flake_file; do
+            nix flake update --flake "${flake_file%/flake.nix}"
+          done < <(
+            find . \
+              \( -path './.git' -o -path './target' \) -prune -o \
+              -type f -name flake.nix -print \
+              | LC_ALL=C sort
+          )
+
+      - name: Regenerate derived interfaces
+        run: nix develop --accept-flake-config --command ./hack/generate.sh
+
+      - name: Verify updates
+        run: |
+          nix develop --accept-flake-config --command cargo fmt --check
+          nix develop --accept-flake-config --command cargo clippy --all-targets -- -D warnings
+          nix develop --accept-flake-config --command cargo test --all-targets
+          nix develop --accept-flake-config --command ./hack/generate.sh --check
+          nix develop --accept-flake-config --command actionlint
+          nix flake check --accept-flake-config --print-build-logs
+          nix flake check --accept-flake-config --print-build-logs ./extras
+
+      - name: Create pull request
+        id: cpr
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ github.token }}
+          branch: automation/update-sources
+          delete-branch: true
+          title: "chore: update Cargo dependencies and flake inputs"
+          commit-message: "chore: update Cargo dependencies and flake inputs"
+          body: |
+            Automated update:
+            - Updated Cargo dependencies
+            - Updated every root and nested flake lock
+            - Regenerated Orc interfaces
+
+  check:
+    needs: update
+    if: >-
+      needs.update.outputs.operation == 'created' ||
+      needs.update.outputs.operation == 'updated'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+          - runner: macos-15
+            system: aarch64-darwin
+    name: Check updated sources on ${{ matrix.system }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ needs.update.outputs.head-sha }}
+
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Verify runner architecture
+        env:
+          EXPECTED_SYSTEM: ${{ matrix.system }}
+        run: test "$(nix eval --impure --raw --expr builtins.currentSystem)" = "$EXPECTED_SYSTEM"
+
+      - name: Check every shipped flake
+        run: |
+          while IFS= read -r flake_file; do
+            nix flake check "${flake_file%/flake.nix}" --accept-flake-config --print-build-logs
+          done < <(
+            find . \
+              \( -path './.git' -o -path './target' \) -prune -o \
+              -type f -name flake.nix -print \
+              | LC_ALL=C sort
+          )
+
+  merge:
+    name: Merge the tested source update
+    needs: [update, check]
+    if: >-
+      needs.update.outputs.operation == 'created' ||
+      needs.update.outputs.operation == 'updated'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Merge the tested head
+        env:
+          EXPECTED_HEAD: ${{ needs.update.outputs.head-sha }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.update.outputs.pull-request-number }}
+        run: |
+          actual_head=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
+          test "$actual_head" = "$EXPECTED_HEAD"
+          gh pr merge "$PR_NUMBER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --squash \
+            --delete-branch \
+            --match-head-commit "$EXPECTED_HEAD"
