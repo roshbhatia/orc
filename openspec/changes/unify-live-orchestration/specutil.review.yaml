@@ -1,0 +1,46 @@
+version: 2
+change: unify-live-orchestration
+decision: approved
+note: Independent mediation found no remaining material defect; live animation and attachment checks passed.
+change_hash: 1c83d83857a020ea
+base_commit: 915a7d976b2f9a22b2fdc1eb34d06ffea90bb4af
+items:
+    0cb25f1104e341ce:
+        hash: ca14a4b3ef4693b2
+        text: Merge adoption, binding, activity, resume, and refresh behavior writes:` src/control.rs,src/cli.rs,src/mcp.rs,src/tui.rs,assets/animations.yaml
+    3e4d3880224bc466:
+        hash: 8d4c73a0b71c5c0c
+        text: Expose equivalent adoption entry points writes:` src/cli.rs,src/mcp.rs
+    5ddf107ddf86c3d2:
+        hash: e9964dc71de39b2f
+        text: 'Adversarial review (`adversarial-review` skill): validate behavior and record surviving objections writes:` openspec/changes/unify-live-orchestration/review.md'
+    7e467bfed25f869f:
+        hash: 2e9ea83ef5776454
+        text: Add selected-session activity and resume behavior writes:` src/tui.rs
+    88c8b467b6ab05bf:
+        hash: 7992e6c3f3c3136f
+        text: 'Apply: prepare release and deployment work, gated on the verification loop reaching its STOP condition'
+    896abaff4697e3c2:
+        hash: d894cc3ca7482279
+        text: 'Adversarial review (`adversarial-review` skill): run deterministic lint and record the terminal review state'
+    48078ca04366111b:
+        hash: 90c9674b12be3a59
+        text: 'Confirm: the owner accepts the working and idle animation language before release'
+    99237b7ecc52c440:
+        hash: 71ab7997e1da275a
+        text: Add bounded best-effort bind-current registration writes:` src/control.rs,src/cli.rs
+    ae2dddf8a6051a0b:
+        hash: e0c0dd27bdfd4553
+        text: Add root Output inspection, prompt refresh, and configured runtime animation writes:` src/tui.rs,assets/animations.yaml
+    d03248f87f9d6c7c:
+        hash: c8461085dd6e3fce
+        text: Preserve node state and expose atomic adoption writes:` src/control.rs
+    f1f6a8f8667ca937:
+        hash: a7480ec87318a513
+        text: 'Gather: run formatting, unit, integration, provider, and PTY checks'
+    f5f59dbe7e5eddcc:
+        hash: 33fdff1da2caa52b
+        text: 'Act: fix only failures mapped to the change behavior'
+    fecc66f77c395de1:
+        hash: e08a1613e8c7502a
+        text: 'Verify: rerun the stop commands and affected provider or PTY checks'

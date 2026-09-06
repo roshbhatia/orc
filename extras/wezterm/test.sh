@@ -10,6 +10,90 @@ real_sleep=${ORC_PROVIDER_WEZTERM_REAL_SLEEP:?}
 test_scope=${TMPDIR:?}/wezterm-provider-test
 mkdir -p "$test_scope"
 
+bind_request() {
+  jq -n \
+    --arg scope "$test_scope" \
+    '{
+      version: "orc.provider/v1",
+      capability: "session.bind",
+      scope: $scope,
+      rebindCurrent: true,
+      currentSessionId: "orc-session",
+      session: {
+        id: "orc-session",
+        nativeId: "native-session",
+        providers: []
+      }
+    }'
+}
+
+assert_bind_status() {
+  local expected_ref output
+  expected_ref=$1
+  output=$2
+  if [[ -n $expected_ref ]]; then
+    jq -e --arg ref "$expected_ref" '
+      .binding.kind == "display"
+      and .binding.status == "active"
+      and .binding.ref == $ref
+    ' <<< "$output" > /dev/null
+  else
+    jq -e '
+      .binding.kind == "display"
+      and .binding.status == "available"
+      and .binding.ref == null
+    ' <<< "$output" > /dev/null
+  fi
+}
+
+bind_with_tty() {
+  local clients panes tty
+  clients=$1
+  panes=$2
+  tty=$3
+  bind_request |
+    env -u WEZTERM_PANE \
+      ORC_PROVIDER_LIB="$provider_library" \
+      ORC_TEST_PS_TTY="$tty" \
+      ORC_TEST_WEZTERM_CLIENTS="$clients" \
+      ORC_TEST_WEZTERM_PANES="$panes" \
+      bash "$provider_script"
+}
+
+live_clients='[{"pid":123}]'
+exact_panes='[{"pane_id":73,"tty_name":"/dev/ttys007"}]'
+assert_bind_status 73 "$(bind_with_tty "$live_clients" "$exact_panes" ttys007)"
+
+other_panes='[{"pane_id":73,"tty_name":"/dev/ttys008"}]'
+assert_bind_status '' "$(bind_with_tty "$live_clients" "$other_panes" ttys007)"
+
+ambiguous_panes='[
+  {"pane_id":73,"tty_name":"/dev/ttys007"},
+  {"pane_id":74,"tty_name":"/dev/ttys007"}
+]'
+assert_bind_status '' "$(bind_with_tty "$live_clients" "$ambiguous_panes" ttys007)"
+assert_bind_status '' "$(bind_with_tty '[]' "$exact_panes" ttys007)"
+
+mismatched_request=$(bind_request | jq '.currentSessionId = "other-session"')
+mismatched_output=$(printf '%s\n' "$mismatched_request" |
+  env -u ORC_NATIVE_SESSION_ID -u WEZTERM_PANE \
+    ORC_PROVIDER_LIB="$provider_library" \
+    ORC_TEST_PS_TTY=ttys007 \
+    ORC_TEST_WEZTERM_CLIENTS="$live_clients" \
+    ORC_TEST_WEZTERM_PANES="$exact_panes" \
+    bash "$provider_script")
+assert_bind_status '' "$mismatched_output"
+
+bind_request | jq 'del(.currentSessionId)' |
+  ORC_NATIVE_SESSION_ID=native-session \
+    ORC_PROVIDER_LIB="$provider_library" \
+    ORC_TEST_PS_TTY=ttys007 \
+    ORC_TEST_WEZTERM_CLIENTS="$live_clients" \
+    ORC_TEST_WEZTERM_PANES='[{"pane_id":42,"tty_name":"/dev/ttys008"}]' \
+    WEZTERM_PANE=42 \
+    bash "$provider_script" > "$test_scope/environment-pane.json"
+assert_bind_status 42 "$(< "$test_scope/environment-pane.json")"
+
 request() {
   local direction
   direction=$1

@@ -1,6 +1,6 @@
 [package]
 name = "orc"
-version = "0.10.8"
+version = "0.10.9"
 edition = "2024"
 rust-version = "1.88"
 description = "Local control plane for agent harnesses"
@@ -16,6 +16,7 @@ crossterm = "0.29"
 hex = "0.4"
 libc = "0.2"
 minijinja = "2.21"
+notify = "8"
 rataflow = { version = "0.1.0", default-features = false, features = ["crossterm", "sugiyama"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 rs-utils = { git = "https://github.com/roshbhatia/rs-utils", rev = "8b8a7ed" }

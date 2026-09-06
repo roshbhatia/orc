@@ -370,6 +370,11 @@ struct RegisterArgs {
     idle_timeout_seconds: Option<u64>,
     #[arg(long = "hook-input")]
     hook_input: bool,
+    #[arg(
+        long = "bind-current",
+        help = "Request provider bindings for the current terminal after registration"
+    )]
+    bind_current: bool,
     #[arg(long)]
     quiet: bool,
 }
@@ -520,16 +525,26 @@ enum NodeCommand {
         contract: Box<ContractArgs>,
         #[arg(long = "session")]
         session_id: Option<String>,
-        #[arg(long, default_value = "queued")]
-        status: LifecycleStatus,
-        #[arg(long, default_value_t = 0)]
-        attempt: u32,
+        #[arg(long)]
+        status: Option<LifecycleStatus>,
+        #[arg(long)]
+        attempt: Option<u32>,
         #[arg(long = "depends-on")]
         depends_on: Vec<String>,
         #[arg(long)]
         execution: Option<String>,
-        #[arg(long = "judge-policy", default_value = "llm")]
-        judge_policy: JudgePolicy,
+        #[arg(long = "judge-policy")]
+        judge_policy: Option<JudgePolicy>,
+    },
+    #[command(about = "Assign an existing session to a workflow node")]
+    Adopt {
+        id: String,
+        #[command(flatten)]
+        scope: ScopeArgs,
+        #[arg(long = "run")]
+        run_id: String,
+        #[arg(long = "session", env = "ORC_SESSION_ID")]
+        session_id: Option<String>,
     },
     Update {
         id: String,
@@ -733,8 +748,26 @@ fn hook_context(input: bool) -> Result<serde_json::Value> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegistrationEnrichment {
+    Current,
+    Workspace,
+    Deferred,
+}
+
+fn registration_enrichment(invoked_by_hook: bool, bind_current: bool) -> RegistrationEnrichment {
+    if bind_current {
+        RegistrationEnrichment::Current
+    } else if invoked_by_hook {
+        RegistrationEnrichment::Deferred
+    } else {
+        RegistrationEnrichment::Workspace
+    }
+}
+
 fn register(config: &Config, mut args: RegisterArgs) -> Result<Option<String>> {
     let invoked_by_hook = args.hook_input;
+    let bind_current = args.bind_current;
     let hook = hook_context(args.hook_input)?;
     if let Some(directory) = hook
         .get("cwd")
@@ -790,9 +823,14 @@ fn register(config: &Config, mut args: RegisterArgs) -> Result<Option<String>> {
     if session.registration == RegistrationSource::Managed {
         daemon::ensure_running(config)?;
     }
-    // Defer provider enrichment because harness hooks have strict latency budgets.
-    if !invoked_by_hook {
-        let _ = control::reconcile_with_current(config, &args.scope.scope, true);
+    match registration_enrichment(invoked_by_hook, bind_current) {
+        RegistrationEnrichment::Current => {
+            let _ = control::bind_current_session(config, &args.scope.scope, &session.id);
+        }
+        RegistrationEnrichment::Workspace => {
+            let _ = control::reconcile_with_current(config, &args.scope.scope, true);
+        }
+        RegistrationEnrichment::Deferred => {}
     }
     Ok((!args.quiet).then_some(session.id))
 }
@@ -1416,6 +1454,21 @@ pub fn run() -> Result<u8> {
                     },
                 )?)?
             }
+            NodeCommand::Adopt {
+                id,
+                scope,
+                run_id,
+                session_id,
+            } => {
+                require_orchestrator_or_operator(&scope.scope)?;
+                let session_id = control::require_id(session_id)?;
+                print_json(&control::adopt_node(
+                    &scope.scope,
+                    &run_id,
+                    &id,
+                    &session_id,
+                )?)?
+            }
             NodeCommand::Update {
                 id,
                 scope,
@@ -1526,26 +1579,32 @@ pub fn run() -> Result<u8> {
             .clamp(0, 255) as u8);
         }
         Commands::Attach(args) => {
-            return Ok(control::attach(
+            let outcome = control::attach(
                 &config,
                 &args.scope.scope,
                 &args.id,
                 Action::Attach,
                 &args.direction.to_string(),
-            )?
-            .code
-            .clamp(0, 255) as u8);
+            )?;
+            return Ok(if outcome.accepted {
+                0
+            } else {
+                outcome.code.clamp(0, 255) as u8
+            });
         }
         Commands::Inspect(args) => {
-            return Ok(control::attach(
+            let outcome = control::attach(
                 &config,
                 &args.scope.scope,
                 &args.id,
                 Action::Inspect,
                 &args.direction.to_string(),
-            )?
-            .code
-            .clamp(0, 255) as u8);
+            )?;
+            return Ok(if outcome.accepted {
+                0
+            } else {
+                outcome.code.clamp(0, 255) as u8
+            });
         }
         Commands::Disconnect { id, scope } => {
             require_orchestrator_or_operator(&scope.scope)?;
@@ -1881,7 +1940,10 @@ fn generate_artifacts(root: &std::path::Path, check: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, SplitDirection, WorkflowCommand, resolve_workflow_reference};
+    use super::{
+        Cli, Commands, NodeCommand, RegistrationEnrichment, SessionCommand, SplitDirection,
+        WorkflowCommand, registration_enrichment, resolve_workflow_reference,
+    };
     use crate::{config::Config, workflow};
     use clap::Parser;
     use std::{fs, path::Path};
@@ -1893,6 +1955,94 @@ mod tests {
         assert_eq!(SplitDirection::Left.to_string(), "left");
         assert_eq!(SplitDirection::Top.to_string(), "top");
         assert_eq!(SplitDirection::Bottom.to_string(), "bottom");
+    }
+
+    #[test]
+    fn node_adopt_accepts_an_explicit_session() {
+        let cli = Cli::try_parse_from([
+            "orc",
+            "node",
+            "adopt",
+            "build",
+            "--run",
+            "run-a",
+            "--session",
+            "session-a",
+        ])
+        .expect("parse node adoption");
+
+        let Some(Commands::Node {
+            command:
+                NodeCommand::Adopt {
+                    id,
+                    run_id,
+                    session_id,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected node adoption command");
+        };
+        assert_eq!(id, "build");
+        assert_eq!(run_id, "run-a");
+        assert_eq!(session_id.as_deref(), Some("session-a"));
+    }
+
+    #[test]
+    fn node_upsert_preserves_omitted_runtime_arguments() {
+        let cli = Cli::try_parse_from(["orc", "node", "upsert", "build", "--run", "run-a"])
+            .expect("parse node upsert");
+
+        let Some(Commands::Node {
+            command:
+                NodeCommand::Upsert {
+                    status,
+                    attempt,
+                    judge_policy,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected node upsert command");
+        };
+        assert_eq!(status, None);
+        assert_eq!(attempt, None);
+        assert_eq!(judge_policy, None);
+    }
+
+    #[test]
+    fn registration_accepts_current_binding_request_without_hook_input() {
+        let cli = Cli::try_parse_from(["orc", "session", "register", "--bind-current"])
+            .expect("parse current binding registration");
+
+        let Some(Commands::Session {
+            command: SessionCommand::Register(args),
+        }) = cli.command
+        else {
+            panic!("expected session registration command");
+        };
+        assert!(!args.hook_input);
+        assert!(args.bind_current);
+        assert_eq!(
+            registration_enrichment(args.hook_input, args.bind_current),
+            RegistrationEnrichment::Current
+        );
+    }
+
+    #[test]
+    fn registration_enrichment_modes_are_exclusive() {
+        assert_eq!(
+            registration_enrichment(true, true),
+            RegistrationEnrichment::Current
+        );
+        assert_eq!(
+            registration_enrichment(false, false),
+            RegistrationEnrichment::Workspace
+        );
+        assert_eq!(
+            registration_enrichment(true, false),
+            RegistrationEnrichment::Deferred
+        );
     }
 
     #[test]

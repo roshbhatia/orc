@@ -104,6 +104,14 @@ fn node_identity_properties() -> Value {
     })
 }
 
+fn node_adoption_properties() -> Value {
+    json!({
+        "runId": { "type": "string" },
+        "id": { "type": "string" },
+        "sessionId": { "type": "string" },
+    })
+}
+
 fn node_upsert_properties() -> Value {
     json!({
         "runId": { "type": "string" },
@@ -232,6 +240,12 @@ fn tools() -> Value {
             required: &["runId", "id", "name", "role", "goal", "expectedOutput"],
         },
         ToolDefinition {
+            name: "orc_node_adopt",
+            description: "Assign an existing session to a workflow node without replacing its data.",
+            properties: node_adoption_properties,
+            required: &["runId", "id"],
+        },
+        ToolDefinition {
             name: "orc_node_update",
             description: "Update a workflow node lifecycle status.",
             properties: node_identity_properties,
@@ -289,6 +303,50 @@ fn active_context(
         "ORC_SESSION_ID is required for Orc MCP tools; connect this harness session first",
     )?;
     control::ensure_active_context_for(scope, session_id)
+}
+
+fn node_spec(input: &Value, default_harness: &str) -> Result<control::NodeSpec> {
+    Ok(control::NodeSpec {
+        id: string(input, "id"),
+        contract: control::Contract {
+            harness: optional(input, "harness").unwrap_or_else(|| default_harness.into()),
+            model: optional(input, "model"),
+            role: string(input, "role")
+                .parse::<SessionRole>()
+                .map_err(anyhow::Error::msg)?,
+            title: string(input, "name"),
+            purpose: optional(input, "purpose").unwrap_or_else(|| "Workflow step".into()),
+            goal: string(input, "goal"),
+            expected_output: string(input, "expectedOutput"),
+            success_criteria: strings(input, "successCriteria"),
+            completion: optional(input, "completion")
+                .unwrap_or_else(|| "orchestrator".into())
+                .parse::<CompletionTarget>()
+                .map_err(anyhow::Error::msg)?,
+            review_by: optional(input, "reviewBy"),
+        },
+        session_id: optional(input, "sessionId"),
+        status: optional(input, "status")
+            .map(|status| {
+                status
+                    .parse::<LifecycleStatus>()
+                    .map_err(anyhow::Error::msg)
+            })
+            .transpose()?,
+        attempt: input
+            .get("attempt")
+            .and_then(Value::as_u64)
+            .map(|attempt| attempt as u32),
+        depends_on: strings(input, "dependsOn"),
+        execution: optional(input, "execution"),
+        judge_policy: optional(input, "judgePolicy")
+            .map(|policy| {
+                policy
+                    .parse::<crate::domain::JudgePolicy>()
+                    .map_err(anyhow::Error::msg)
+            })
+            .transpose()?,
+    })
 }
 
 fn call(name: &str, input: &Value, config: &Config) -> Result<Value> {
@@ -446,38 +504,15 @@ fn call(name: &str, input: &Value, config: &Config) -> Result<Value> {
         "orc_node_upsert" => serde_json::to_value(control::upsert_node(
             &scope,
             &string(input, "runId"),
-            control::NodeSpec {
-                id: string(input, "id"),
-                contract: control::Contract {
-                    harness: optional(input, "harness").unwrap_or(current.harness),
-                    model: optional(input, "model"),
-                    role: string(input, "role")
-                        .parse::<SessionRole>()
-                        .map_err(anyhow::Error::msg)?,
-                    title: string(input, "name"),
-                    purpose: optional(input, "purpose").unwrap_or_else(|| "Workflow step".into()),
-                    goal: string(input, "goal"),
-                    expected_output: string(input, "expectedOutput"),
-                    success_criteria: strings(input, "successCriteria"),
-                    completion: optional(input, "completion")
-                        .unwrap_or_else(|| "orchestrator".into())
-                        .parse::<CompletionTarget>()
-                        .map_err(anyhow::Error::msg)?,
-                    review_by: optional(input, "reviewBy"),
-                },
-                session_id: optional(input, "sessionId"),
-                status: optional(input, "status")
-                    .unwrap_or_else(|| "queued".into())
-                    .parse::<LifecycleStatus>()
-                    .map_err(anyhow::Error::msg)?,
-                attempt: input.get("attempt").and_then(Value::as_u64).unwrap_or(0) as u32,
-                depends_on: strings(input, "dependsOn"),
-                execution: optional(input, "execution"),
-                judge_policy: optional(input, "judgePolicy")
-                    .unwrap_or_else(|| "llm".into())
-                    .parse::<crate::domain::JudgePolicy>()
-                    .map_err(anyhow::Error::msg)?,
-            },
+            node_spec(input, &current.harness)?,
+        )?)?,
+        "orc_node_adopt" => serde_json::to_value(control::adopt_node(
+            &scope,
+            &string(input, "runId"),
+            &string(input, "id"),
+            optional(input, "sessionId")
+                .as_deref()
+                .unwrap_or(current.id.as_str()),
         )?)?,
         "orc_node_update" => serde_json::to_value(control::update_node(
             &scope,
@@ -494,7 +529,7 @@ fn call(name: &str, input: &Value, config: &Config) -> Result<Value> {
                 &scope,
                 &run_id,
                 &node_id,
-                (current.role != SessionRole::Orchestrator).then_some(current.id.as_str()),
+                Some(current.id.as_str()),
                 control::NodeReport {
                     status: string(input, "status")
                         .parse::<LifecycleStatus>()
@@ -525,6 +560,7 @@ fn orchestrator_only(name: &str) -> bool {
             | "orc_workflow_propose"
             | "orc_workflow_start"
             | "orc_node_upsert"
+            | "orc_node_adopt"
             | "orc_node_update"
     )
 }
@@ -591,10 +627,23 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert_eq!(catalog.len(), names.len());
-        assert_eq!(names.len(), 17);
+        assert_eq!(names.len(), 18);
         assert!(catalog.iter().all(|tool| {
             tool.pointer("/inputSchema/additionalProperties") == Some(&Value::Bool(false))
         }));
+        let adoption = catalog
+            .iter()
+            .find(|tool| tool.get("name") == Some(&Value::String("orc_node_adopt".into())))
+            .expect("node adoption tool");
+        assert_eq!(
+            adoption.pointer("/inputSchema/required"),
+            Some(&json!(["runId", "id"]))
+        );
+        assert!(
+            adoption
+                .pointer("/inputSchema/properties/sessionId")
+                .is_some()
+        );
     }
 
     #[test]
@@ -603,5 +652,42 @@ mod tests {
             .expect_err("MCP must not inherit the latest orchestrator");
 
         assert!(error.to_string().contains("ORC_SESSION_ID is required"));
+    }
+
+    #[test]
+    fn node_upsert_input_preserves_omitted_runtime_fields() {
+        let input = json!({
+            "id": "build",
+            "role": "implementer",
+            "name": "Build",
+            "goal": "Build the change",
+            "expectedOutput": "A verified change"
+        });
+
+        let omitted = node_spec(&input, "codex").expect("parse omitted fields");
+        assert_eq!(omitted.status, None);
+        assert_eq!(omitted.attempt, None);
+        assert_eq!(omitted.judge_policy, None);
+
+        let explicit = node_spec(
+            &json!({
+                "id": "build",
+                "role": "implementer",
+                "name": "Build",
+                "goal": "Build the change",
+                "expectedOutput": "A verified change",
+                "status": "working",
+                "attempt": 3,
+                "judgePolicy": "human"
+            }),
+            "codex",
+        )
+        .expect("parse explicit fields");
+        assert_eq!(explicit.status, Some(LifecycleStatus::Working));
+        assert_eq!(explicit.attempt, Some(3));
+        assert_eq!(
+            explicit.judge_policy,
+            Some(crate::domain::JudgePolicy::Human)
+        );
     }
 }

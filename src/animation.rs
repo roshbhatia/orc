@@ -12,6 +12,7 @@ use crate::config::{self, Config};
 
 const FALLBACK_SOURCE: &str = include_str!("../assets/animations.yaml");
 const NAME: &str = "loading";
+const REQUIRED_ANIMATIONS: [&str; 3] = [NAME, "working", "idle"];
 
 #[derive(Clone, Debug)]
 pub struct Loaded {
@@ -69,7 +70,7 @@ fn load_explicit(path: &Path) -> Result<Loaded> {
         .with_context(|| format!("read animation configuration {}", path.display()))?;
     let config = AnimationConfig::from_yaml(&source)
         .with_context(|| format!("validate animation configuration {}", path.display()))?;
-    require_loading(&config)?;
+    require_runtime_animations(&config)?;
     Ok(Loaded {
         config,
         source: Source::File(path.to_path_buf()),
@@ -98,12 +99,13 @@ fn packaged(warning: Option<String>) -> Loaded {
     }
 }
 
-fn require_loading(config: &AnimationConfig) -> Result<()> {
-    if config.animations.contains_key(NAME) {
-        Ok(())
-    } else {
-        bail!("animations.{NAME} is required")
+fn require_runtime_animations(config: &AnimationConfig) -> Result<()> {
+    for name in REQUIRED_ANIMATIONS {
+        if !config.animations.contains_key(name) {
+            bail!("animations.{name} is required");
+        }
     }
+    Ok(())
 }
 
 pub fn select(
@@ -255,6 +257,43 @@ animations:
         assert_eq!(fallback.source, Source::Packaged);
         assert!(fallback.warning.is_some());
         assert!(load_explicit(&path).is_err());
+    }
+
+    #[test]
+    fn explicit_animation_requires_working_and_idle_roles() {
+        let directory = TempDir::new().expect("temporary directory");
+        let path = directory.path().join("animations.yaml");
+        fs::write(&path, custom()).expect("animation fixture");
+
+        let error = load_explicit(&path).expect_err("runtime roles are required");
+
+        assert!(format!("{error:#}").contains("animations.working is required"));
+
+        let missing_idle = format!(
+            "{}{}",
+            custom(),
+            r#"  working:
+    full:
+      dimensions: { width: 1, height: 1 }
+      playback: loop
+      easing: linear
+      frames:
+        - { content: w, style: accent, duration_ms: 100 }
+    reduced_motion:
+      dimensions: { width: 1, height: 1 }
+      playback: once
+      easing: linear
+      frames:
+        - { content: w, style: accent, duration_ms: 100 }
+"#
+        );
+        fs::write(&path, missing_idle).expect("animation fixture without idle");
+        let error = load_explicit(&path).expect_err("idle role is required");
+
+        assert!(
+            format!("{error:#}").contains("animations.idle is required"),
+            "{error:#}"
+        );
     }
 
     #[test]

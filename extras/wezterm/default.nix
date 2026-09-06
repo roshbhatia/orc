@@ -2,6 +2,9 @@
   coreutils,
   jq,
   mkProvider,
+  procps,
+  stdenv,
+  unixtools,
   wezterm,
 }:
 mkProvider {
@@ -11,6 +14,7 @@ mkProvider {
   runtimeInputs = [
     coreutils
     jq
+    (if stdenv.hostPlatform.isDarwin then unixtools.ps else procps)
     wezterm
   ];
   commandPackages = [ wezterm ];

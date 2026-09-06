@@ -51,39 +51,6 @@ screenshot_bin_dir=$(dirname "$ORC_SCREENSHOT_BIN")
 export PATH="$screenshot_bin_dir:$PATH"
 export ORC_SCREENSHOT_SCOPE="$repo_dir/examples/provider-migration"
 
-animation="$fixture/animations.yaml"
-cat > "$animation" << 'YAML'
-version: terminal.animation/v1
-animations:
-  loading:
-    full:
-      dimensions: { width: 25, height: 3 }
-      playback: ping_pong
-      easing: ease_in_out
-      fps: 5
-      frames:
-        - { content: "user-owned Orc animation\n⚔ ······················\nassembling the workflow", style: muted }
-        - { content: "user-owned Orc animation\n· ⚔ ····················\nassembling the workflow", style: accent }
-        - { content: "user-owned Orc animation\n·· ⚔ ···················\nassembling the workflow", style: accent }
-        - { content: "user-owned Orc animation\n··· ⚔ ··················\nassembling the workflow", style: success }
-    compact:
-      dimensions: { width: 3, height: 1 }
-      playback: loop
-      easing: linear
-      fps: 4
-      frames:
-        - { content: "⚔  ", style: muted }
-        - { content: " ⚔ ", style: accent }
-        - { content: "  ⚔", style: success }
-    reduced_motion:
-      dimensions: { width: 25, height: 1 }
-      playback: once
-      easing: linear
-      frames:
-        - { content: "⚔ Orc", style: accent, duration_ms: 1000 }
-YAML
-export ORC_UI_ANIMATION_FILE="$animation"
-
 orchestrator=$(
   "$ORC_SCREENSHOT_BIN" connect \
     --scope "$ORC_SCREENSHOT_SCOPE" \

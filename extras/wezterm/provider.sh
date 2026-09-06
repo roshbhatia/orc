@@ -12,6 +12,49 @@ wait_for_close() {
   fi
 }
 
+provider_controlling_tty() {
+  local pid parent_pid tty
+  pid=$$
+
+  for _ in {1..64}; do
+    parent_pid=$(ps -o ppid= -p "$pid" 2> /dev/null | tr -d '[:space:]') || return 1
+    tty=$(ps -o tty= -p "$pid" 2> /dev/null | tr -d '[:space:]') || return 1
+    case "$tty" in
+      "" | "?" | "??" | "-") ;;
+      *)
+        if [[ $tty == /dev/* ]]; then
+          printf '%s\n' "$tty"
+        else
+          printf '/dev/%s\n' "$tty"
+        fi
+        return 0
+        ;;
+    esac
+
+    if [[ ! $parent_pid =~ ^[0-9]+$ || $parent_pid -le 1 || $parent_pid == "$pid" ]]; then
+      return 1
+    fi
+    pid=$parent_pid
+  done
+
+  return 1
+}
+
+pane_for_current_tty() {
+  local panes tty matches
+  panes=$1
+  tty=$(provider_controlling_tty) || return 1
+  matches=$(jq -c --arg tty "$tty" '
+    [
+      .[]
+      | select(.tty_name == $tty and (.pane_id | type == "number"))
+      | .pane_id
+    ]
+    | unique
+  ' <<< "$panes")
+  jq -er 'select(length == 1) | .[0]' <<< "$matches"
+}
+
 if [[ ${1:-} == hold ]]; then
   shift
   if (($# == 0)); then
@@ -56,13 +99,30 @@ case "$capability" in
       ) // empty
     ' <<< "$request")
     rebind_current=$(jq -r '.rebindCurrent // false' <<< "$request")
+    clients='[]'
+    panes='[]'
+    has_client=false
+    if clients=$("$executable" cli --no-auto-start list-clients --format json 2> /dev/null) &&
+      jq -e 'type == "array" and length > 0' <<< "$clients" > /dev/null; then
+      has_client=true
+      panes=$("$executable" cli --no-auto-start list --format json 2> /dev/null) || panes='[]'
+    fi
     existing_pane=false
-    if [[ $existing_ref =~ ^[0-9]+$ ]] && "$executable" cli --no-auto-start list --format json 2> /dev/null |
-      jq -e --argjson pane "$existing_ref" 'any(.[]; .pane_id == $pane)' > /dev/null; then
+    if [[ $has_client == true && $existing_ref =~ ^[0-9]+$ ]] &&
+      jq -e --argjson pane "$existing_ref" 'any(.[]; .pane_id == $pane)' <<< "$panes" > /dev/null; then
       existing_pane=true
     fi
-    if [[ $rebind_current == true ]] && current_session_matches && [[ -n ${WEZTERM_PANE:-} ]]; then
-      emit_binding "display" "active" "$WEZTERM_PANE" "WezTerm pane $WEZTERM_PANE"
+    current_pane=''
+    if [[ $rebind_current == true ]] && current_session_matches && [[ $has_client == true ]]; then
+      if [[ ${WEZTERM_PANE:-} =~ ^[0-9]+$ ]] &&
+        jq -e --argjson pane "$WEZTERM_PANE" 'any(.[]; .pane_id == $pane)' <<< "$panes" > /dev/null; then
+        current_pane=$WEZTERM_PANE
+      else
+        current_pane=$(pane_for_current_tty "$panes") || current_pane=''
+      fi
+    fi
+    if [[ -n $current_pane ]]; then
+      emit_binding "display" "active" "$current_pane" "WezTerm pane $current_pane"
     elif [[ $existing_pane == true ]]; then
       emit_binding "display" "active" "$existing_ref" "WezTerm pane $existing_ref"
     else

@@ -833,29 +833,54 @@ Register the current session
 Usage: orc connect [OPTIONS]
 
 Options:
-      --scope <SCOPE>                              [env: ORC_SCOPE=] [default: .]
-      --harness <HARNESS>                          [default: unknown]
+      --scope <SCOPE>
+          [env: ORC_SCOPE=] [default: .]
+      --harness <HARNESS>
+          [default: unknown]
       --model <MODEL>
-      --role <ROLE>                                [default: worker]
-      --title <TITLE>                              [default: "Agent session"]
-      --purpose <PURPOSE>                          [default: "Agent session"]
-      --goal <GOAL>                                [default: "Complete the assigned work"]
-      --expected-output <EXPECTED_OUTPUT>          [default: "A verified result"]
+
+      --role <ROLE>
+          [default: worker]
+      --title <TITLE>
+          [default: "Agent session"]
+      --purpose <PURPOSE>
+          [default: "Agent session"]
+      --goal <GOAL>
+          [default: "Complete the assigned work"]
+      --expected-output <EXPECTED_OUTPUT>
+          [default: "A verified result"]
       --success <SUCCESS_CRITERIA>
-      --completion <COMPLETION>                    [default: orchestrator]
+
+      --completion <COMPLETION>
+          [default: orchestrator]
       --review-by <REVIEW_BY>
+
       --id <ID>
+
       --native-id <NATIVE_ID>
+
       --parent <PARENT_ID>
+
       --run <RUN_ID>
+
       --node <NODE_ID>
+
       --provider-ref <PROVIDER_REF>
-      --source <SOURCE>                            [default: connected]
+
+      --source <SOURCE>
+          [default: connected]
       --runtime-timeout <RUNTIME_TIMEOUT_SECONDS>
+
       --idle-timeout <IDLE_TIMEOUT_SECONDS>
+
       --hook-input
+
+      --bind-current
+          Request provider bindings for the current terminal after registration
       --quiet
-  -h, --help                                       Print help
+
+  -h, --help
+          Print help
 ```
 
 ### `orc session`
@@ -888,29 +913,54 @@ Options:
 Usage: orc session register [OPTIONS]
 
 Options:
-      --scope <SCOPE>                              [env: ORC_SCOPE=] [default: .]
-      --harness <HARNESS>                          [default: unknown]
+      --scope <SCOPE>
+          [env: ORC_SCOPE=] [default: .]
+      --harness <HARNESS>
+          [default: unknown]
       --model <MODEL>
-      --role <ROLE>                                [default: worker]
-      --title <TITLE>                              [default: "Agent session"]
-      --purpose <PURPOSE>                          [default: "Agent session"]
-      --goal <GOAL>                                [default: "Complete the assigned work"]
-      --expected-output <EXPECTED_OUTPUT>          [default: "A verified result"]
+
+      --role <ROLE>
+          [default: worker]
+      --title <TITLE>
+          [default: "Agent session"]
+      --purpose <PURPOSE>
+          [default: "Agent session"]
+      --goal <GOAL>
+          [default: "Complete the assigned work"]
+      --expected-output <EXPECTED_OUTPUT>
+          [default: "A verified result"]
       --success <SUCCESS_CRITERIA>
-      --completion <COMPLETION>                    [default: orchestrator]
+
+      --completion <COMPLETION>
+          [default: orchestrator]
       --review-by <REVIEW_BY>
+
       --id <ID>
+
       --native-id <NATIVE_ID>
+
       --parent <PARENT_ID>
+
       --run <RUN_ID>
+
       --node <NODE_ID>
+
       --provider-ref <PROVIDER_REF>
-      --source <SOURCE>                            [default: connected]
+
+      --source <SOURCE>
+          [default: connected]
       --runtime-timeout <RUNTIME_TIMEOUT_SECONDS>
+
       --idle-timeout <IDLE_TIMEOUT_SECONDS>
+
       --hook-input
+
+      --bind-current
+          Request provider bindings for the current terminal after registration
       --quiet
-  -h, --help                                       Print help
+
+  -h, --help
+          Print help
 ```
 
 ### `orc session adopt`
@@ -1168,6 +1218,7 @@ Usage: orc node <COMMAND>
 
 Commands:
   upsert
+  adopt       Assign an existing session to a workflow node
   update
   edit
   delete
@@ -1200,12 +1251,31 @@ Options:
       --completion <COMPLETION>            [default: orchestrator]
       --review-by <REVIEW_BY>
       --session <SESSION_ID>
-      --status <STATUS>                    [default: queued]
-      --attempt <ATTEMPT>                  [default: 0]
+      --status <STATUS>
+      --attempt <ATTEMPT>
       --depends-on <DEPENDS_ON>
       --execution <EXECUTION>
-      --judge-policy <JUDGE_POLICY>        [default: llm]
+      --judge-policy <JUDGE_POLICY>
   -h, --help                               Print help
+```
+
+### `orc node adopt`
+
+Assign an existing session to a workflow node
+
+```text
+Assign an existing session to a workflow node
+
+Usage: orc node adopt [OPTIONS] --run <RUN_ID> <ID>
+
+Arguments:
+  <ID>
+
+Options:
+      --scope <SCOPE>         [env: ORC_SCOPE=] [default: .]
+      --run <RUN_ID>
+      --session <SESSION_ID>  [env: ORC_SESSION_ID=]
+  -h, --help                  Print help
 ```
 
 ### `orc node update`

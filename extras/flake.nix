@@ -259,7 +259,20 @@
           weztermEnvironment =
             let
               fakeWezterm = pkgs.writeShellScriptBin "wezterm" ''
-                exit 0
+                case "$*" in
+                  "cli --no-auto-start list-clients --format json")
+                    printf '%s\n' "''${ORC_TEST_WEZTERM_CLIENTS:-[]}"
+                    ;;
+                  "cli --no-auto-start list --format json")
+                    printf '%s\n' "''${ORC_TEST_WEZTERM_PANES:-[]}"
+                    ;;
+                esac
+              '';
+              fakePs = pkgs.writeShellScriptBin "ps" ''
+                case "$*" in
+                  *"ppid="*) printf '1\n' ;;
+                  *"tty="*) printf '%s\n' "''${ORC_TEST_PS_TTY:-??}" ;;
+                esac
               '';
             in
             pkgs.runCommand "orc-wezterm-composed-environment"
@@ -269,11 +282,13 @@
                   pkgs.coreutils
                   pkgs.expect
                   pkgs.jq
+                  fakePs
                   fakeWezterm
                 ];
               }
               ''
                 export HOME="$TMPDIR/home"
+                export PATH=${fakePs}/bin:$PATH
                 export ORC_PROVIDER_LIB=${./lib/provider.sh}
                 export ORC_PROVIDER_WEZTERM_SCRIPT=${./wezterm/provider.sh}
                 export ORC_PROVIDER_WEZTERM_EXPECT=${./wezterm/hold.exp}

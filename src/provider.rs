@@ -2922,12 +2922,35 @@ pub fn discover_bindings(
     session: &Session,
     rebind_current: bool,
 ) -> Vec<ProviderBinding> {
+    discover_bindings_with_current(config, providers, scope, session, rebind_current, None)
+}
+
+pub fn discover_current_bindings(
+    config: &Config,
+    providers: &[Manifest],
+    scope: &Path,
+    session: &Session,
+) -> Vec<ProviderBinding> {
+    discover_bindings_with_current(config, providers, scope, session, true, Some(&session.id))
+}
+
+fn discover_bindings_with_current(
+    config: &Config,
+    providers: &[Manifest],
+    scope: &Path,
+    session: &Session,
+    rebind_current: bool,
+    current_session_id: Option<&str>,
+) -> Vec<ProviderBinding> {
     candidates(providers, Capability::SessionBind).into_iter().filter_map(|provider| {
-        let request = json!({
+        let mut request = json!({
             "version": "orc.provider/v1", "action": "bind", "capability": Capability::SessionBind,
             "scope": scope, "session": session, "plan": null,
             "rebindCurrent": rebind_current,
         });
+        if let Some(current_session_id) = current_session_id {
+            request["currentSessionId"] = Value::String(current_session_id.into());
+        }
         let value = invoke_raw(provider, &request, config, None).ok()?;
         if value.get("status").and_then(Value::as_str) == Some("declined") { return None; }
         parse_binding(provider, &value).ok()

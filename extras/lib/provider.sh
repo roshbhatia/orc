@@ -174,9 +174,12 @@ read_command() {
 }
 
 current_session_matches() {
-  local native_id
+  local current_session_id native_id session_id
+  current_session_id=$(jq -r '.currentSessionId // empty' <<< "$request")
+  session_id=$(jq -r '.session.id // empty' <<< "$request")
   native_id=$(jq -r '.session.nativeId // empty' <<< "$request")
-  [[ -n $native_id && -n ${ORC_NATIVE_SESSION_ID:-} && $ORC_NATIVE_SESSION_ID == "$native_id" ]]
+  [[ -n $current_session_id && -n $session_id && $current_session_id == "$session_id" ]] ||
+    [[ -n $native_id && -n ${ORC_NATIVE_SESSION_ID:-} && $ORC_NATIVE_SESSION_ID == "$native_id" ]]
 }
 
 unsupported_capability() {

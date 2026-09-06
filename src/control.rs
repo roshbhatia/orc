@@ -27,6 +27,7 @@ use crate::{
 };
 
 const MAX_NODE_OUTPUT_BYTES: usize = 1024 * 1024;
+const CURRENT_BIND_PROVIDER_TIMEOUT_MS: u64 = 500;
 
 #[derive(Debug, Error)]
 #[error("no matching active session")]
@@ -115,11 +116,11 @@ pub struct NodeSpec {
     pub id: String,
     pub contract: Contract,
     pub session_id: Option<String>,
-    pub status: LifecycleStatus,
-    pub attempt: u32,
+    pub status: Option<LifecycleStatus>,
+    pub attempt: Option<u32>,
     pub depends_on: Vec<String>,
     pub execution: Option<String>,
-    pub judge_policy: JudgePolicy,
+    pub judge_policy: Option<JudgePolicy>,
 }
 
 #[derive(Clone, Debug)]
@@ -1372,6 +1373,37 @@ pub fn reconcile(config: &Config, scope: &Path) -> Result<WorkspaceState> {
     reconcile_with_current(config, scope, false)
 }
 
+pub fn bind_current_session(config: &Config, scope: &Path, id: &str) -> Result<WorkspaceState> {
+    let scope = state::resolve_scope(scope)?;
+    let providers = provider::discover(config)?;
+    let snapshot = state::read(&scope)?;
+    let session = selected_session(&snapshot, id)?.clone();
+    let bounded_config = current_bind_config(config);
+    let bindings =
+        provider::discover_current_bindings(&bounded_config, &providers, &scope, &session);
+    if bindings.is_empty() {
+        return Ok(snapshot);
+    }
+    state::update(&scope, |workspace| {
+        let selected = workspace
+            .sessions
+            .iter_mut()
+            .find(|candidate| candidate.id == id)
+            .with_context(|| format!("unknown session: {id}"))?;
+        apply_enrichment(selected, &bindings, None, None);
+        Ok(workspace.clone())
+    })
+}
+
+fn current_bind_config(config: &Config) -> Config {
+    let mut bounded = config.clone();
+    bounded.providers.timeout_ms = bounded
+        .providers
+        .timeout_ms
+        .min(CURRENT_BIND_PROVIDER_TIMEOUT_MS);
+    bounded
+}
+
 pub fn reconcile_with_current(
     config: &Config,
     scope: &Path,
@@ -1671,10 +1703,24 @@ pub fn upsert_node(scope: &Path, run_id: &str, spec: NodeSpec) -> Result<Workflo
         if run.status == LifecycleStatus::Terminating || !run.status.active() {
             bail!("run is not mutable while {}", run.status);
         }
+        let current = run
+            .nodes
+            .iter()
+            .find(|candidate| candidate.id == id)
+            .cloned();
+        let status = status
+            .or_else(|| current.as_ref().map(|node| node.status))
+            .unwrap_or(LifecycleStatus::Queued);
+        let attempt = attempt
+            .or_else(|| current.as_ref().map(|node| node.attempt))
+            .unwrap_or(0);
+        let judge_policy = judge_policy
+            .or_else(|| current.as_ref().map(|node| node.judge_policy))
+            .unwrap_or(JudgePolicy::Llm);
         if !status.valid_for(LifecycleSubject::Node) {
             bail!("invalid node lifecycle state: {status}");
         }
-        if let Some(current) = run.nodes.iter().find(|candidate| candidate.id == id) {
+        if let Some(current) = &current {
             require_transition(LifecycleSubject::Node, current.status, status)?;
         }
         let node = WorkflowNode {
@@ -1683,25 +1729,37 @@ pub fn upsert_node(scope: &Path, run_id: &str, spec: NodeSpec) -> Result<Workflo
             purpose: contract.purpose.clone(),
             role: contract.role,
             harness: contract.harness.clone(),
-            model: contract.model.clone(),
-            execution,
+            model: contract
+                .model
+                .clone()
+                .or_else(|| current.as_ref().and_then(|node| node.model.clone())),
+            execution: execution
+                .clone()
+                .or_else(|| current.as_ref().and_then(|node| node.execution.clone())),
             judge_policy,
             goal: contract.goal.clone(),
             expected_output: contract.expected_output.clone(),
             success_criteria: contract.success_criteria.clone(),
             completion: contract.completion,
-            review_by: contract.review_by.clone(),
-            session_id: session_id.clone(),
-            child_run_id: None,
+            review_by: contract
+                .review_by
+                .clone()
+                .or_else(|| current.as_ref().and_then(|node| node.review_by.clone())),
+            session_id: session_id
+                .clone()
+                .or_else(|| current.as_ref().and_then(|node| node.session_id.clone())),
+            child_run_id: current.as_ref().and_then(|node| node.child_run_id.clone()),
             status,
             attempt,
-            retry_after: None,
-            prompt: None,
-            input: None,
-            output: None,
-            activity: Vec::new(),
-            tokens: 0,
-            cost_usd: 0.0,
+            retry_after: current.as_ref().and_then(|node| node.retry_after),
+            prompt: current.as_ref().and_then(|node| node.prompt.clone()),
+            input: current.as_ref().and_then(|node| node.input.clone()),
+            output: current.as_ref().and_then(|node| node.output.clone()),
+            activity: current
+                .as_ref()
+                .map_or_else(Vec::new, |node| node.activity.clone()),
+            tokens: current.as_ref().map_or(0, |node| node.tokens),
+            cost_usd: current.as_ref().map_or(0.0, |node| node.cost_usd),
             updated_at: Utc::now(),
         };
         run.nodes.retain(|candidate| candidate.id != id);
@@ -1725,6 +1783,134 @@ pub fn upsert_node(scope: &Path, run_id: &str, spec: NodeSpec) -> Result<Workflo
         }
         run.updated_at = Utc::now();
         Ok(node)
+    })
+}
+
+pub fn adopt_node(
+    scope: &Path,
+    run_id: &str,
+    node_id: &str,
+    session_id: &str,
+) -> Result<WorkflowNode> {
+    let scope = state::resolve_scope(scope)?;
+    state::update(&scope, |workspace| {
+        let now = Utc::now();
+        let session = workspace
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+            .with_context(|| format!("unknown session: {session_id}"))?;
+        if !session.status.active() || session.status == LifecycleStatus::Terminating {
+            bail!("session is not available for adoption: {session_id}");
+        }
+
+        let run_index = workspace
+            .runs
+            .iter()
+            .position(|run| run.id == run_id)
+            .with_context(|| format!("unknown run: {run_id}"))?;
+        let run = &workspace.runs[run_index];
+        if !run.status.active() || run.status == LifecycleStatus::Terminating {
+            bail!("run is not mutable while {}", run.status);
+        }
+        let node_index = run
+            .nodes
+            .iter()
+            .position(|node| node.id == node_id)
+            .with_context(|| format!("unknown node: {node_id}"))?;
+        let orchestrator_direct = session.role == SessionRole::Orchestrator
+            && run.orchestrator_id.as_deref() == Some(session_id);
+        if session.role == SessionRole::Orchestrator && !orchestrator_direct {
+            bail!("orchestrator {session_id} does not own workflow run {run_id}");
+        }
+        if !orchestrator_direct {
+            if let Some(assigned_run) = session.run_id.as_deref()
+                && assigned_run != run_id
+            {
+                bail!("session {session_id} belongs to workflow run {assigned_run}");
+            }
+            if let Some(assigned_node) = session.node_id.as_deref()
+                && assigned_node != node_id
+            {
+                bail!("session {session_id} belongs to workflow node {assigned_node}");
+            }
+        }
+        if let Some(owner) = workspace.sessions.iter().find(|candidate| {
+            candidate.id != session_id
+                && candidate.run_id.as_deref() == Some(run_id)
+                && candidate.node_id.as_deref() == Some(node_id)
+                && candidate.status.active()
+                && candidate.status != LifecycleStatus::Terminating
+        }) {
+            bail!(
+                "workflow node {node_id} is owned by active session {}",
+                owner.id
+            );
+        }
+
+        let previous_id = run.nodes[node_index].session_id.clone();
+        let session_needs_lineage =
+            !orchestrator_direct && (session.run_id.is_none() || session.node_id.is_none());
+        if previous_id.as_deref() == Some(session_id) && !session_needs_lineage {
+            return Ok(run.nodes[node_index].clone());
+        }
+        if let Some(previous_id) = previous_id.as_deref()
+            && previous_id != session_id
+            && workspace.sessions.iter().any(|candidate| {
+                candidate.id == previous_id
+                    && candidate.status.active()
+                    && candidate.status != LifecycleStatus::Terminating
+            })
+        {
+            bail!("workflow node {node_id} is owned by active session {previous_id}");
+        }
+        if !orchestrator_direct
+            && workspace.runs.iter().any(|candidate_run| {
+                candidate_run.status.active()
+                    && candidate_run.nodes.iter().any(|candidate_node| {
+                        candidate_node.session_id.as_deref() == Some(session_id)
+                            && (candidate_run.id != run_id || candidate_node.id != node_id)
+                            && candidate_node.status.active()
+                    })
+            })
+        {
+            bail!("active worker session {session_id} already owns another workflow node");
+        }
+
+        let run = &mut workspace.runs[run_index];
+        let node = &mut run.nodes[node_index];
+        node.session_id = Some(session_id.to_owned());
+        node.record_activity(
+            "adopted",
+            match previous_id.as_deref() {
+                None => format!("session {session_id} adopted this node"),
+                Some(previous) if previous == session_id => {
+                    format!("session {session_id} adopted its existing node assignment")
+                }
+                Some(previous) => {
+                    format!("session {session_id} replaced inactive session {previous}")
+                }
+            },
+        );
+        node.updated_at = now;
+        run.updated_at = now;
+
+        if !orchestrator_direct {
+            let session = workspace
+                .sessions
+                .iter_mut()
+                .find(|candidate| candidate.id == session_id)
+                .context("adopted session disappeared")?;
+            if session.run_id.is_none() {
+                session.run_id = Some(run_id.to_owned());
+            }
+            if session.node_id.is_none() {
+                session.node_id = Some(node_id.to_owned());
+            }
+            session.updated_at = now;
+        }
+        Ok(node.clone())
     })
 }
 
@@ -1775,19 +1961,33 @@ pub fn report_node(
         bail!("workflow node output exceeds {MAX_NODE_OUTPUT_BYTES} bytes");
     }
     state::update(&scope, |workspace| {
-        if let Some(session_id) = reporting_session_id {
+        let reporting = if let Some(session_id) = reporting_session_id {
             let reporting = workspace
                 .sessions
                 .iter()
                 .find(|session| session.id == session_id)
+                .cloned()
                 .with_context(|| format!("unknown reporting session: {session_id}"))?;
-            if !reporting.status.active()
-                || reporting.status == LifecycleStatus::Terminating
-                || reporting.registration != RegistrationSource::Managed
-            {
+            if !reporting.status.active() || reporting.status == LifecycleStatus::Terminating {
                 bail!("reporting session is not authorized: {session_id}");
             }
-        }
+            Some(reporting)
+        } else {
+            None
+        };
+        let active_lineage_owner = reporting_session_id.and_then(|session_id| {
+            workspace
+                .sessions
+                .iter()
+                .find(|candidate| {
+                    candidate.id != session_id
+                        && candidate.run_id.as_deref() == Some(run_id)
+                        && candidate.node_id.as_deref() == Some(node_id)
+                        && candidate.status.active()
+                        && candidate.status != LifecycleStatus::Terminating
+                })
+                .map(|candidate| candidate.id.clone())
+        });
         let run = workspace
             .runs
             .iter_mut()
@@ -1795,6 +1995,19 @@ pub fn report_node(
             .with_context(|| format!("unknown run: {run_id}"))?;
         if !run.status.active() {
             bail!("run is not mutable while {}", run.status);
+        }
+        let orchestrator_direct = reporting.as_ref().is_some_and(|session| {
+            session.role == SessionRole::Orchestrator
+                && run.orchestrator_id.as_deref() == Some(session.id.as_str())
+        });
+        if let Some(reporting) = &reporting
+            && reporting.role == SessionRole::Orchestrator
+            && !orchestrator_direct
+        {
+            bail!(
+                "orchestrator {} does not own workflow run {run_id}",
+                reporting.id
+            );
         }
         let node = run
             .nodes
@@ -1805,10 +2018,24 @@ pub fn report_node(
         {
             return Ok(node.clone());
         }
-        if let Some(session_id) = reporting_session_id
-            && node.session_id.as_deref() != Some(session_id)
-        {
-            bail!("a worker can report only its assigned workflow node");
+        if let Some(session_id) = reporting_session_id {
+            match node.session_id.as_deref() {
+                Some(assigned) if assigned != session_id => {
+                    bail!("workflow node {node_id} is owned by session {assigned}")
+                }
+                None if orchestrator_direct => {
+                    if let Some(owner) = active_lineage_owner {
+                        bail!("workflow node {node_id} is owned by active session {owner}");
+                    }
+                    node.session_id = Some(session_id.to_owned());
+                    node.record_activity(
+                        "adopted",
+                        format!("orchestrator session {session_id} adopted this node"),
+                    );
+                }
+                None => bail!("a worker can report only its assigned workflow node"),
+                Some(_) => {}
+            }
         }
         if reporting_session_id.is_some()
             && !matches!(
@@ -1904,46 +2131,28 @@ fn attach_with_output(
                     .as_ref()
                     .is_some_and(|value| !value.is_empty())
         });
-    let has_persistent_process = session.providers.iter().any(|binding| {
-        binding.kind == crate::domain::ProviderKind::Persistence
-            && binding.status == crate::domain::BindingStatus::Active
-            && binding
-                .r#ref
-                .as_ref()
-                .is_some_and(|value| !value.is_empty())
-    });
-    execute_attach_with(
-        action,
-        prefer_focus,
-        session.status.active(),
-        has_persistent_process,
-        &session.title,
-        |selected_action| {
-            let request =
-                provider::action_request(selected_action, &scope, Some(session), direction);
-            let plan = provider::resolve_plan(config, &providers, selected_action, request)?;
-            let code = if print_output {
-                provider::execute_plan(&plan, &scope, false)?
-            } else {
-                provider::run_plan(&plan, &scope)?.code
-            };
-            Ok((code, plan.accepts(code)))
-        },
-    )
+    execute_attach_with(action, prefer_focus, |selected_action| {
+        let request = provider::action_request(selected_action, &scope, Some(session), direction);
+        let plan = provider::resolve_plan(config, &providers, selected_action, request)?;
+        let code = if print_output {
+            provider::execute_plan(&plan, &scope, false)?
+        } else {
+            provider::run_plan(&plan, &scope)?.code
+        };
+        Ok((code, plan.accepts(code)))
+    })
 }
 
 fn execute_attach_with(
     action: provider::Action,
     prefer_focus: bool,
-    session_active: bool,
-    has_persistent_process: bool,
-    session_title: &str,
     mut execute: impl FnMut(provider::Action) -> Result<(i32, bool)>,
 ) -> Result<AttachOutcome> {
     if action != provider::Action::Attach {
-        let (code, _) = execute(action)?;
+        let (code, accepted) = execute(action)?;
         return Ok(AttachOutcome {
             code,
+            accepted,
             disposition: AttachDisposition::Launched,
         });
     }
@@ -1953,6 +2162,7 @@ fn execute_attach_with(
             Ok((code, true)) => {
                 return Ok(AttachOutcome {
                     code,
+                    accepted: true,
                     disposition: AttachDisposition::Focused,
                 });
             }
@@ -1963,19 +2173,10 @@ fn execute_attach_with(
         None
     };
 
-    if session_active && !has_persistent_process {
-        let suffix = focus_failure
-            .as_deref()
-            .map(|failure| format!(" ({failure})"))
-            .unwrap_or_default();
-        bail!(
-            "{session_title} is active, but no display can focus it and no persistent process can reattach it; inspect it or stop it before resuming{suffix}"
-        );
-    }
-
     execute(provider::Action::Attach)
-        .map(|(code, _)| AttachOutcome {
+        .map(|(code, accepted)| AttachOutcome {
             code,
+            accepted,
             disposition: AttachDisposition::Launched,
         })
         .with_context(|| {
@@ -1995,6 +2196,7 @@ pub enum AttachDisposition {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AttachOutcome {
     pub code: i32,
+    pub accepted: bool,
     pub disposition: AttachDisposition,
 }
 
@@ -2323,6 +2525,27 @@ JSON
     ;;
   *) printf '%s\n' 'null' ;;
 esac
+"#;
+
+    const CURRENT_BIND_PROVIDER: &str = r#"#!/bin/sh
+request=$(cat)
+if printf '%s' "$request" | jq -e '.rebindCurrent == true and .currentSessionId == .session.id' >/dev/null; then
+    cat <<'JSON'
+{"version":"orc.provider/v1","binding":{"kind":"display","status":"active","ref":"pane-7"}}
+JSON
+else
+    cat <<'JSON'
+{"version":"orc.provider/v1","binding":{"kind":"display","status":"available"}}
+JSON
+fi
+"#;
+
+    const CURRENT_BIND_MANIFEST: &str = r#"version: orc.provider/v1
+name: display
+kind: display
+command: {{ command }}
+actions:
+  session.bind: Bind the current terminal
 "#;
 
     const MISSING_SCOPE_STOP_PROVIDER: &str = r#"#!/bin/sh
@@ -2800,6 +3023,82 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         );
         assert_eq!(current_rebind_id(&workspace, None, None), None);
         assert_eq!(current_rebind_id(&workspace, Some("missing"), None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_registration_can_request_a_bounded_provider_binding() {
+        let directory = tempfile::tempdir().expect("binding fixture");
+        let scope_directory = directory.path().join("scope");
+        let provider_directory = directory.path().join("providers");
+        fs::create_dir_all(&scope_directory).expect("scope");
+        fs::create_dir_all(&provider_directory).expect("providers");
+        let scope = fs::canonicalize(scope_directory).expect("canonical scope");
+        let provider = directory.path().join("provider.sh");
+        fs::write(&provider, CURRENT_BIND_PROVIDER).expect("provider script");
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o755))
+            .expect("provider executable");
+        fs::write(
+            provider_directory.join("provider.yaml"),
+            render_fixture(
+                CURRENT_BIND_MANIFEST,
+                serde_json::json!({
+                    "command": provider.display().to_string(),
+                }),
+            ),
+        )
+        .expect("provider manifest");
+        let linked = register(
+            &scope,
+            Contract::default(),
+            SessionLink {
+                id: Some("current".into()),
+                native_id: Some("native-current".into()),
+                source: RegistrationSource::Hook,
+                ..SessionLink::default()
+            },
+        )
+        .expect("hook session");
+        state::update(&scope, |workspace| {
+            let mut unrelated = session(
+                "unrelated",
+                SessionRole::Researcher,
+                LifecycleStatus::Working,
+            );
+            unrelated.title = "Unrelated title".into();
+            unrelated.goal = "Unrelated goal".into();
+            unrelated.providers = vec![binding(
+                "existing",
+                ProviderKind::Activity,
+                BindingStatus::Active,
+            )];
+            workspace.sessions.push(unrelated);
+            Ok(())
+        })
+        .expect("record unrelated session");
+        let mut config = Config::default();
+        config.providers.directory = provider_directory;
+        config.providers.timeout_ms = 30_000;
+        assert_eq!(
+            current_bind_config(&config).providers.timeout_ms,
+            CURRENT_BIND_PROVIDER_TIMEOUT_MS
+        );
+
+        let state = bind_current_session(&config, &scope, &linked.id)
+            .expect("bind the just-registered session");
+
+        let current = selected_session(&state, &linked.id).expect("bound session");
+        assert_eq!(current.providers.len(), 1);
+        assert_eq!(current.providers[0].provider, "display");
+        assert_eq!(current.providers[0].kind, ProviderKind::Display);
+        assert_eq!(current.providers[0].status, BindingStatus::Active);
+        assert_eq!(current.providers[0].r#ref.as_deref(), Some("pane-7"));
+        let unrelated = selected_session(&state, "unrelated").expect("unrelated session");
+        assert_eq!(unrelated.title, "Unrelated title");
+        assert_eq!(unrelated.goal, "Unrelated goal");
+        assert_eq!(unrelated.providers.len(), 1);
+        assert_eq!(unrelated.providers[0].provider, "existing");
+        let _ = fs::remove_file(state::path(&scope));
     }
 
     #[test]
@@ -4345,11 +4644,11 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
                 id: "work".into(),
                 contract: Contract::default(),
                 session_id: None,
-                status: LifecycleStatus::Queued,
-                attempt: 0,
+                status: Some(LifecycleStatus::Queued),
+                attempt: Some(0),
                 depends_on: Vec::new(),
                 execution: None,
-                judge_policy: JudgePolicy::Llm,
+                judge_policy: Some(JudgePolicy::Llm),
             },
         )
         .expect("create node");
@@ -4457,11 +4756,11 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
                         ..Contract::default()
                     },
                     session_id: None,
-                    status: LifecycleStatus::Queued,
-                    attempt: 0,
+                    status: Some(LifecycleStatus::Queued),
+                    attempt: Some(0),
                     depends_on: Vec::new(),
                     execution: None,
-                    judge_policy: JudgePolicy::Llm,
+                    judge_policy: Some(JudgePolicy::Llm),
                 },
             )
             .expect("upsert node");
@@ -4480,6 +4779,656 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
             .collect::<Vec<_>>();
         assert_eq!(review_edges.len(), 1);
         assert_eq!(review_edges[0].to, "second-reviewer");
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn repeated_node_upserts_preserve_runtime_and_omitted_optional_fields() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let run = create_run(
+            &scope,
+            "runtime state".into(),
+            "preserve server fields".into(),
+            "runtime state survives".into(),
+            None,
+            None,
+            None,
+        )
+        .expect("create run");
+        upsert_node(
+            &scope,
+            &run.id,
+            NodeSpec {
+                id: "work".into(),
+                contract: Contract {
+                    model: Some("model-a".into()),
+                    review_by: Some("reviewer".into()),
+                    ..Contract::default()
+                },
+                session_id: Some("session-a".into()),
+                status: Some(LifecycleStatus::Queued),
+                attempt: Some(1),
+                depends_on: Vec::new(),
+                execution: Some("local".into()),
+                judge_policy: Some(JudgePolicy::Llm),
+            },
+        )
+        .expect("create node");
+        let retry_after = Utc::now() + chrono::Duration::seconds(30);
+        state::update(&scope, |workspace| {
+            let node = &mut workspace.runs[0].nodes[0];
+            node.status = LifecycleStatus::Working;
+            node.attempt = 3;
+            node.judge_policy = JudgePolicy::Human;
+            node.child_run_id = Some("child-run".into());
+            node.retry_after = Some(retry_after);
+            node.prompt = Some("runtime prompt".into());
+            node.input = Some(serde_json::json!({"input": true}));
+            node.output = Some(serde_json::json!({"output": true}));
+            node.record_activity("started", "runtime activity");
+            node.tokens = 42;
+            node.cost_usd = 1.25;
+            Ok(())
+        })
+        .expect("record runtime state");
+
+        let updated = upsert_node(
+            &scope,
+            &run.id,
+            NodeSpec {
+                id: "work".into(),
+                contract: Contract {
+                    title: "Updated contract".into(),
+                    model: None,
+                    review_by: None,
+                    ..Contract::default()
+                },
+                session_id: None,
+                status: None,
+                attempt: None,
+                depends_on: Vec::new(),
+                execution: None,
+                judge_policy: None,
+            },
+        )
+        .expect("update desired fields");
+
+        assert_eq!(updated.name, "Updated contract");
+        assert_eq!(updated.status, LifecycleStatus::Working);
+        assert_eq!(updated.attempt, 3);
+        assert_eq!(updated.judge_policy, JudgePolicy::Human);
+        assert_eq!(updated.model.as_deref(), Some("model-a"));
+        assert_eq!(updated.review_by.as_deref(), Some("reviewer"));
+        assert_eq!(updated.execution.as_deref(), Some("local"));
+        assert_eq!(updated.session_id.as_deref(), Some("session-a"));
+        assert_eq!(updated.child_run_id.as_deref(), Some("child-run"));
+        assert_eq!(updated.retry_after, Some(retry_after));
+        assert_eq!(updated.prompt.as_deref(), Some("runtime prompt"));
+        assert_eq!(updated.input, Some(serde_json::json!({"input": true})));
+        assert_eq!(updated.output, Some(serde_json::json!({"output": true})));
+        assert_eq!(updated.activity.len(), 1);
+        assert_eq!(updated.tokens, 42);
+        assert_eq!(updated.cost_usd, 1.25);
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn new_node_defaults_desired_runtime_fields() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let run = create_run(
+            &scope,
+            "defaults".into(),
+            "default omitted node state".into(),
+            "queued node".into(),
+            None,
+            None,
+            None,
+        )
+        .expect("create run");
+
+        let node = upsert_node(
+            &scope,
+            &run.id,
+            NodeSpec {
+                id: "work".into(),
+                contract: Contract::default(),
+                session_id: None,
+                status: None,
+                attempt: None,
+                depends_on: Vec::new(),
+                execution: None,
+                judge_policy: None,
+            },
+        )
+        .expect("create node");
+
+        assert_eq!(node.status, LifecycleStatus::Queued);
+        assert_eq!(node.attempt, 0);
+        assert_eq!(node.judge_policy, JudgePolicy::Llm);
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn omitted_node_state_preserves_terminal_values() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let run = create_run(
+            &scope,
+            "terminal".into(),
+            "preserve terminal node state".into(),
+            "done node remains done".into(),
+            None,
+            None,
+            None,
+        )
+        .expect("create run");
+        upsert_node(
+            &scope,
+            &run.id,
+            NodeSpec {
+                id: "work".into(),
+                contract: Contract::default(),
+                session_id: None,
+                status: Some(LifecycleStatus::Done),
+                attempt: Some(4),
+                depends_on: Vec::new(),
+                execution: None,
+                judge_policy: Some(JudgePolicy::LlmAndHuman),
+            },
+        )
+        .expect("create terminal node");
+
+        let node = upsert_node(
+            &scope,
+            &run.id,
+            NodeSpec {
+                id: "work".into(),
+                contract: Contract {
+                    title: "Updated terminal contract".into(),
+                    ..Contract::default()
+                },
+                session_id: None,
+                status: None,
+                attempt: None,
+                depends_on: Vec::new(),
+                execution: None,
+                judge_policy: None,
+            },
+        )
+        .expect("update terminal node contract");
+
+        assert_eq!(node.status, LifecycleStatus::Done);
+        assert_eq!(node.attempt, 4);
+        assert_eq!(node.judge_policy, JudgePolicy::LlmAndHuman);
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn run_orchestrator_can_adopt_and_report_direct_work() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let orchestrator = register(
+            &scope,
+            Contract {
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("direct-work-root".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("register orchestrator");
+        let run = create_run(
+            &scope,
+            "direct work".into(),
+            "let the orchestrator implement".into(),
+            "a reported result".into(),
+            Some(orchestrator.id.clone()),
+            None,
+            None,
+        )
+        .expect("create run");
+        upsert_node(
+            &scope,
+            &run.id,
+            NodeSpec {
+                id: "work".into(),
+                contract: Contract::default(),
+                session_id: None,
+                status: Some(LifecycleStatus::Queued),
+                attempt: Some(0),
+                depends_on: Vec::new(),
+                execution: None,
+                judge_policy: Some(JudgePolicy::Llm),
+            },
+        )
+        .expect("create node");
+
+        let reported = report_node(
+            &scope,
+            &run.id,
+            "work",
+            Some(&orchestrator.id),
+            NodeReport {
+                status: LifecycleStatus::Working,
+                output: Some(serde_json::json!({"progress": "started"})),
+                message: Some("working directly".into()),
+                tokens: Some(9),
+                cost_usd: Some(0.25),
+            },
+        )
+        .expect("orchestrator reports direct work");
+
+        assert_eq!(
+            reported.session_id.as_deref(),
+            Some(orchestrator.id.as_str())
+        );
+        assert_eq!(reported.tokens, 9);
+        assert_eq!(reported.cost_usd, 0.25);
+        assert_eq!(reported.activity[0].kind, "adopted");
+        assert_eq!(reported.activity[1].kind, "reported");
+        let current = read_workspace(&scope).expect("workspace");
+        let current_orchestrator = current
+            .sessions
+            .iter()
+            .find(|session| session.id == orchestrator.id)
+            .expect("orchestrator");
+        assert!(current_orchestrator.run_id.is_none());
+        assert!(current_orchestrator.node_id.is_none());
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn explicit_node_adoption_allows_the_run_orchestrator() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let orchestrator = register(
+            &scope,
+            Contract {
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("explicit-adoption-root".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("register orchestrator");
+        let run = create_run(
+            &scope,
+            "explicit adoption".into(),
+            "claim direct work".into(),
+            "node links to the orchestrator".into(),
+            Some(orchestrator.id.clone()),
+            None,
+            None,
+        )
+        .expect("create run");
+        upsert_node(
+            &scope,
+            &run.id,
+            NodeSpec {
+                id: "work".into(),
+                contract: Contract::default(),
+                session_id: None,
+                status: Some(LifecycleStatus::Queued),
+                attempt: Some(0),
+                depends_on: Vec::new(),
+                execution: None,
+                judge_policy: Some(JudgePolicy::Llm),
+            },
+        )
+        .expect("create node");
+        state::update(&scope, |workspace| {
+            workspace.runs[0].nodes[0].prompt = Some("preserved prompt".into());
+            Ok(())
+        })
+        .expect("record runtime data");
+
+        let adopted = adopt_node(&scope, &run.id, "work", &orchestrator.id)
+            .expect("orchestrator adopts direct work");
+
+        assert_eq!(
+            adopted.session_id.as_deref(),
+            Some(orchestrator.id.as_str())
+        );
+        assert_eq!(adopted.prompt.as_deref(), Some("preserved prompt"));
+        assert_eq!(adopted.activity.last().expect("activity").kind, "adopted");
+        let current = read_workspace(&scope).expect("workspace");
+        let current_orchestrator = current
+            .sessions
+            .iter()
+            .find(|session| session.id == orchestrator.id)
+            .expect("orchestrator");
+        assert!(current_orchestrator.run_id.is_none());
+        assert!(current_orchestrator.node_id.is_none());
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn node_adoption_backfills_missing_session_lineage_once() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let run = create_run(
+            &scope,
+            "backfill".into(),
+            "restore session lineage".into(),
+            "both sides reference each other".into(),
+            None,
+            None,
+            None,
+        )
+        .expect("create run");
+        upsert_node(
+            &scope,
+            &run.id,
+            NodeSpec {
+                id: "work".into(),
+                contract: Contract::default(),
+                session_id: Some("existing-worker".into()),
+                status: Some(LifecycleStatus::Working),
+                attempt: Some(1),
+                depends_on: Vec::new(),
+                execution: None,
+                judge_policy: Some(JudgePolicy::Llm),
+            },
+        )
+        .expect("create assigned node");
+        state::update(&scope, |workspace| {
+            workspace.sessions.push(session(
+                "existing-worker",
+                SessionRole::Implementer,
+                LifecycleStatus::Working,
+            ));
+            Ok(())
+        })
+        .expect("record unlinked session");
+
+        let adopted =
+            adopt_node(&scope, &run.id, "work", "existing-worker").expect("backfill lineage");
+        let repeated =
+            adopt_node(&scope, &run.id, "work", "existing-worker").expect("repeat adoption");
+
+        assert_eq!(adopted.activity.len(), 1);
+        assert_eq!(repeated.activity.len(), 1);
+        let current = read_workspace(&scope).expect("workspace");
+        let worker = current
+            .sessions
+            .iter()
+            .find(|session| session.id == "existing-worker")
+            .expect("worker");
+        assert_eq!(worker.run_id.as_deref(), Some(run.id.as_str()));
+        assert_eq!(worker.node_id.as_deref(), Some("work"));
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn orchestrator_report_rejects_a_node_owned_by_another_session() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let orchestrator = register(
+            &scope,
+            Contract {
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("conflict-root".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("register orchestrator");
+        let run = create_run(
+            &scope,
+            "conflict".into(),
+            "protect active work".into(),
+            "worker ownership remains".into(),
+            Some(orchestrator.id.clone()),
+            None,
+            None,
+        )
+        .expect("create run");
+        upsert_node(
+            &scope,
+            &run.id,
+            NodeSpec {
+                id: "work".into(),
+                contract: Contract::default(),
+                session_id: Some("worker-a".into()),
+                status: Some(LifecycleStatus::Working),
+                attempt: Some(1),
+                depends_on: Vec::new(),
+                execution: None,
+                judge_policy: Some(JudgePolicy::Llm),
+            },
+        )
+        .expect("create assigned node");
+
+        let error = report_node(
+            &scope,
+            &run.id,
+            "work",
+            Some(&orchestrator.id),
+            NodeReport {
+                status: LifecycleStatus::Working,
+                output: None,
+                message: None,
+                tokens: None,
+                cost_usd: None,
+            },
+        )
+        .expect_err("orchestrator cannot replace a worker by reporting");
+
+        assert!(error.to_string().contains("owned by session worker-a"));
+        assert_eq!(
+            read_workspace(&scope).expect("workspace").runs[0].nodes[0]
+                .session_id
+                .as_deref(),
+            Some("worker-a")
+        );
+        state::update(&scope, |workspace| {
+            workspace.runs[0].nodes[0].session_id = None;
+            workspace.runs[0].orchestrator_id = Some("different-orchestrator".into());
+            Ok(())
+        })
+        .expect("change run owner");
+        let error = report_node(
+            &scope,
+            &run.id,
+            "work",
+            Some(&orchestrator.id),
+            NodeReport {
+                status: LifecycleStatus::Working,
+                output: None,
+                message: None,
+                tokens: None,
+                cost_usd: None,
+            },
+        )
+        .expect_err("another run orchestrator cannot report");
+        assert!(error.to_string().contains("does not own workflow run"));
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn node_adoption_rejects_active_conflicts_and_preserves_node_data() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let run = create_run(
+            &scope,
+            "adoption".into(),
+            "adopt an existing worker".into(),
+            "provenance is retained".into(),
+            None,
+            None,
+            None,
+        )
+        .expect("create run");
+        upsert_node(
+            &scope,
+            &run.id,
+            NodeSpec {
+                id: "work".into(),
+                contract: Contract::default(),
+                session_id: Some("old-worker".into()),
+                status: Some(LifecycleStatus::Working),
+                attempt: Some(1),
+                depends_on: Vec::new(),
+                execution: None,
+                judge_policy: Some(JudgePolicy::Llm),
+            },
+        )
+        .expect("create node");
+        state::update(&scope, |workspace| {
+            let mut old = session(
+                "old-worker",
+                SessionRole::Implementer,
+                LifecycleStatus::Working,
+            );
+            old.run_id = Some(run.id.clone());
+            old.node_id = Some("work".into());
+            let candidate = session(
+                "candidate",
+                SessionRole::Implementer,
+                LifecycleStatus::Working,
+            );
+            workspace.sessions.extend([old, candidate]);
+            workspace.runs[0].nodes[0].output = Some(serde_json::json!({"kept": true}));
+            Ok(())
+        })
+        .expect("record sessions");
+
+        let error = adopt_node(&scope, &run.id, "work", "candidate")
+            .expect_err("active owner cannot be displaced");
+        assert!(
+            error
+                .to_string()
+                .contains("owned by active session old-worker")
+        );
+
+        state::update(&scope, |workspace| {
+            workspace
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == "old-worker")
+                .expect("old worker")
+                .status = LifecycleStatus::Disconnected;
+            Ok(())
+        })
+        .expect("disconnect old worker");
+        let adopted =
+            adopt_node(&scope, &run.id, "work", "candidate").expect("replace inactive owner");
+
+        assert_eq!(adopted.session_id.as_deref(), Some("candidate"));
+        assert_eq!(adopted.output, Some(serde_json::json!({"kept": true})));
+        assert_eq!(adopted.activity.last().expect("activity").kind, "adopted");
+        let current = read_workspace(&scope).expect("workspace");
+        let candidate = current
+            .sessions
+            .iter()
+            .find(|session| session.id == "candidate")
+            .expect("candidate");
+        assert_eq!(candidate.run_id.as_deref(), Some(run.id.as_str()));
+        assert_eq!(candidate.node_id.as_deref(), Some("work"));
+        let reported = report_node(
+            &scope,
+            &run.id,
+            "work",
+            Some("candidate"),
+            NodeReport {
+                status: LifecycleStatus::Working,
+                output: Some(serde_json::json!({"adopted": true})),
+                message: Some("adopted session reporting".into()),
+                tokens: None,
+                cost_usd: None,
+            },
+        )
+        .expect("adopted connected session reports its node");
+        assert_eq!(reported.output, Some(serde_json::json!({"adopted": true})));
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn node_adoption_validates_run_node_and_session_lineage() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let run = create_run(
+            &scope,
+            "lineage".into(),
+            "validate adoption targets".into(),
+            "invalid lineage is rejected".into(),
+            None,
+            None,
+            None,
+        )
+        .expect("create run");
+        upsert_node(
+            &scope,
+            &run.id,
+            NodeSpec {
+                id: "work".into(),
+                contract: Contract::default(),
+                session_id: None,
+                status: Some(LifecycleStatus::Queued),
+                attempt: Some(0),
+                depends_on: Vec::new(),
+                execution: None,
+                judge_policy: Some(JudgePolicy::Llm),
+            },
+        )
+        .expect("create node");
+        state::update(&scope, |workspace| {
+            let mut wrong_run = session(
+                "wrong-run",
+                SessionRole::Implementer,
+                LifecycleStatus::Working,
+            );
+            wrong_run.run_id = Some("another-run".into());
+            let mut wrong_node = session(
+                "wrong-node",
+                SessionRole::Implementer,
+                LifecycleStatus::Working,
+            );
+            wrong_node.run_id = Some(run.id.clone());
+            wrong_node.node_id = Some("another-node".into());
+            workspace.sessions.extend([wrong_run, wrong_node]);
+            Ok(())
+        })
+        .expect("record sessions");
+
+        assert!(
+            adopt_node(&scope, &run.id, "work", "missing")
+                .expect_err("unknown session")
+                .to_string()
+                .contains("unknown session")
+        );
+        assert!(
+            adopt_node(&scope, "missing-run", "work", "wrong-run")
+                .expect_err("unknown run")
+                .to_string()
+                .contains("unknown run")
+        );
+        assert!(
+            adopt_node(&scope, &run.id, "missing-node", "wrong-run")
+                .expect_err("unknown node")
+                .to_string()
+                .contains("unknown node")
+        );
+        assert!(
+            adopt_node(&scope, &run.id, "work", "wrong-run")
+                .expect_err("wrong run lineage")
+                .to_string()
+                .contains("belongs to workflow run another-run")
+        );
+        assert!(
+            adopt_node(&scope, &run.id, "work", "wrong-node")
+                .expect_err("wrong node lineage")
+                .to_string()
+                .contains("belongs to workflow node another-node")
+        );
         let _ = std::fs::remove_file(state::path(&scope));
     }
 
@@ -5085,21 +6034,14 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
     fn attach_falls_back_after_focus_provider_fails() {
         let mut calls = Vec::new();
 
-        let outcome = execute_attach_with(
-            provider::Action::Attach,
-            true,
-            true,
-            true,
-            "agent",
-            |action| {
-                calls.push(action);
-                match action {
-                    provider::Action::Focus => Ok((1, false)),
-                    provider::Action::Attach => Ok((0, true)),
-                    _ => unreachable!("unexpected action"),
-                }
-            },
-        )
+        let outcome = execute_attach_with(provider::Action::Attach, true, |action| {
+            calls.push(action);
+            match action {
+                provider::Action::Focus => Ok((1, false)),
+                provider::Action::Attach => Ok((0, true)),
+                _ => unreachable!("unexpected action"),
+            }
+        })
         .expect("attach fallback succeeds");
 
         assert_eq!(
@@ -5108,47 +6050,58 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         );
         assert_eq!(outcome.disposition, AttachDisposition::Launched);
         assert_eq!(outcome.code, 0);
+        assert!(outcome.accepted);
     }
 
     #[test]
     fn attach_does_not_fallback_after_successful_focus() {
         let mut calls = Vec::new();
 
-        let outcome = execute_attach_with(
-            provider::Action::Attach,
-            true,
-            true,
-            true,
-            "agent",
-            |action| {
-                calls.push(action);
-                Ok((0, true))
-            },
-        )
+        let outcome = execute_attach_with(provider::Action::Attach, true, |action| {
+            calls.push(action);
+            Ok((17, true))
+        })
         .expect("focus succeeds");
 
         assert_eq!(calls, vec![provider::Action::Focus]);
         assert_eq!(outcome.disposition, AttachDisposition::Focused);
+        assert_eq!(outcome.code, 17);
+        assert!(outcome.accepted);
     }
 
     #[test]
-    fn active_session_without_persistence_requires_inspection() {
+    fn active_session_without_persistence_uses_provider_neutral_attach() {
         let mut calls = Vec::new();
 
-        let error = execute_attach_with(
-            provider::Action::Attach,
-            false,
-            true,
-            false,
-            "agent",
-            |action| {
-                calls.push(action);
-                Ok((0, true))
-            },
-        )
-        .expect_err("active session without persistence must not resume");
+        let outcome = execute_attach_with(provider::Action::Attach, false, |action| {
+            calls.push(action);
+            Ok((23, true))
+        })
+        .expect("attach provider decides whether the session can resume");
 
-        assert!(calls.is_empty());
-        assert!(error.to_string().contains("inspect it"));
+        assert_eq!(calls, vec![provider::Action::Attach]);
+        assert_eq!(outcome.disposition, AttachDisposition::Launched);
+        assert_eq!(outcome.code, 23);
+        assert!(outcome.accepted);
+    }
+
+    #[test]
+    fn attach_outcome_preserves_a_provider_rejection() {
+        let outcome = execute_attach_with(provider::Action::Attach, false, |_| Ok((17, false)))
+            .expect("provider rejection remains an outcome");
+
+        assert_eq!(outcome.code, 17);
+        assert!(!outcome.accepted);
+        assert_eq!(outcome.disposition, AttachDisposition::Launched);
+    }
+
+    #[test]
+    fn non_attach_outcome_preserves_provider_acceptance() {
+        let outcome = execute_attach_with(provider::Action::Inspect, false, |_| Ok((23, true)))
+            .expect("provider-defined success remains accepted");
+
+        assert_eq!(outcome.code, 23);
+        assert!(outcome.accepted);
+        assert_eq!(outcome.disposition, AttachDisposition::Launched);
     }
 }
