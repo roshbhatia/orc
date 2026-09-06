@@ -18,7 +18,7 @@ let
   providerRuntimeInputs = [ bash ] ++ runtimeInputs;
   adapter = stdenvNoCC.mkDerivation {
     pname = "orc-provider-${name}-adapter";
-    version = "0.10.7";
+    version = "0.10.8";
     dontUnpack = true;
     strictDeps = true;
 
@@ -30,9 +30,15 @@ let
     doCheck = true;
     checkPhase = ''
       shellcheck -x -P ${../.} ${script}
+      check_provider="$TMPDIR/orc-provider-${name}"
+      cp ${script} "$check_provider"
+      chmod 0555 "$check_provider"
+      substituteInPlace "$check_provider" \
+        --replace-fail '#!/usr/bin/env bash' '#!${lib.getExe bash}'
       ${lib.concatMapStringsSep "\n" (test: ''
         PATH=${lib.makeBinPath providerRuntimeInputs}:$PATH \
-          ${lib.getExe bash} ${test} ${script}
+          ORC_PROVIDER_LIB=${./provider.sh} \
+          ${lib.getExe bash} ${test} "$check_provider"
       '') checkScripts}
     '';
 
