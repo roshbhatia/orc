@@ -7,6 +7,7 @@
   symlinkJoin,
 }:
 {
+  checkScripts ? [ ],
   commandPackages ? [ ],
   manifest,
   name,
@@ -17,7 +18,7 @@ let
   providerRuntimeInputs = [ bash ] ++ runtimeInputs;
   adapter = stdenvNoCC.mkDerivation {
     pname = "orc-provider-${name}-adapter";
-    version = "0.10.6";
+    version = "0.10.7";
     dontUnpack = true;
     strictDeps = true;
 
@@ -29,6 +30,10 @@ let
     doCheck = true;
     checkPhase = ''
       shellcheck -x -P ${../.} ${script}
+      ${lib.concatMapStringsSep "\n" (test: ''
+        PATH=${lib.makeBinPath providerRuntimeInputs}:$PATH \
+          ${lib.getExe bash} ${test} ${script}
+      '') checkScripts}
     '';
 
     installPhase = ''

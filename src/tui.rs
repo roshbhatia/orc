@@ -200,6 +200,7 @@ enum RuntimeActivity {
 enum AttachReadiness {
     Focus,
     Reattach,
+    Inspect,
     Unavailable,
 }
 
@@ -208,6 +209,7 @@ impl AttachReadiness {
         match self {
             Self::Focus => "open ready · focus",
             Self::Reattach => "open ready · reattach",
+            Self::Inspect => "open ready · inspect",
             Self::Unavailable => "open unavailable",
         }
     }
@@ -245,17 +247,30 @@ fn attach_readiness(session: &Session, providers: &[Manifest]) -> AttachReadines
     {
         return AttachReadiness::Focus;
     }
+    if !session.status.active() {
+        return AttachReadiness::Unavailable;
+    }
     let persistent = provider_binding_ready(
         session,
         providers,
         ProviderKind::Persistence,
         Capability::SessionPersist,
     );
+    let attach = providers.iter().any(|provider| {
+        provider.supports(Capability::SessionAttach) && provider.available_on_host()
+    });
     let display = providers.iter().any(|provider| {
         provider.supports(Capability::TerminalOpen) && provider.available_on_host()
     });
-    if persistent && display {
+    if persistent && attach && display {
         AttachReadiness::Reattach
+    } else if !persistent
+        && display
+        && providers.iter().any(|provider| {
+            provider.supports(Capability::SessionInspect) && provider.available_on_host()
+        })
+    {
+        AttachReadiness::Inspect
     } else {
         AttachReadiness::Unavailable
     }
@@ -397,6 +412,7 @@ struct RelationEdge {
     active: bool,
     relation: String,
     lane: usize,
+    show_label: bool,
 }
 
 impl EdgeContent for RelationEdge {
@@ -479,7 +495,11 @@ impl EdgeContent for RelationEdge {
         }
         .with_stroke_style(Style::default().fg(color))
         .with_label_style(Style::default().fg(color));
-        let label = edge_label(&self.relation).map(Text::raw);
+        let label = self
+            .show_label
+            .then(|| edge_label(&self.relation))
+            .flatten()
+            .map(Text::raw);
         ctx.render_path(&style, label.as_ref(), buf);
     }
 }
@@ -492,6 +512,10 @@ const EDGE_LABEL_WIDTH: usize = 24;
 const AGENT_CARD_WIDTH: f64 = 42.0;
 const AGENT_CARD_HEIGHT: f64 = 6.0;
 const CONTROL_LANE_PADDING: f64 = 4.0;
+const GRAPH_FIT_PADDING: f64 = 6.0;
+const GRAPH_MAX_ZOOM: f64 = 2.0;
+const MAX_COMMAND_BYTES: usize = 4 * 1024;
+const MAX_COMMAND_HISTORY: usize = 100;
 const DISPLAY_ATTACH_WAIT: Duration = Duration::from_secs(5);
 const DISPLAY_ATTACH_POLL: Duration = Duration::from_millis(100);
 
@@ -543,6 +567,139 @@ struct HitAreas {
     graph: Rect,
     inspector: Option<Rect>,
 }
+
+#[derive(Clone, Debug, Default)]
+struct CommandLine {
+    text: String,
+    history_at: usize,
+    candidates: Vec<String>,
+    candidate_at: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandAction {
+    Quit,
+    Help,
+    Open,
+    Inspect,
+    Tree,
+    Graph,
+    Integrations,
+    Fit,
+    Refresh,
+    Activity,
+    Changes,
+    Mode,
+    Split,
+    VSplit,
+    Close,
+}
+
+struct CommandSpec {
+    name: &'static str,
+    args: &'static str,
+    description: &'static str,
+    action: CommandAction,
+}
+
+const COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "quit",
+        args: "",
+        description: "leave Orc",
+        action: CommandAction::Quit,
+    },
+    CommandSpec {
+        name: "help",
+        args: "",
+        description: "show keys and commands",
+        action: CommandAction::Help,
+    },
+    CommandSpec {
+        name: "open",
+        args: "",
+        description: "open the selected agent",
+        action: CommandAction::Open,
+    },
+    CommandSpec {
+        name: "attach",
+        args: "",
+        description: "attach to the selected agent",
+        action: CommandAction::Open,
+    },
+    CommandSpec {
+        name: "inspect",
+        args: "",
+        description: "show the selected item details",
+        action: CommandAction::Inspect,
+    },
+    CommandSpec {
+        name: "tree",
+        args: "",
+        description: "show the workspace tree",
+        action: CommandAction::Tree,
+    },
+    CommandSpec {
+        name: "graph",
+        args: "",
+        description: "show the workflow graph",
+        action: CommandAction::Graph,
+    },
+    CommandSpec {
+        name: "integrations",
+        args: "",
+        description: "show discovered integrations",
+        action: CommandAction::Integrations,
+    },
+    CommandSpec {
+        name: "fit",
+        args: "",
+        description: "fit the workflow graph",
+        action: CommandAction::Fit,
+    },
+    CommandSpec {
+        name: "refresh",
+        args: "",
+        description: "refresh state and integrations",
+        action: CommandAction::Refresh,
+    },
+    CommandSpec {
+        name: "activity",
+        args: "",
+        description: "show selected agent activity",
+        action: CommandAction::Activity,
+    },
+    CommandSpec {
+        name: "changes",
+        args: "",
+        description: "show workspace changes",
+        action: CommandAction::Changes,
+    },
+    CommandSpec {
+        name: "mode",
+        args: "<supervised|approval_gated|autonomous>",
+        description: "set workspace autonomy",
+        action: CommandAction::Mode,
+    },
+    CommandSpec {
+        name: "split",
+        args: "",
+        description: "dock the inspector below",
+        action: CommandAction::Split,
+    },
+    CommandSpec {
+        name: "vsplit",
+        args: "",
+        description: "dock the inspector right",
+        action: CommandAction::VSplit,
+    },
+    CommandSpec {
+        name: "close",
+        args: "",
+        description: "hide the inspector",
+        action: CommandAction::Close,
+    },
+];
 
 #[derive(Clone, Debug)]
 enum BootState {
@@ -632,6 +789,8 @@ struct App {
     boot: BootState,
     preferences: WorkspacePreferences,
     editor: Option<NodeEditor>,
+    command: Option<CommandLine>,
+    command_history: Vec<String>,
     loading_animation: AnimationConfig,
     startup_warning: Option<String>,
 }
@@ -728,6 +887,8 @@ impl App {
             boot: BootState::Ready,
             preferences: WorkspacePreferences::default(),
             editor: None,
+            command: None,
+            command_history: Vec::new(),
             loading_animation: animation::fallback(),
             startup_warning: None,
         };
@@ -834,31 +995,34 @@ impl App {
         self.provider_at = self.provider_at.min(self.providers.len().saturating_sub(1));
         let signature = graph_signature(&self.state, self.active_run.as_deref());
         if signature != self.graph_signature || force_layout {
-            let restore_viewport = self.preferences.graph_selected_item.is_some();
             let selected = self
                 .preferences
                 .graph_selected_item
                 .clone()
                 .or_else(|| self.flow.first_selected_node_id());
             let (mut flow, items) = build_flow(&self.state, self.active_run.as_deref());
-            if let Some(selected) = selected {
+            let selected_exists = selected
+                .as_ref()
+                .is_some_and(|selected| items.contains_key(selected));
+            if let Some(selected) = selected.filter(|selected| items.contains_key(selected)) {
                 flow.select_node(&selected);
             }
             if flow.first_selected_node_id().is_none() {
                 flow.select_next_node();
             }
-            let mut snapshot = flow.to_snapshot();
-            snapshot
-                .viewport
-                .set_offset(self.preferences.graph_pan_x, self.preferences.graph_pan_y);
-            snapshot.viewport.zoom = self.preferences.graph_zoom.clamp(0.75, 2.0);
-            if let Ok(restored) = AgentFlow::from_snapshot(snapshot) {
-                flow = configure_flow(restored);
+            if selected_exists && !force_layout {
+                let mut snapshot = flow.to_snapshot();
+                snapshot
+                    .viewport
+                    .set_offset(self.preferences.graph_pan_x, self.preferences.graph_pan_y);
+                snapshot.viewport.zoom = self.preferences.graph_zoom.clamp(0.5, 2.0);
+                if let Ok(restored) = AgentFlow::from_snapshot(snapshot) {
+                    flow = configure_flow(restored);
+                }
             }
             self.flow = flow;
-            if !restore_viewport {
-                self.flow
-                    .request_fit_view_with_options(FitViewOptions::default().with_padding(3.0));
+            if force_layout || !selected_exists {
+                request_flow_fit(&mut self.flow);
             }
             self.graph_items = items;
             self.graph_signature = signature;
@@ -1115,10 +1279,31 @@ impl App {
 
     fn changes_view_is_open(&self) -> bool {
         self.main_tab == MainTab::Work
+            && self.inspector_view_is_visible()
             && self.output_tab == OutputTab::Changes
             && inspector_tabs(self.selected().as_ref())
                 .iter()
                 .any(|(tab, _)| *tab == OutputTab::Changes)
+    }
+
+    fn activity_view_is_open(&self) -> bool {
+        self.inspector_view_is_visible()
+            && self.output_tab == OutputTab::Timeline
+            && self.main_tab == MainTab::Work
+            && self.selected_session().is_some()
+    }
+
+    fn provider_activity_view_is_open(&self) -> bool {
+        self.inspector_view_is_visible()
+            && self.output_tab == OutputTab::Timeline
+            && self.main_tab == MainTab::Integrations
+            && matches!(self.selected(), Some(ItemRef::Provider(_)))
+    }
+
+    fn inspector_view_is_visible(&self) -> bool {
+        self.dock != Dock::Hidden
+            && ((self.hit.main.width == 0 && self.hit.main.height == 0)
+                || self.hit.inspector.is_some())
     }
 
     fn display_direction(&self) -> &str {
@@ -1144,6 +1329,9 @@ impl App {
     }
 
     fn request_activity(&mut self, tx: &Sender<BackgroundResult>, force: bool) {
+        if !self.activity_view_is_open() {
+            return;
+        }
         let Some(session) = self.selected_session().cloned() else {
             return;
         };
@@ -1163,16 +1351,25 @@ impl App {
         let scope = self.scope.clone();
         let tx = tx.clone();
         thread::spawn(move || {
-            let request =
+            let mut request =
                 provider::action_request(Action::Activity, &scope, Some(&session), "right");
+            if let Some(request) = request.as_object_mut() {
+                request.insert("maxBytes".into(), MAX_INSPECTOR_BYTES.into());
+                request.insert("maxLines".into(), MAX_INSPECTOR_LINES.into());
+            }
             let result = provider::resolve_activity_plan(&config, &providers, request)
-                .and_then(|plan| provider::capture_plan(&plan, &scope, config.provider_timeout()))
+                .and_then(|plan| {
+                    provider::capture_activity_plan(&plan, &scope, config.provider_timeout())
+                })
                 .map_err(|error| format!("{error:#}"));
             let _ = tx.send(BackgroundResult::Activity { session_id, result });
         });
     }
 
     fn request_provider_activity(&mut self, tx: &Sender<BackgroundResult>, force: bool) {
+        if !self.provider_activity_view_is_open() {
+            return;
+        }
         let Some(ItemRef::Provider(provider_name)) = self.selected() else {
             return;
         };
@@ -1464,24 +1661,39 @@ impl App {
             return;
         }
         if let Some(session) = self.selected_session().cloned() {
-            if attach_readiness(&session, &self.providers) == AttachReadiness::Unavailable {
-                self.set_status("this session has no ready display and persistence provider chain");
+            let readiness = attach_readiness(&session, &self.providers);
+            if readiness == AttachReadiness::Unavailable {
+                self.set_status(format!(
+                    "cannot open {}: no active display; safe reattach or inspection is unavailable",
+                    session.title
+                ));
                 return;
             }
             self.action_inflight = true;
-            self.set_status("opening session through providers");
+            self.set_status(match readiness {
+                AttachReadiness::Inspect => "opening read-only session inspection",
+                _ => "opening session through providers",
+            });
             let config = self.config.clone();
             let scope = self.scope.clone();
             let direction = self.display_direction().to_owned();
             let tx = tx.clone();
             thread::spawn(move || {
+                let action = if readiness == AttachReadiness::Inspect {
+                    Action::Inspect
+                } else {
+                    Action::Attach
+                };
                 let result =
-                    control::attach_quiet(&config, &scope, &session.id, Action::Attach, &direction)
+                    control::attach_quiet(&config, &scope, &session.id, action, &direction)
                         .and_then(|outcome| {
                             if outcome.code == 0 {
-                                let verb = match outcome.disposition {
-                                    control::AttachDisposition::Focused => "focused",
-                                    control::AttachDisposition::Launched => "launch requested for",
+                                let verb = match (readiness, outcome.disposition) {
+                                    (AttachReadiness::Inspect, _) => "opened inspection for",
+                                    (_, control::AttachDisposition::Focused) => "focused",
+                                    (_, control::AttachDisposition::Launched) => {
+                                        "launch requested for"
+                                    }
                                 };
                                 Ok(format!("{verb} {}", session.title))
                             } else {
@@ -1493,11 +1705,15 @@ impl App {
             });
         } else if self.main_tab == MainTab::Integrations {
             self.validate_provider(tx);
-        } else if matches!(self.selected(), Some(ItemRef::Run(_))) {
-            self.set_status("this run has no associated agent display");
+        } else if let Some(ItemRef::Run(run_id)) = self.selected() {
+            self.set_status(format!(
+                "cannot open {run_id}: the run has no connected orchestrator session"
+            ));
         } else if let Some((run_id, node_id)) = self.selected_unassigned_stage() {
             if !launch_attach_ready(self) {
-                self.set_status("this stage has no ready persistence and display provider chain");
+                self.set_status(format!(
+                    "cannot launch {node_id}: its harness, execution, persistence, or display route is not ready"
+                ));
                 return;
             }
             let (launch_request, execution_provider) = self
@@ -1570,8 +1786,20 @@ impl App {
                 .map_err(|error| format!("{error:#}"));
                 let _ = tx.send(BackgroundResult::Action(result));
             });
-        } else if matches!(self.selected(), Some(ItemRef::Node(_, _))) {
-            self.set_status("this completed stage has no live agent to open");
+        } else {
+            match self.selected() {
+                Some(ItemRef::Node(_, node_id)) => self.set_status(format!(
+                    "cannot open {node_id}: the stage has no connected live agent"
+                )),
+                Some(ItemRef::History) => {
+                    self.set_status("cannot open history: select a run or agent")
+                }
+                Some(ItemRef::Provider(name)) => {
+                    self.set_status(format!("cannot validate {name}: provider is unavailable"))
+                }
+                None => self.set_status("nothing selected to open"),
+                Some(ItemRef::Session(_) | ItemRef::Run(_)) => unreachable!(),
+            }
         }
     }
 
@@ -1584,7 +1812,7 @@ impl App {
         self.explorer_view = ExplorerView::Graph;
         self.focus = Focus::Main;
         self.rebuild(true);
-        self.flow.request_fit_view();
+        request_flow_fit(&mut self.flow);
         self.set_status("opened workflow graph");
         self.persist_preferences();
     }
@@ -1596,12 +1824,18 @@ impl App {
                     self.set_status("select an agent first");
                     return;
                 }
-                self.request_activity(tx, true);
                 self.output_tab = OutputTab::Timeline;
+                if self.dock == Dock::Hidden {
+                    self.dock = Dock::Bottom;
+                }
+                self.request_activity(tx, true);
             }
             Action::Changes => {
-                self.request_changes(tx, true);
                 self.output_tab = OutputTab::Changes;
+                if self.dock == Dock::Hidden {
+                    self.dock = Dock::Bottom;
+                }
+                self.request_changes(tx, true);
             }
             _ => return,
         }
@@ -1785,12 +2019,169 @@ impl App {
         });
     }
 
+    fn handle_command_key(&mut self, key: KeyEvent, tx: &Sender<BackgroundResult>) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if matches!(key.code, KeyCode::Esc) || (ctrl && matches!(key.code, KeyCode::Char('c'))) {
+            self.command = None;
+            self.set_status("command cancelled");
+            return false;
+        }
+        if key.code == KeyCode::Enter {
+            let text = self
+                .command
+                .take()
+                .map(|command| command.text.trim().to_owned())
+                .unwrap_or_default();
+            if text.is_empty() {
+                return false;
+            }
+            if self.command_history.last() != Some(&text) {
+                self.command_history.push(text.clone());
+                if self.command_history.len() > MAX_COMMAND_HISTORY {
+                    self.command_history
+                        .drain(..self.command_history.len() - MAX_COMMAND_HISTORY);
+                }
+            }
+            return self.run_command(&text, tx);
+        }
+        let Some(command) = self.command.as_mut() else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Backspace => {
+                command.text.pop();
+                command.candidates.clear();
+            }
+            KeyCode::Up if !self.command_history.is_empty() => {
+                command.history_at = (command.history_at + 1).min(self.command_history.len());
+                command.text =
+                    self.command_history[self.command_history.len() - command.history_at].clone();
+                command.candidates.clear();
+            }
+            KeyCode::Down => {
+                command.history_at = command.history_at.saturating_sub(1);
+                command.text = if command.history_at == 0 {
+                    String::new()
+                } else {
+                    self.command_history[self.command_history.len() - command.history_at].clone()
+                };
+                command.candidates.clear();
+            }
+            KeyCode::Tab => complete_command(command),
+            KeyCode::Char(character)
+                if !ctrl && command.text.len() + character.len_utf8() <= MAX_COMMAND_BYTES =>
+            {
+                command.text.push(character);
+                command.candidates.clear();
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn run_command(&mut self, text: &str, tx: &Sender<BackgroundResult>) -> bool {
+        let (head, args) = text
+            .split_once(' ')
+            .map_or((text, ""), |(head, args)| (head, args.trim()));
+        let action = match command_lookup(head) {
+            Ok(action) => action,
+            Err(error) => {
+                self.set_status(error);
+                return false;
+            }
+        };
+        if action != CommandAction::Mode && !args.is_empty() {
+            self.set_status(format!("{head} takes no arguments"));
+            return false;
+        }
+        match action {
+            CommandAction::Quit => return true,
+            CommandAction::Help => self.help = true,
+            CommandAction::Open => self.open_selected(tx),
+            CommandAction::Inspect => {
+                if self.selected().is_none() {
+                    self.set_status("nothing selected to inspect");
+                } else {
+                    self.dock = Dock::Bottom;
+                    self.output_tab = OutputTab::Summary;
+                    self.focus = Focus::Inspector;
+                    self.inspector_scroll = 0;
+                    self.set_status("opened inspector");
+                }
+            }
+            CommandAction::Tree => {
+                self.switch_main_tab(MainTab::Work);
+                self.explorer_view = ExplorerView::Tree;
+                self.rebuild(false);
+                self.set_status("opened workspace tree");
+            }
+            CommandAction::Graph => {
+                if self.explorer_view == ExplorerView::Tree {
+                    self.active_run = self.selected_tree_run_id();
+                }
+                self.switch_main_tab(MainTab::Work);
+                self.explorer_view = ExplorerView::Graph;
+                self.rebuild(true);
+                self.set_status("opened workflow graph");
+            }
+            CommandAction::Integrations => {
+                self.switch_main_tab(MainTab::Integrations);
+                self.set_status("opened integrations");
+            }
+            CommandAction::Fit => {
+                if self.main_tab == MainTab::Work && self.explorer_view == ExplorerView::Graph {
+                    request_flow_fit(&mut self.flow);
+                    self.set_status("fit workflow graph");
+                } else {
+                    self.set_status("fit is available in the graph view");
+                }
+            }
+            CommandAction::Refresh => {
+                self.enrichment_requested = true;
+                self.request_refresh(tx);
+                if self.changes_view_is_open() {
+                    self.request_changes(tx, true);
+                }
+                self.set_status("refreshing workspace");
+            }
+            CommandAction::Activity => self.load_output(Action::Activity, tx),
+            CommandAction::Changes => self.load_output(Action::Changes, tx),
+            CommandAction::Mode => match args.parse() {
+                Ok(mode) => {
+                    self.preferences.autonomy = mode;
+                    self.set_status(format!("autonomy: {mode}"));
+                }
+                Err(error) => self.set_status(error),
+            },
+            CommandAction::Split => {
+                self.dock = Dock::Bottom;
+                self.focus = Focus::Inspector;
+                self.set_status("inspector docked below");
+            }
+            CommandAction::VSplit => {
+                self.dock = Dock::Right;
+                self.focus = Focus::Inspector;
+                self.set_status("inspector docked right");
+            }
+            CommandAction::Close => {
+                self.dock = Dock::Hidden;
+                self.focus = Focus::Main;
+                self.set_status("inspector hidden");
+            }
+        }
+        self.persist_preferences();
+        false
+    }
+
     fn handle_key(&mut self, key: KeyEvent, tx: &Sender<BackgroundResult>) -> bool {
         if key.kind == KeyEventKind::Release {
             return false;
         }
         if terminal_reply(key) {
             return false;
+        }
+        if self.command.is_some() {
+            return self.handle_command_key(key, tx);
         }
         if key.kind == KeyEventKind::Repeat && provider_action_key(key) {
             return false;
@@ -1898,6 +2289,10 @@ impl App {
         match (key.code, ctrl) {
             (KeyCode::Char('q'), _) => return true,
             (KeyCode::Char('?'), _) => self.help = true,
+            (KeyCode::Char(':'), _) => {
+                self.command = Some(CommandLine::default());
+                self.clear_status();
+            }
             (KeyCode::Char(' '), _) => self.leader = true,
             (KeyCode::Char('w'), true) => self.pending = Some('w'),
             (KeyCode::Char('j'), true) if binding_enabled(self, "focus-inspector") => {
@@ -1980,10 +2375,10 @@ impl App {
             }
             (KeyCode::Char('R'), _) if binding_enabled(self, "relayout") => {
                 self.rebuild(true);
-                self.flow.request_fit_view();
+                request_flow_fit(&mut self.flow);
             }
             (KeyCode::Char('o'), _) if binding_enabled(self, "viewport") => {
-                self.flow.request_fit_view();
+                request_flow_fit(&mut self.flow);
             }
             (KeyCode::Char('+' | '=' | '-' | '_'), _) if binding_enabled(self, "viewport") => {
                 let _ = self.flow.handle_controls_key_event(key);
@@ -2012,11 +2407,7 @@ impl App {
                 self.validate_provider(tx)
             }
             (KeyCode::Char('x'), _) if binding_enabled(self, "cancel") => self.request_cancel(),
-            (KeyCode::Enter, _)
-                if binding_enabled(self, "open") || binding_enabled(self, "provider-validate") =>
-            {
-                self.open_selected(tx)
-            }
+            (KeyCode::Enter, _) => self.open_selected(tx),
             (KeyCode::Char('j'), _) | (KeyCode::Down, _) => self.motion(Direction::Down),
             (KeyCode::Char('k'), _) | (KeyCode::Up, _) => self.motion(Direction::Up),
             (KeyCode::Char('h'), _) | (KeyCode::Left, _) => self.motion(Direction::Left),
@@ -2055,7 +2446,7 @@ impl App {
                 }
                 self.explorer_view = ExplorerView::Graph;
                 self.rebuild(true);
-                self.flow.request_fit_view();
+                request_flow_fit(&mut self.flow);
                 self.persist_preferences();
                 return;
             }
@@ -2215,6 +2606,84 @@ fn non_empty(value: String) -> Option<String> {
     (!value.trim().is_empty()).then_some(value)
 }
 
+fn command_candidates(head: &str) -> Vec<String> {
+    COMMANDS
+        .iter()
+        .filter(|command| command.name.starts_with(head))
+        .map(|command| command.name.to_owned())
+        .collect()
+}
+
+fn shared_command_prefix(candidates: &[String]) -> String {
+    let Some(first) = candidates.first() else {
+        return String::new();
+    };
+    let mut prefix = first.clone();
+    for candidate in &candidates[1..] {
+        while !candidate.starts_with(&prefix) {
+            prefix.pop();
+        }
+    }
+    prefix
+}
+
+fn command_lookup(head: &str) -> std::result::Result<CommandAction, String> {
+    if let Some(command) = COMMANDS.iter().find(|command| command.name == head) {
+        return Ok(command.action);
+    }
+    let matches = COMMANDS
+        .iter()
+        .filter(|command| command.name.starts_with(head))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Err(format!("no command starts with {head}")),
+        [command] => Ok(command.action),
+        _ => Err(format!("{head} is ambiguous")),
+    }
+}
+
+fn complete_command(command: &mut CommandLine) {
+    if command
+        .text
+        .split_once(' ')
+        .is_some_and(|(_, args)| !args.is_empty())
+    {
+        return;
+    }
+    if command.candidates.len() > 1 {
+        command.candidate_at = (command.candidate_at + 1) % command.candidates.len();
+        command.text = command.candidates[command.candidate_at].clone();
+        return;
+    }
+    let head = command.text.trim();
+    let candidates = command_candidates(head);
+    match candidates.as_slice() {
+        [] => {}
+        [candidate] => {
+            command.text = candidate.clone();
+            if COMMANDS
+                .iter()
+                .find(|spec| spec.name == candidate)
+                .is_some_and(|spec| !spec.args.is_empty())
+            {
+                command.text.push(' ');
+            }
+            command.candidates.clear();
+        }
+        _ => {
+            let shared = shared_command_prefix(&candidates);
+            if shared.len() > head.len() {
+                command.text = shared;
+                command.candidates.clear();
+            } else {
+                command.candidates = candidates;
+                command.candidate_at = 0;
+                command.text.clone_from(&command.candidates[0]);
+            }
+        }
+    }
+}
+
 fn provider_action_key(key: KeyEvent) -> bool {
     matches!(
         key.code,
@@ -2295,7 +2764,9 @@ fn node_placement(state: &WorkspaceState, node: &WorkflowNode) -> String {
         return session_placement(session);
     }
     let execution = node.execution.as_deref().unwrap_or("execution unassigned");
-    if matches!(
+    if node.status == LifecycleStatus::Working {
+        format!("inconsistent · not connected · {execution} · no agent assigned")
+    } else if matches!(
         node.status,
         LifecycleStatus::Pending | LifecycleStatus::Queued | LifecycleStatus::Waiting
     ) {
@@ -2419,10 +2890,29 @@ fn configure_flow(flow: AgentFlow) -> AgentFlow {
     palette.accent = Color::Cyan;
     palette.text = Color::Reset;
     flow.with_theme(Theme::Custom(palette))
-        .with_min_zoom(0.75)
-        .with_max_zoom(2.0)
+        .with_min_zoom(0.2)
+        .with_max_zoom(GRAPH_MAX_ZOOM)
         .with_deselect_on_pane_click(false)
         .with_selection_reveal(rataflow::SelectionReveal::EnsureVisible)
+}
+
+fn request_flow_fit(flow: &mut AgentFlow) {
+    flow.request_fit_view_with_options(
+        FitViewOptions::default()
+            .with_padding(graph_visual_padding(flow, GRAPH_MAX_ZOOM))
+            .with_min_zoom(if flow.nodes().count() > 3 { 0.2 } else { 0.5 }),
+    );
+}
+
+fn graph_visual_padding(flow: &AgentFlow, zoom: f64) -> f64 {
+    let feedback_overhang = flow
+        .edges()
+        .iter()
+        .filter(|edge| edge.content.relation == "feedback")
+        .map(|edge| edge.content.lane)
+        .max()
+        .map_or(0.0, |lane| 2.0 + lane as f64 * 2.0);
+    GRAPH_FIT_PADDING + feedback_overhang * zoom
 }
 
 fn clamp_axis(offset: f64, min: f64, max: f64, zoom: f64, size: f64, margin: f64) -> f64 {
@@ -2448,13 +2938,14 @@ fn clamp_flow_viewport(flow: &mut AgentFlow) -> bool {
         return false;
     };
     let mut snapshot = flow.to_snapshot();
+    let visual_padding = graph_visual_padding(flow, snapshot.viewport.zoom);
     let x = clamp_axis(
         snapshot.viewport.x,
         bounds.x(),
         bounds.right(),
         snapshot.viewport.zoom,
         f64::from(canvas.width),
-        4.0,
+        visual_padding,
     );
     let y = clamp_axis(
         snapshot.viewport.y,
@@ -2462,7 +2953,7 @@ fn clamp_flow_viewport(flow: &mut AgentFlow) -> bool {
         bounds.bottom(),
         snapshot.viewport.zoom,
         f64::from(canvas.height),
-        2.0,
+        visual_padding,
     );
     if (x - snapshot.viewport.x).abs() < f64::EPSILON
         && (y - snapshot.viewport.y).abs() < f64::EPSILON
@@ -2683,11 +3174,14 @@ fn orchestration_edges(run: &WorkflowRun, root_id: &str) -> Vec<GraphEdge> {
 }
 
 fn orchestration_lane_clearance(edges: &[GraphEdge]) -> f64 {
-    let lanes = edges
+    if edges
         .iter()
-        .filter(|(_, _, relation, _)| matches!(relation.as_str(), "delegates" | "reports"))
-        .count();
-    CONTROL_LANE_PADDING + lanes.max(1) as f64 * 2.0
+        .any(|(_, _, relation, _)| matches!(relation.as_str(), "delegates" | "reports"))
+    {
+        CONTROL_LANE_PADDING + 4.0
+    } else {
+        CONTROL_LANE_PADDING
+    }
 }
 
 fn build_flow(
@@ -2866,7 +3360,7 @@ fn build_flow(
         add_graph_edges(&mut flow, &known, edges, "lineage");
         flow.apply_layout(Sugiyama::vertical());
     }
-    flow.request_fit_view_with_options(FitViewOptions::default().with_padding(3.0));
+    request_flow_fit(&mut flow);
     (flow, items)
 }
 
@@ -2882,13 +3376,17 @@ fn add_graph_edges(
             continue;
         }
         let lane = relation_lanes.entry(relation.clone()).or_default();
-        let relation_lane = *lane;
+        let shared_lane = matches!(relation.as_str(), "delegates" | "reports");
+        let relation_lane = if shared_lane { 0 } else { *lane };
+        let shared_label = shared_lane || relation == "feedback";
+        let show_label = !shared_label || *lane == 0;
         *lane += 1;
         let edge = Edge::new(format!("edge:{kind}:{index}"), from, to)
             .with_content(RelationEdge {
                 active,
                 relation: relation.clone(),
                 lane: relation_lane,
+                show_label,
                 ..RelationEdge::default()
             })
             .with_selectable(false)
@@ -3826,15 +4324,6 @@ fn selected_result(app: &App) -> String {
 }
 
 fn selected_timeline(app: &App) -> String {
-    let report = selected_provider_report(app);
-    if app.main_tab == MainTab::Integrations && !report.is_empty() {
-        let calls = selected_log(app);
-        return if calls.is_empty() {
-            report
-        } else {
-            format!("{report}\n\nrecent calls\n{calls}")
-        };
-    }
     selected_log(app)
 }
 
@@ -3880,6 +4369,11 @@ fn selected_log(app: &App) -> String {
                 (false, false) => format!("{local}\n\n{provider}"),
                 (false, true) => local,
                 (true, false) => provider,
+                (true, true)
+                    if node.session_id.is_none() && node.status == LifecycleStatus::Working =>
+                {
+                    "Inconsistent state: this stage is working without a connected agent.".into()
+                }
                 (true, true) if node.session_id.is_none() => {
                     "No agent is assigned to this stage.".into()
                 }
@@ -4116,7 +4610,54 @@ fn provider_details(provider: &Manifest) -> String {
     render_detail_template("provider", context! { provider, actions })
 }
 
+fn command_bar(command: &CommandLine) -> Line<'static> {
+    let head = command
+        .text
+        .split_once(' ')
+        .map_or(command.text.as_str(), |(head, _)| head);
+    let candidates = command_candidates(head);
+    let mut spans = vec![
+        Span::styled(":", accent()),
+        Span::styled(command.text.clone(), plain()),
+    ];
+    if command.text.contains(' ') {
+        if let Ok(action) = command_lookup(head)
+            && let Some(spec) = COMMANDS.iter().find(|spec| spec.action == action)
+        {
+            spans.push(Span::styled(format!("  {}", spec.description), dim()));
+        }
+    } else if candidates.len() == 1 {
+        let candidate = &candidates[0];
+        spans.push(Span::styled(
+            candidate.strip_prefix(head).unwrap_or_default().to_owned(),
+            dim(),
+        ));
+        if let Some(spec) = COMMANDS.iter().find(|spec| spec.name == candidate) {
+            spans.push(Span::styled(
+                format!(" {}  {}", spec.args, spec.description),
+                dim(),
+            ));
+        }
+    } else if candidates.len() > 1 {
+        spans.push(Span::styled(format!("  {}", candidates.join("  ")), dim()));
+    } else {
+        spans.push(Span::styled(
+            "  tab completes · up/down history · esc cancel",
+            dim(),
+        ));
+    }
+    spans.push(Span::styled(
+        " ",
+        Style::default().add_modifier(Modifier::REVERSED),
+    ));
+    Line::from(spans)
+}
+
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+    if let Some(command) = &app.command {
+        frame.render_widget(Paragraph::new(command_bar(command)), area);
+        return;
+    }
     let focus = match app.focus {
         Focus::Main => "main",
         Focus::Inspector => "inspector",
@@ -4182,9 +4723,10 @@ fn inspector_available(app: &App) -> bool {
 
 fn open_available(app: &App) -> bool {
     work_main(app)
-        && (app.selected_session().is_some_and(|session| {
-            attach_readiness(session, &app.providers) != AttachReadiness::Unavailable
-        }) || launch_attach_ready(app))
+        && matches!(
+            app.selected(),
+            Some(ItemRef::Session(_) | ItemRef::Run(_) | ItemRef::Node(_, _))
+        )
 }
 
 fn launch_attach_ready(app: &App) -> bool {
@@ -4236,6 +4778,14 @@ macro_rules! binding {
 
 const BINDINGS: &[Binding] = &[
     binding!(
+        "command",
+        ":",
+        "command",
+        "open the command line",
+        true,
+        anywhere
+    ),
+    binding!(
         "line",
         "h/j/k/l",
         "navigate",
@@ -4270,8 +4820,8 @@ const BINDINGS: &[Binding] = &[
     binding!(
         "open",
         "enter",
-        "open",
-        "attach a live session or launch an active unassigned stage",
+        "open/inspect",
+        "focus, safely reattach, inspect, or launch the selected agent",
         true,
         open_available
     ),
@@ -4455,8 +5005,10 @@ fn binding_enabled(app: &App, id: &str) -> bool {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let width = area.width.min(72);
-    let height = area.height.min((BINDINGS.len() + 4) as u16);
+    let width = area.width.min(110);
+    let height = area
+        .height
+        .min((BINDINGS.len().max(COMMANDS.len()) + 4) as u16);
     if width < 30 || height < 8 {
         return;
     }
@@ -4467,22 +5019,50 @@ fn render_help(frame: &mut Frame, area: Rect) {
         height,
     );
     frame.render_widget(Clear, popup);
-    let lines = BINDINGS
-        .iter()
-        .map(|binding| {
-            Line::from(vec![
-                Span::styled(format!(" {:<20}", binding.keys), accent()),
-                Span::raw(binding.description),
-            ])
-        })
-        .collect::<Vec<_>>();
+    let column_width = popup.width.saturating_sub(2) as usize / 2;
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            format!(" {:<width$}", "keys", width = column_width - 1),
+            title(),
+        ),
+        Span::styled("commands", title()),
+    ])];
+    lines.extend((0..BINDINGS.len().max(COMMANDS.len())).map(|index| {
+        let left = BINDINGS.get(index).map_or_else(String::new, |binding| {
+            truncate(
+                &format!("{}  {}", binding.keys, binding.description),
+                column_width.saturating_sub(1),
+            )
+        });
+        let right = COMMANDS.get(index).map_or_else(String::new, |command| {
+            truncate(
+                &format!(
+                    ":{}{}",
+                    command.name,
+                    if command.args.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" {}", command.args)
+                    }
+                ),
+                column_width,
+            )
+        });
+        Line::from(vec![
+            Span::styled(
+                format!(" {:<width$}", left, width = column_width - 1),
+                accent(),
+            ),
+            Span::styled(right, accent()),
+        ])
+    }));
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(accent())
-                .title(" keys ")
+                .title(" keys · commands ")
                 .title_bottom(Line::from(" ? / esc to close ").alignment(Alignment::Center)),
         ),
         popup,
@@ -4836,9 +5416,7 @@ pub fn run(config: Config, scope: &Path) -> Result<()> {
                     Event::Key(key) if app.handle_key(key, &tx) => quit = true,
                     Event::Mouse(mouse) => app.handle_mouse(mouse),
                     Event::Resize(_, _) => {
-                        app.flow.request_fit_view_with_options(
-                            FitViewOptions::default().with_padding(3.0),
-                        );
+                        request_flow_fit(&mut app.flow);
                         app.resize_at = Some(Instant::now());
                     }
                     _ => {}
@@ -5064,6 +5642,137 @@ mod tests {
             .map(|binding| binding.id)
             .collect::<BTreeSet<_>>();
         assert_eq!(ids.len(), BINDINGS.len());
+        assert!(
+            COMMANDS
+                .iter()
+                .all(|command| !command.description.is_empty())
+        );
+    }
+
+    #[test]
+    fn compact_help_keeps_commands_visible() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = app();
+        app.help = true;
+
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("help renders");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains(":mode"));
+        assert!(rendered.contains(":close"));
+    }
+
+    #[test]
+    fn command_mode_completes_recalls_and_sets_autonomy() {
+        let mut app = app();
+        let (tx, _rx) = mpsc::channel();
+
+        app.handle_key(key(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        app.handle_key(key(KeyCode::Char('m'), KeyModifiers::NONE), &tx);
+        app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
+        app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE), &tx);
+        assert_eq!(
+            app.command.as_ref().map(|command| command.text.as_str()),
+            Some("mode ")
+        );
+        for character in "autonomous".chars() {
+            app.handle_key(key(KeyCode::Char(character), KeyModifiers::NONE), &tx);
+        }
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert_eq!(app.preferences.autonomy.to_string(), "autonomous");
+
+        app.handle_key(key(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        app.handle_key(key(KeyCode::Up, KeyModifiers::NONE), &tx);
+        assert_eq!(
+            app.command.as_ref().map(|command| command.text.as_str()),
+            Some("mode autonomous")
+        );
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &tx);
+        assert!(app.command.is_none());
+    }
+
+    #[test]
+    fn reattach_requires_active_persistence_attach_and_display() {
+        let mut app = app();
+        let providers = [
+            "version: orc.provider/v1\nname: attach\ncommand: \"true\"\nactions:\n  session.attach: Attach\n",
+            "version: orc.provider/v1\nname: persistence\nkind: persistence\ncommand: \"true\"\nactions:\n  session.persist: Persist\n",
+            "version: orc.provider/v1\nname: display\nkind: display\ncommand: \"true\"\nactions:\n  terminal.open: Open\n",
+        ]
+        .into_iter()
+        .map(|manifest| serde_yaml::from_str(manifest).expect("provider manifest"))
+        .collect::<Vec<_>>();
+        app.state.sessions[0]
+            .providers
+            .push(crate::domain::ProviderBinding {
+                provider: "persistence".into(),
+                kind: ProviderKind::Persistence,
+                r#ref: Some("session:root".into()),
+                status: BindingStatus::Active,
+                label: "ready".into(),
+            });
+
+        assert_eq!(
+            attach_readiness(&app.state.sessions[0], &providers),
+            AttachReadiness::Reattach
+        );
+    }
+
+    #[test]
+    fn active_session_without_persistence_opens_read_only_inspection() {
+        let app = app();
+        let providers = [
+            "version: orc.provider/v1\nname: inspect\ncommand: \"true\"\nactions:\n  session.inspect: Inspect\n",
+            "version: orc.provider/v1\nname: display\nkind: display\ncommand: \"true\"\nactions:\n  terminal.open: Open\n",
+        ]
+        .into_iter()
+        .map(|manifest| serde_yaml::from_str(manifest).expect("provider manifest"))
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            attach_readiness(&app.state.sessions[0], &providers),
+            AttachReadiness::Inspect
+        );
+    }
+
+    #[test]
+    fn command_input_and_history_are_bounded() {
+        let mut app = app();
+        let (tx, _rx) = mpsc::channel();
+        app.command = Some(CommandLine::default());
+        for _ in 0..MAX_COMMAND_BYTES + 20 {
+            app.handle_command_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &tx);
+        }
+        assert_eq!(app.command.as_ref().unwrap().text.len(), MAX_COMMAND_BYTES);
+
+        app.command = None;
+        for index in 0..MAX_COMMAND_HISTORY + 20 {
+            app.command = Some(CommandLine {
+                text: format!("missing{index}"),
+                ..CommandLine::default()
+            });
+            app.handle_command_key(key(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        }
+        assert_eq!(app.command_history.len(), MAX_COMMAND_HISTORY);
+        assert_eq!(app.command_history.first().unwrap(), "missing20");
+    }
+
+    #[test]
+    fn activity_polling_follows_the_visible_inspector_tab() {
+        let mut app = app();
+        assert!(!app.activity_view_is_open());
+        app.output_tab = OutputTab::Timeline;
+        assert!(app.activity_view_is_open());
+        app.dock = Dock::Hidden;
+        assert!(!app.activity_view_is_open());
     }
 
     #[test]
@@ -5074,7 +5783,7 @@ mod tests {
             .map(|binding| binding.id)
             .collect::<BTreeSet<_>>();
         assert!(tree.contains("view"));
-        assert!(!tree.contains("open"));
+        assert!(tree.contains("open"));
         assert!(!tree.contains("drill"));
         assert!(!tree.contains("provider-validate"));
 
@@ -5452,6 +6161,9 @@ mod tests {
 
         app.provider_at = 0;
         assert_eq!(selected_provider_report(&app), "first is healthy");
+        app.provider_activity
+            .insert("first".into(), "first activity".into());
+        assert_eq!(selected_timeline(&app), "first activity");
         app.provider_at = 1;
         assert_eq!(selected_provider_report(&app), "second is healthy");
     }
@@ -5500,7 +6212,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_selection_and_viewport_restore_from_preferences() {
+    fn forced_graph_relayout_keeps_selection_and_fits_instead_of_restoring_viewport() {
         let mut app = app();
         let mut run = workflow_run();
         run.nodes
@@ -5519,7 +6231,7 @@ mod tests {
             Some("node:run:implement")
         );
         let viewport = app.flow.to_snapshot().viewport;
-        assert_eq!((viewport.x, viewport.y, viewport.zoom), (17.0, -4.0, 1.25));
+        assert_eq!((viewport.x, viewport.y, viewport.zoom), (0.0, 0.0, 1.0));
     }
 
     #[test]
@@ -5575,7 +6287,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_is_hidden_and_inert_without_a_complete_attach_chain() {
+    fn enter_reports_an_unavailable_launch_route() {
         let mut app = app();
         let mut run = workflow_run();
         run.nodes
@@ -5587,11 +6299,11 @@ mod tests {
         app.flow.select_node("node:run:implement");
         let (tx, rx) = mpsc::channel();
 
-        assert!(!open_available(&app));
+        assert!(open_available(&app));
         app.open_selected(&tx);
 
         assert!(!app.action_inflight);
-        assert!(app.status.contains("no ready persistence and display"));
+        assert!(app.status.contains("cannot launch implement"));
         assert!(rx.try_recv().is_err());
     }
 
@@ -5639,7 +6351,7 @@ actions:
             &app.providers,
             Some("executor-a")
         ));
-        assert!(!open_available(&app));
+        assert!(open_available(&app));
     }
 
     #[test]
@@ -5667,7 +6379,7 @@ actions:
         assert!(open_available(&app));
 
         app.launch_ready.clear();
-        assert!(!open_available(&app));
+        assert!(open_available(&app));
     }
 
     #[test]
@@ -6483,6 +7195,61 @@ actions:
     }
 
     #[test]
+    fn parallel_feedback_keeps_endpoint_identity_and_fittable_lanes() {
+        let mut state = app().state;
+        let mut run = workflow_run();
+        run.nodes = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|id| workflow_node(id, LifecycleStatus::Done, 1))
+            .collect();
+        run.edges = [
+            ("a", "c", "depends_on"),
+            ("b", "d", "depends_on"),
+            ("c", "a", "feedback"),
+            ("d", "b", "feedback"),
+        ]
+        .into_iter()
+        .map(|(from, to, relationship)| crate::domain::WorkflowEdge {
+            from: from.into(),
+            to: to.into(),
+            relationship: relationship.into(),
+        })
+        .collect();
+        state.runs.push(run);
+
+        let (flow, _) = build_flow(&state, Some("run"));
+        let feedback = flow
+            .edges()
+            .iter()
+            .filter(|edge| edge.content.relation == "feedback")
+            .collect::<Vec<_>>();
+        assert_eq!(feedback.len(), 2);
+        assert_eq!(
+            feedback
+                .iter()
+                .map(|edge| (
+                    edge.source.as_str(),
+                    edge.target.as_str(),
+                    edge.content.lane
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("node:run:c", "node:run:a", 0),
+                ("node:run:d", "node:run:b", 1)
+            ]
+        );
+        assert_eq!(
+            feedback
+                .iter()
+                .filter(|edge| edge.content.show_label)
+                .count(),
+            1
+        );
+        assert_eq!(graph_visual_padding(&flow, 1.0), GRAPH_FIT_PADDING + 4.0);
+        assert_eq!(graph_visual_padding(&flow, 2.0), GRAPH_FIT_PADDING + 8.0);
+    }
+
+    #[test]
     fn labeled_edges_have_rendered_clearance() {
         let mut state = app().state;
         state.runs.push(reviewed_workflow_run());
@@ -6710,6 +7477,61 @@ actions:
         );
         assert_node_visible(&app.flow, "node:run:implement");
         assert_node_visible(&app.flow, "session:root");
+    }
+
+    #[test]
+    fn compact_graph_hides_inspector_polling() {
+        let mut app = app();
+        app.state.runs.push(workflow_run());
+        app.active_run = Some("run".into());
+        app.explorer_view = ExplorerView::Graph;
+        app.output_tab = OutputTab::Timeline;
+        app.rebuild(true);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("compact terminal");
+
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("compact graph renders");
+
+        assert!(app.hit.inspector.is_none());
+        assert!(!app.activity_view_is_open());
+        app.output_tab = OutputTab::Changes;
+        assert!(!app.changes_view_is_open());
+    }
+
+    #[test]
+    fn fit_shows_a_five_node_workflow_at_normal_terminal_size() {
+        let mut app = app();
+        let mut run = workflow_run();
+        run.nodes = (0..5)
+            .map(|index| workflow_node(&format!("stage-{index}"), LifecycleStatus::Queued, 0))
+            .collect();
+        run.edges = (0..4)
+            .map(|index| crate::domain::WorkflowEdge {
+                from: format!("stage-{index}"),
+                to: format!("stage-{}", index + 1),
+                relationship: "depends_on".into(),
+            })
+            .collect();
+        app.state.runs.push(run);
+        app.active_run = Some("run".into());
+        app.explorer_view = ExplorerView::Graph;
+        app.rebuild(true);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("normal terminal");
+        let (tx, _rx) = mpsc::channel();
+
+        app.run_command("fit", &tx);
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("fitted graph renders");
+
+        assert_node_visible(&app.flow, "session:root");
+        for index in 0..5 {
+            assert_node_visible(&app.flow, &format!("node:run:stage-{index}"));
+        }
+        assert!(app.flow.to_snapshot().viewport.zoom < 0.5);
     }
 
     fn assert_node_visible(flow: &AgentFlow, id: &str) {

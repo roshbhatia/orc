@@ -421,6 +421,8 @@ pub fn resolve_activity_plan(
     providers: &[Manifest],
     mut request: Value,
 ) -> Result<CommandPlan> {
+    request["maxBytes"] = json!(MAX_ACTIVITY_BYTES);
+    request["maxLines"] = json!(MAX_ACTIVITY_LINES);
     let capabilities = [
         Capability::ActivityRead,
         Capability::ExecutionLogs,
@@ -428,7 +430,7 @@ pub fn resolve_activity_plan(
     ];
     let mut failures = Vec::new();
     for capability in capabilities {
-        for provider in candidates(providers, capability) {
+        for provider in activity_candidates(providers, capability, &request) {
             request["capability"] = Value::String(capability.to_string());
             request["plan"] = Value::Null;
             match invoke_raw(provider, &request, config, None)
@@ -447,6 +449,42 @@ pub fn resolve_activity_plan(
         "no activity provider accepted the session: {}",
         failures.join("; ")
     )
+}
+
+fn activity_candidates<'a>(
+    providers: &'a [Manifest],
+    capability: Capability,
+    request: &Value,
+) -> Vec<&'a Manifest> {
+    let mut selected = candidates_for_request(providers, capability, request);
+    let explicitly_selected = request
+        .get("providers")
+        .and_then(|providers| providers.get(capability.to_string()))
+        .and_then(Value::as_str)
+        .is_some();
+    if explicitly_selected {
+        return selected;
+    }
+    let preferred = request
+        .get("session")
+        .and_then(|session| session.get("providers"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|binding| {
+            binding.get("kind").and_then(Value::as_str) == Some("activity")
+                && binding.get("status").and_then(Value::as_str) == Some("active")
+                && binding
+                    .get("ref")
+                    .and_then(Value::as_str)
+                    .is_some_and(|reference| !reference.is_empty())
+        })
+        .and_then(|binding| binding.get("provider"))
+        .and_then(Value::as_str);
+    if let Some(preferred) = preferred {
+        selected.sort_by_key(|provider| provider.name != preferred);
+    }
+    selected
 }
 
 pub fn schema() -> serde_json::Value {
@@ -2504,6 +2542,24 @@ pub fn run_plan_with_timeout(
     scope: &Path,
     timeout: std::time::Duration,
 ) -> Result<CommandResult> {
+    run_plan_with_timeout_retention(
+        plan,
+        scope,
+        timeout,
+        MAX_PROVIDER_OUTPUT_BYTES,
+        None,
+        OutputRetention::Head,
+    )
+}
+
+fn run_plan_with_timeout_retention(
+    plan: &CommandPlan,
+    scope: &Path,
+    timeout: std::time::Duration,
+    max_stdout_bytes: usize,
+    max_stdout_lines: Option<usize>,
+    stdout_retention: OutputRetention,
+) -> Result<CommandResult> {
     let started = Instant::now();
     let program = plan.command.first().context("command plan is empty")?;
     let working_directory = plan_working_directory(plan, scope)?;
@@ -2520,7 +2576,12 @@ pub fn run_plan_with_timeout(
     let mut child = command
         .spawn()
         .with_context(|| format!("start command plan {program}"))?;
-    let stdout = drain_bounded(child.stdout.take().context("command plan stdout")?);
+    let stdout = drain_bounded_with(
+        child.stdout.take().context("command plan stdout")?,
+        max_stdout_bytes,
+        max_stdout_lines,
+        stdout_retention,
+    );
     let stderr = drain_bounded(child.stderr.take().context("command plan stderr")?);
     let status = match child.wait_timeout(timeout)? {
         Some(status) => status,
@@ -2581,10 +2642,36 @@ struct BoundedOutput {
 struct OutputDrain {
     receiver: Receiver<io::Result<BoundedOutput>>,
     cancel: Arc<AtomicBool>,
+    retention: OutputRetention,
+    max_lines: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputRetention {
+    Head,
+    Tail,
 }
 
 #[cfg(unix)]
-fn drain_bounded<R>(mut reader: R) -> OutputDrain
+fn drain_bounded<R>(reader: R) -> OutputDrain
+where
+    R: AsRawFd + Read + Send + 'static,
+{
+    drain_bounded_with(
+        reader,
+        MAX_PROVIDER_OUTPUT_BYTES,
+        None,
+        OutputRetention::Head,
+    )
+}
+
+#[cfg(unix)]
+fn drain_bounded_with<R>(
+    mut reader: R,
+    max_bytes: usize,
+    max_lines: Option<usize>,
+    retention: OutputRetention,
+) -> OutputDrain
 where
     R: AsRawFd + Read + Send + 'static,
 {
@@ -2609,9 +2696,31 @@ where
                 if read == 0 {
                     break;
                 }
-                let remaining = MAX_PROVIDER_OUTPUT_BYTES.saturating_sub(output.len());
-                output.extend_from_slice(&buffer[..read.min(remaining)]);
-                truncated |= read > remaining;
+                match retention {
+                    OutputRetention::Head => {
+                        let remaining = max_bytes.saturating_sub(output.len());
+                        output.extend_from_slice(&buffer[..read.min(remaining)]);
+                        truncated |= read > remaining;
+                    }
+                    OutputRetention::Tail => {
+                        let incoming = &buffer[..read];
+                        if incoming.len() >= max_bytes {
+                            output.clear();
+                            output.extend_from_slice(&incoming[incoming.len() - max_bytes..]);
+                            truncated = true;
+                        } else {
+                            let excess = output
+                                .len()
+                                .saturating_add(incoming.len())
+                                .saturating_sub(max_bytes);
+                            if excess > 0 {
+                                output.drain(..excess);
+                                truncated = true;
+                            }
+                            output.extend_from_slice(incoming);
+                        }
+                    }
+                }
             }
             Ok(BoundedOutput {
                 bytes: output,
@@ -2621,7 +2730,12 @@ where
         })();
         let _ = sender.send(result);
     });
-    OutputDrain { receiver, cancel }
+    OutputDrain {
+        receiver,
+        cancel,
+        retention,
+        max_lines,
+    }
 }
 
 #[cfg(unix)]
@@ -2658,6 +2772,8 @@ fn finish_drain(drain: OutputDrain) -> Result<String> {
 }
 
 fn finish_drain_with_timeout(drain: OutputDrain, timeout: std::time::Duration) -> Result<String> {
+    let retention = drain.retention;
+    let max_lines = drain.max_lines;
     let output = match drain.receiver.recv_timeout(timeout) {
         Ok(output) => output?,
         Err(RecvTimeoutError::Timeout) => {
@@ -2667,8 +2783,28 @@ fn finish_drain_with_timeout(drain: OutputDrain, timeout: std::time::Duration) -
         Err(RecvTimeoutError::Disconnected) => bail!("output reader stopped unexpectedly"),
     };
     let mut rendered = String::from_utf8_lossy(&output.bytes).into_owned();
-    if output.truncated {
-        rendered.push_str("\n[output truncated by Orc]\n");
+    let mut truncated = output.truncated;
+    if retention == OutputRetention::Tail
+        && output.truncated
+        && let Some(line_end) = rendered.find('\n')
+    {
+        rendered.drain(..=line_end);
+    }
+    if let Some(max_lines) = max_lines {
+        let line_count = rendered.lines().count();
+        if line_count > max_lines
+            && let Some((line_end, _)) =
+                rendered.match_indices('\n').nth(line_count - max_lines - 1)
+        {
+            rendered.drain(..=line_end);
+            truncated = true;
+        }
+    }
+    if truncated {
+        match retention {
+            OutputRetention::Head => rendered.push_str("\n[output truncated by Orc]\n"),
+            OutputRetention::Tail => rendered.insert_str(0, "[earlier output truncated by Orc]\n"),
+        }
     }
     if output.stream_open {
         rendered.push_str("\n[output stream remained open after command exit]\n");
@@ -2731,6 +2867,29 @@ pub fn capture_plan(
     timeout: std::time::Duration,
 ) -> Result<String> {
     let result = run_plan_with_timeout(plan, scope, timeout)?;
+    if !plan.accepts(result.code) {
+        let message = result.stderr.trim();
+        if message.is_empty() {
+            bail!("command plan exited with {}", result.code);
+        }
+        bail!("{message}");
+    }
+    Ok(result.stdout)
+}
+
+pub fn capture_activity_plan(
+    plan: &CommandPlan,
+    scope: &Path,
+    timeout: std::time::Duration,
+) -> Result<String> {
+    let result = run_plan_with_timeout_retention(
+        plan,
+        scope,
+        timeout,
+        MAX_ACTIVITY_BYTES as usize,
+        Some(MAX_ACTIVITY_LINES),
+        OutputRetention::Tail,
+    )?;
     if !plan.accepts(result.code) {
         let message = result.stderr.trim();
         if message.is_empty() {
@@ -2829,6 +2988,12 @@ JSON
 JSON
     ;;
 esac
+"#;
+
+    const ACTIVITY_PROVIDER: &str = r#"#!/bin/sh
+request=$(cat)
+printf '%s\n' "$request" > '{{ request }}'
+printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
 "#;
 
     fn provider_manifest(name: &str, command: &Path, priority: i64) -> Manifest {
@@ -4044,6 +4209,106 @@ third line
         let tail = read_file_tail(&path, 20).expect("activity tail");
 
         assert_eq!(String::from_utf8(tail).expect("utf-8 tail"), "third line\n");
+    }
+
+    #[test]
+    fn activity_resolution_prefers_the_active_activity_binding() {
+        let mut preferred = provider_manifest("preferred", Path::new("true"), 0);
+        preferred.actions =
+            BTreeMap::from([(Capability::ActivityRead, "Read preferred activity".into())]);
+        let mut higher_priority = provider_manifest("other", Path::new("true"), 100);
+        higher_priority.actions =
+            BTreeMap::from([(Capability::ActivityRead, "Read other activity".into())]);
+        let providers = [higher_priority, preferred];
+        let request = json!({
+            "session": {
+                "providers": [{
+                    "provider": "preferred",
+                    "kind": "activity",
+                    "status": "active",
+                    "ref": "trace-1"
+                }]
+            }
+        });
+
+        let selected = activity_candidates(&providers, Capability::ActivityRead, &request);
+
+        assert_eq!(selected[0].name, "preferred");
+    }
+
+    #[test]
+    fn activity_resolution_sends_capture_limits() {
+        let directory = tempfile::tempdir().expect("activity provider directory");
+        let recorded = directory.path().join("request.json");
+        let command = write_provider(
+            directory.path(),
+            "activity-provider",
+            &render_fixture(
+                ACTIVITY_PROVIDER,
+                json!({"request": recorded.display().to_string()}),
+            ),
+        );
+        let mut provider = provider_manifest("activity", &command, 0);
+        provider.actions =
+            BTreeMap::from([(Capability::ActivityRead, "Read recent activity".into())]);
+
+        resolve_activity_plan(
+            &Config::default(),
+            &[provider],
+            json!({"scope": directory.path(), "session": {}}),
+        )
+        .expect("activity plan");
+        let request: Value =
+            serde_json::from_slice(&fs::read(recorded).expect("recorded activity request"))
+                .expect("activity request json");
+
+        assert_eq!(request["maxBytes"], MAX_ACTIVITY_BYTES);
+        assert_eq!(request["maxLines"], MAX_ACTIVITY_LINES);
+    }
+
+    #[test]
+    fn activity_capture_retains_the_newest_lines() {
+        let plan = CommandPlan {
+            version: "orc.provider/v1".into(),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "i=0; while [ $i -lt 120 ]; do printf 'line-%03d\\n' \"$i\"; i=$((i + 1)); done"
+                    .into(),
+            ],
+            cwd: None,
+            environment: BTreeMap::new(),
+            success_codes: vec![0],
+        };
+
+        let activity = capture_activity_plan(&plan, Path::new("."), Duration::from_secs(1))
+            .expect("activity capture");
+
+        assert!(activity.contains("line-119"));
+        assert!(!activity.contains("line-000"));
+        assert!(activity.starts_with("[earlier output truncated by Orc]"));
+    }
+
+    #[test]
+    fn activity_capture_retains_an_oversized_line_tail() {
+        let plan = CommandPlan {
+            version: "orc.provider/v1".into(),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "yes x | tr -d '\\n' | head -c 270000; printf LATEST".into(),
+            ],
+            cwd: None,
+            environment: BTreeMap::new(),
+            success_codes: vec![0],
+        };
+
+        let activity = capture_activity_plan(&plan, Path::new("."), Duration::from_secs(2))
+            .expect("activity capture");
+
+        assert!(activity.starts_with("[earlier output truncated by Orc]"));
+        assert!(activity.ends_with("LATEST"));
+        assert!(activity.len() <= MAX_ACTIVITY_BYTES as usize + 64);
     }
 
     #[cfg(unix)]

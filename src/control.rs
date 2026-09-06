@@ -5130,4 +5130,25 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         assert_eq!(calls, vec![provider::Action::Focus]);
         assert_eq!(outcome.disposition, AttachDisposition::Focused);
     }
+
+    #[test]
+    fn active_session_without_persistence_requires_inspection() {
+        let mut calls = Vec::new();
+
+        let error = execute_attach_with(
+            provider::Action::Attach,
+            false,
+            true,
+            false,
+            "agent",
+            |action| {
+                calls.push(action);
+                Ok((0, true))
+            },
+        )
+        .expect_err("active session without persistence must not resume");
+
+        assert!(calls.is_empty());
+        assert!(error.to_string().contains("inspect it"));
+    }
 }
