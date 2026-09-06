@@ -18,7 +18,7 @@ let
   providerRuntimeInputs = [ bash ] ++ runtimeInputs;
   adapter = stdenvNoCC.mkDerivation {
     pname = "orc-provider-${name}-adapter";
-    version = "0.11.0";
+    version = "0.11.1";
     dontUnpack = true;
     strictDeps = true;
 
