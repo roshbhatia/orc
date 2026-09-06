@@ -4,6 +4,7 @@
       "enum": [
         "provider.validate",
         "activity.read",
+        "messages.read",
         "changes.inspect",
         "session.attach",
         "session.bind",
@@ -138,6 +139,9 @@
           "type": "string"
         },
         "execution.status": {
+          "type": "string"
+        },
+        "messages.read": {
           "type": "string"
         },
         "provider.validate": {

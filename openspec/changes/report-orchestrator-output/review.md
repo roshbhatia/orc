@@ -1,4 +1,4 @@
-# Planning Review
+# Review
 
 The adversarial reviewer found six material contract defects. The independent mediator accepted four and reframed two. The revised artifacts now:
 
@@ -11,7 +11,7 @@ The adversarial reviewer found six material contract defects. The independent me
 
 ## Decision
 
-Approved for implementation after the six corrections. Implementation review remains required by tasks 1.3, 2.3, and 3.2.
+The structured checkpoint contract and provider-backed assistant Output implementation are approved after mediated corrections. Release remains pending task 4.3.
 
 ## Implementation Mediation
 
@@ -45,3 +45,17 @@ The state, interface, and TUI critics returned CLEAN. The independent mediator
 also returned CLEAN after checking the focused tests, strict specification
 review, and diff integrity. The deferred workspace-state persistence concern
 remains task 3.4 and does not block this change.
+
+### Round 6
+
+The Output semantics reviewer found three concrete defects:
+
+- a stray escape before UTF-8 could panic the sanitizer and leave Output loading forever;
+- generic inspector truncation used an Activity label for Output; and
+- the earlier live-orchestration delta still assigned structured JSON to Output.
+
+The implementation now sanitizes without panics, uses inspector-specific omission labels, and assigns structured data to Checkpoint in both active changes.
+
+The live-behavior reviewer found that Output inherited Activity's active-session filter. A completed run could show an Output tab but could not read its archived orchestrator. Output now has a separate subject resolver that supports archived sessions while Activity retains its active-only policy.
+
+Both independent reviewers returned CLEAN after the corrections. They verified provider neutrality, exact Traces command compatibility, session and workflow selection, Activity and Checkpoint isolation, loading and error retention, scroll preservation, generated interfaces, and complete OpenSpec artifacts. Native tests ran without an Orc runtime or broker.

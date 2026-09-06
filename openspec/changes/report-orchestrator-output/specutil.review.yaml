@@ -1,37 +1,49 @@
 version: 2
 change: report-orchestrator-output
 decision: approved
-note: approved after round-4 mediated correction
-change_hash: 03b8fd9ff89282e8
-base_commit: 555051e3f97dd26e1d6a2728cd865e422cdc6fa0
+note: approved after independent provider semantics and live behavior reviews
+change_hash: 170ee123ec3e536e
+base_commit: 911b5fb10fcf5517b049322fe5065d1d8eaad381
 items:
+    0c006ee499f5879b:
+        hash: 335b6728ae399ca8
+        text: Keep the backward-compatible `reportedOutput` envelope and JSON-null round trip
     1cf64d9b99141edb:
         hash: c13a4b8bbb9208a4
         text: Regenerate schemas, completions, and reference documentation
-    7bd65e8f08fefc8f:
-        hash: 60512d562084676f
-        text: Add equivalent CLI inline/file/stdin and MCP report operations with generated interface coverage writes:` src/cli.rs,src/mcp.rs
-    24cc133e544a3de6:
-        hash: ef4a7704c367d5a6
-        text: Run focused and full checks, strict OpenSpec validation, and mediated adversarial review
-    0538ce559b2b7260:
-        hash: 039081581f81baaf
-        text: Follow up separately on compact or bounded workspace-state persistence; this change does not alter state serialization writes:` src/state.rs
-    4688d7b9bb1a643a:
-        hash: b19fd1e287bfa305
-        text: 'Adversarial review: audit state integrity, authorization, and size enforcement writes:` openspec/changes/report-orchestrator-output/review.md'
-    ac8e4f7371bd7b1a:
-        hash: 821cdf7e57de3451
-        text: Add bounded self-scoped orchestrator reporting with terminating-session, oversized-value, and unchanged-state inverse tests writes:` src/control.rs
-    b6cf430c2643f34f:
-        hash: ee9536efb4a1de21
-        text: Add a backward-compatible reported-output envelope with JSON-null round-trip and preservation tests writes:` src/domain.rs,src/control.rs
-    b455970afa4580d8:
-        hash: 542ee595883d1c8b
-        text: Commit, release, update sysinit and Laurel, switch, and verify the installed flow
-    bc34311d677aa7af:
-        hash: e48ffdabb4438b14
-        text: 'Adversarial review: audit interface parity and inspector behavior writes:` openspec/changes/report-orchestrator-output/review.md'
-    d5628dc63f5ce79d:
-        hash: db1c5b4fb270dafb
-        text: Render complete or honestly bounded session output in the TUI and keep Activity isolated writes:` src/tui.rs
+    24cab0f11f90de4e:
+        hash: f52bf414a827119c
+        text: Add provider-neutral `messages.read` discovery, validation, plan resolution, and bounded capture writes:` src/provider.rs
+    33ff9a633dcf3554:
+        hash: 6055fb5a0f57d97d
+        text: Run focused and full checks, strict OpenSpec validation, and Nix checks
+    47c45adf94c6c4db:
+        hash: 1e0fb0a8425d7d20
+        text: Add the optional Traces adapter for the native one-shot output command writes:` extras/traces
+    657ff64c9b6994fc:
+        hash: 142bce03634f9c9d
+        text: Complete mediated review, commit, release, update consumers, and verify the installed flow
+    95415d4e4ff37d5a:
+        hash: 17600ae395109bf6
+        text: Keep bounded self-scoped CLI and MCP report operations
+    96620344b117b10b:
+        hash: 6c4a3317f1e9afd4
+        text: Keep complete or honestly bounded structured JSON rendering under Checkpoint
+    3283135936f50bc2:
+        hash: d111cca5e6902cd0
+        text: Split Activity, Output, Checkpoint, Gates, and Health variants and move structured reports to Checkpoint writes:` src/tui.rs
+    82048444719867bc:
+        hash: 557216f45f9a6cde
+        text: 'Adversarial review: verify inspector selection, loading, error retention, scrolling, and live polling writes:` openspec/changes/report-orchestrator-output/review.md'
+    a2e2ce538bc4b53b:
+        hash: 6f52960dc8fc9bf3
+        text: 'Adversarial review: retain the prior structured report integrity and authorization findings writes:` openspec/changes/report-orchestrator-output/review.md'
+    f38a7143350df989:
+        hash: 2b2705b148ed1870
+        text: Add focused separation, refresh-preservation, UTF-8, ANSI, and adapter tests writes:` src/provider.rs,src/tui.rs,extras/traces/test.sh
+    ffb91487faef80f7:
+        hash: f62ffb0cf0f33197
+        text: Add separate Output cache, loading, refresh-error, and polling state without persisting transcript data writes:` src/tui.rs
+    ffc15e5200b793d7:
+        hash: 432f252cc5ceaaaf
+        text: 'Adversarial review: verify provider neutrality, capability isolation, capture bounds, and adapter compatibility writes:` openspec/changes/report-orchestrator-output/review.md'

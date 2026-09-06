@@ -1,78 +1,81 @@
 ## Context
 
-See `proposal.md` for motivation. Orc already persists structured node output and enforces a one-megabyte serialized limit. Session state has no equivalent field or reporting operation, so the orchestrator Output inspector cannot leave its empty state.
+Orc already has two distinct data sources. Activity is a provider-backed operational stream. A session or workflow node can also report one structured JSON value into `WorkspaceState`. The dashboard labeled the structured value Output, although users use Output to mean visible assistant prose.
 
 ## Goals / Non-Goals
 
 **Goals:**
 
-- Reuse one structured JSON value and the existing output-size bound.
-- Keep old workspace files readable.
-- Give CLI and MCP one authorization and mutation path.
-- Preserve Output and Activity as separate user concepts.
+- Give assistant prose, operational activity, and structured checkpoints distinct contracts.
+- Read prose through a provider-neutral command plan.
+- Keep refreshes bounded, responsive, and failure tolerant.
+- Preserve the existing structured report API and on-disk format.
 
 **Non-Goals:**
 
-- Infer output from transcripts, provider logs, or the final visible message.
-- Add provider-specific output readers.
-- Add output history or artifact storage in this change.
-- Let one orchestrator report output for another orchestrator.
+- Store transcripts in Orc state.
+- Teach Orc core about a harness, transcript path, or Traces.
+- Infer assistant prose from operational activity.
+- Add output history or artifact storage.
 
 ## Decisions
 
-### Store an optional reported-output envelope on the session
+### Reserve Output for provider-backed assistant prose
 
-Add an optional, defaulted envelope containing the structured value to the session record. The envelope makes an explicit JSON `null` distinct from an absent report after serialization. It also keeps old workspace files valid. A separate output resource would add identity and consistency work without providing useful history in this change.
+`messages.read` accepts the standard session request and returns a command plan. The command prints chronological, user-visible assistant text. Providers exclude user prompts, reasoning, and tool rows. Orc does not parse a native transcript.
 
-### Report through one self-scoped domain operation
+Resolution never falls back to `activity.read`, `execution.logs`, or `session.inspect`. A provider may advertise both Activity and Output, but each capability follows its own plan.
 
-The domain operation accepts a session identifier, verifies that the workspace and session are active, verifies that the session is not terminating and has the orchestrator role, enforces the shared serialized-size limit, and replaces the value in one workspace transaction. MCP supplies its current session from the runtime context. CLI requires `ORC_SESSION_ID` and uses the same operation.
+### Rename structured reported output to Checkpoint in the inspector
 
-`ORC_SESSION_ID` is trusted routing metadata, not an authentication credential. Exact session selection plus role and lifecycle checks prevent cooperative or accidental cross-session reports. A same-user process can spoof this environment value and access the same state files. Strong spoof resistance therefore requires an execution provider that isolates environment and filesystem access.
+The persisted `reportedOutput` field, `orc session report`, and MCP reporting tool remain unchanged for compatibility. Only the dashboard concept changes. Session and node structured JSON appears under Checkpoint. Run gates and provider health use their own enum variants instead of sharing a generic Result variant.
 
-An operator can inspect any retained session with `orc session show <id> --json`, including archived sessions, but cannot pass a target identifier to the reporting command. MCP keeps the same caller-scoped reporting rule.
+This is a UI correction, not a state migration. Old workspaces remain readable, and an explicit JSON `null` remains distinct from an absent checkpoint.
 
-### Accept JSON inline or through a file stream at the CLI boundary
+### Keep Output cache state independent
 
-The CLI accepts either one inline JSON argument or `--file <path>`, with `-` reading standard input, and parses it before the transaction. The two sources are mutually exclusive. MCP already transports JSON values. Strings remain valid structured values when callers intentionally quote them as JSON. This avoids an ambiguous plain-text fallback and process argument limits.
+The TUI keeps per-session Output values, load times, in-flight markers, and refresh errors separately from Activity. It polls only while the Output tab is visible. A successful refresh replaces the value and clears the error. A failed refresh records the error without deleting the last successful value or changing inspector scroll.
 
-### Render stored output through an output-specific bound
+The refresh interval reuses the configured live-activity interval. This avoids another timing setting while preserving prompt updates after the provider reports new messages.
 
-The Output inspector streams pretty JSON into a byte-and-line capped writer. Serialization stops when either inspector limit is reached, so a compact value cannot amplify into an unbounded pretty-printed allocation. It renders the complete value when serialization finishes inside the bound. Larger values receive an output-specific preview labeled with the number of rendered prefix bytes and a shell-safe `orc session show --json --scope <scope> -- <id>` command. The option terminator keeps option-like session identifiers positional. If an unusually large identifier would push the inspector body past its generic budget, Orc uses `orc session list --json --scope <scope>` instead. Both commands return the complete retained value from the TUI's resolved scope. Missing data retains the current explicit empty state. Activity content and Activity-specific truncation labels never enter this path.
+### Bound text at the provider boundary and inspector boundary
 
-### Return a bounded report receipt
+The provider request supplies byte and line limits. Orc also caps captured stdout using tail retention, so an uncooperative provider cannot allocate an unbounded TUI value. Truncation drops an incomplete leading line, preserves valid UTF-8, and retains complete ANSI sequences in ordinary line-oriented output. The inspector applies its existing final byte and line bounds before rendering ANSI into Ratatui text.
 
-The report mutation returns a receipt instead of the updated session. The receipt contains the constant `reported` status, the compact serialized input byte count, and an RFC 3339 UTC update time with millisecond precision. CLI and MCP therefore acknowledge a near-limit report with bounded output instead of pretty-printing the stored value again. Callers use `orc session show` when they need the retained value.
+### Keep adoption and backfill metadata-only
 
-### Advertise MCP tools only in active session context
+Session registration and provider enrichment continue to store identity, title, purpose, goal, and bindings. They do not copy transcript content into `WorkspaceState`. The Output cache is process-local and can be rebuilt from the selected provider.
 
-MCP tool discovery resolves `ORC_SCOPE` and `ORC_SESSION_ID` through the same active-session lookup used by tool calls. It returns the full provider-neutral catalog only when both values identify an active Orc session. Otherwise it returns an empty catalog. This makes Orc composable with direct harness use without adding harness-specific fallbacks.
+### Implement Traces as an optional extra
 
-### Keep reports with the session that produced them
+The Traces manifest advertises `messages.read`. Its adapter returns this plan:
 
-Same-session registration, refresh, keepalive, and lifecycle mutations preserve the envelope. Root adoption archives the old orchestrator with its output intact and creates the replacement without output. Copying output would falsely attribute one session's report to another.
+```text
+traces --view output --once --session <native-id> [--service <harness>] --color always
+```
+
+The command contract returns user-visible assistant prose only. Orc knows only the manifest capability and returned command plan.
 
 ## Risks / Trade-offs
 
-- A single value has no history. The durable state remains small, and providers can own larger artifact histories.
-- The compact one-megabyte domain limit does not bound pretty-printed workspace state. The inspector stops serialization at its own limits, but state persistence still pretty-serializes the complete workspace. A separate follow-up must bound or compact persistence without changing the on-disk contract in this patch.
-- Adding a field changes generated schemas. Defaulted deserialization and generated-file checks protect backward compatibility.
-- Same-user processes can spoof `ORC_SESSION_ID` unless their execution environment isolates Orc state and routing variables. The CLI describes this value as routing context and does not claim an authentication boundary.
+- A provider failure can make Output stale. The inspector shows the last good value with an explicit refresh error.
+- Process-local caching means a restarted TUI rereads Output. It prevents transcript content from entering durable orchestration state.
+- Providers define what counts as user-visible prose. Provider validation and focused adapter tests protect the contract boundary, but Orc cannot semantically inspect arbitrary text.
 
 ## Migration Plan
 
-1. Add the optional field and preservation tests.
-2. Add the domain report operation and inverse authorization and size tests.
-3. Expose CLI and MCP entry points and update generated interfaces.
-4. Render the value and test reported, absent, and activity-only states.
-5. Validate old workspace fixtures and the full package before release.
+1. Add `messages.read` to the provider schema and resolver.
+2. Split inspector variants and move structured reports to Checkpoint.
+3. Add independent Output refresh state and tests.
+4. Extend the optional Traces provider and its deterministic adapter test.
+5. Regenerate interfaces and run the full release checks.
 
-Rollback to `v0.10.9` can discard reported output on the next state write because that binary does not retain unknown fields. Before rollback, export the workspace with the current binary and retain that file for restore after re-upgrade. Treat rollback after a report as destructive to the new output field and require explicit confirmation.
+Rollback removes the live Output reader but does not alter stored workspace data. Structured reports remain in the existing `reportedOutput` field.
 
 ## Rollout & Gating
 
-The change can ship after focused report tests, the full Rust suite, generated-file checks, strict OpenSpec validation, and a packaged TUI assertion all pass. The sysinit and Laurel inputs update only after the tagged release succeeds on the three supported platforms.
+Ship after focused provider and TUI tests, the full Rust suite, generated-file checks, strict OpenSpec validation, and Nix checks pass.
 
 ## Adversarial Review
 
-An implementation critic checks authorization, lost-update risk, backward-compatible deserialization, size enforcement, and Activity isolation. A separate mediator accepts, rejects, reframes, or defers each objection before rollout.
+One reviewer checks provider and TUI semantics. A second reviewer checks the isolated CLI and live refresh behavior. Both reviews must verify Activity, Output, and Checkpoint isolation, exact `messages.read` compatibility, loading and error retention, scroll behavior, and complete OpenSpec artifacts. Only concrete correctness blockers change the implementation.

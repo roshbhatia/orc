@@ -1,9 +1,9 @@
 version: 2
 change: unify-live-orchestration
 decision: approved
-note: Independent mediation found no remaining material defect; live animation and attachment checks passed.
-change_hash: 1c83d83857a020ea
-base_commit: 915a7d976b2f9a22b2fdc1eb34d06ffea90bb4af
+note: structured report inspector terminology aligned with the owner clarified Output contract
+change_hash: e0dd70b284e6e5eb
+base_commit: 911b5fb10fcf5517b049322fe5065d1d8eaad381
 items:
     0cb25f1104e341ce:
         hash: ca14a4b3ef4693b2

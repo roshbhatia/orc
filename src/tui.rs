@@ -77,8 +77,11 @@ enum Focus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OutputTab {
     Summary,
-    Timeline,
-    Result,
+    Activity,
+    Gates,
+    Health,
+    Checkpoint,
+    Output,
     Changes,
 }
 
@@ -741,6 +744,10 @@ enum BackgroundResult {
         session_id: String,
         result: Result<String, String>,
     },
+    Output {
+        session_id: String,
+        result: Result<String, String>,
+    },
     ProviderActivity {
         provider_name: String,
         result: String,
@@ -783,6 +790,10 @@ struct App {
     activity_loaded_at: BTreeMap<String, Instant>,
     activity_observed_at: BTreeMap<String, Instant>,
     activity_loading: BTreeSet<String>,
+    output: BTreeMap<String, String>,
+    output_errors: BTreeMap<String, String>,
+    output_loaded_at: BTreeMap<String, Instant>,
+    output_loading: BTreeSet<String>,
     provider_activity: BTreeMap<String, String>,
     provider_activity_loaded_at: BTreeMap<String, Instant>,
     provider_activity_loading: BTreeSet<String>,
@@ -882,6 +893,10 @@ impl App {
             activity_loaded_at: BTreeMap::new(),
             activity_observed_at: BTreeMap::new(),
             activity_loading: BTreeSet::new(),
+            output: BTreeMap::new(),
+            output_errors: BTreeMap::new(),
+            output_loaded_at: BTreeMap::new(),
+            output_loading: BTreeSet::new(),
             provider_activity: BTreeMap::new(),
             provider_activity_loaded_at: BTreeMap::new(),
             provider_activity_loading: BTreeSet::new(),
@@ -923,8 +938,11 @@ impl App {
             ExplorerView::Tree
         };
         self.output_tab = match preferences.inspector_tab.as_str() {
-            "timeline" => OutputTab::Timeline,
-            "result" => OutputTab::Result,
+            "timeline" | "activity" => OutputTab::Activity,
+            "gates" => OutputTab::Gates,
+            "health" => OutputTab::Health,
+            "checkpoint" | "result" => OutputTab::Checkpoint,
+            "output" => OutputTab::Output,
             "changes" => OutputTab::Changes,
             _ => OutputTab::Summary,
         };
@@ -994,6 +1012,7 @@ impl App {
             || self.provider_refresh_inflight
             || self.changes_loading
             || !self.activity_loading.is_empty()
+            || !self.output_loading.is_empty()
             || !self.provider_activity_loading.is_empty()
             || !self.provider_validation_loading.is_empty()
             || self.flow.is_dragging()
@@ -1282,6 +1301,20 @@ impl App {
                 self.activity.insert(session_id, activity);
                 self.rebuild(false);
             }
+            BackgroundResult::Output { session_id, result } => {
+                self.output_loading.remove(&session_id);
+                self.output_loaded_at
+                    .insert(session_id.clone(), Instant::now());
+                match result {
+                    Ok(output) => {
+                        self.output.insert(session_id.clone(), output);
+                        self.output_errors.remove(&session_id);
+                    }
+                    Err(error) => {
+                        self.output_errors.insert(session_id, error);
+                    }
+                }
+            }
             BackgroundResult::ProviderActivity {
                 provider_name,
                 result,
@@ -1350,14 +1383,21 @@ impl App {
 
     fn activity_view_is_open(&self) -> bool {
         self.inspector_view_is_visible()
-            && self.output_tab == OutputTab::Timeline
+            && self.output_tab == OutputTab::Activity
             && self.main_tab == MainTab::Work
             && self.selected_activity_subject().is_some()
     }
 
+    fn output_view_is_open(&self) -> bool {
+        self.inspector_view_is_visible()
+            && self.output_tab == OutputTab::Output
+            && self.main_tab == MainTab::Work
+            && self.selected_message_subject().is_some()
+    }
+
     fn provider_activity_view_is_open(&self) -> bool {
         self.inspector_view_is_visible()
-            && self.output_tab == OutputTab::Timeline
+            && self.output_tab == OutputTab::Activity
             && self.main_tab == MainTab::Integrations
             && matches!(self.selected(), Some(ItemRef::Provider(_)))
     }
@@ -1394,7 +1434,7 @@ impl App {
         if !self.activity_view_is_open() {
             return;
         }
-        let Some(subject) = self.selected_activity_subject() else {
+        let Some(subject) = self.selected_message_subject() else {
             return;
         };
         let key = subject.key.to_owned();
@@ -1426,6 +1466,43 @@ impl App {
                 })
                 .map_err(|error| format!("{error:#}"));
             let _ = tx.send(BackgroundResult::Activity {
+                session_id: key,
+                result,
+            });
+        });
+    }
+
+    fn request_output(&mut self, tx: &Sender<BackgroundResult>, force: bool) {
+        if !self.output_view_is_open() {
+            return;
+        }
+        let Some(subject) = self.selected_activity_subject() else {
+            return;
+        };
+        let key = subject.key.to_owned();
+        let session = subject.session.clone();
+        if self.output_loading.contains(&key) {
+            return;
+        }
+        let fresh = self.output_loaded_at.get(&key).is_some_and(|at| {
+            at.elapsed() < Duration::from_millis(self.config.ui.activity_refresh_ms)
+        });
+        if !force && fresh {
+            return;
+        }
+        self.output_loading.insert(key.clone());
+        let config = self.config.clone();
+        let providers = self.providers.clone();
+        let scope = self.scope.clone();
+        let tx = tx.clone();
+        thread::spawn(move || {
+            let request = provider::action_request(Action::Output, &scope, Some(&session), "right");
+            let result = provider::resolve_messages_plan(&config, &providers, request)
+                .and_then(|plan| {
+                    provider::capture_messages_plan(&plan, &scope, config.provider_timeout())
+                })
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(BackgroundResult::Output {
                 session_id: key,
                 result,
             });
@@ -1559,6 +1636,48 @@ impl App {
                         key: &session.id,
                         session,
                         provenance: Some(format!("From run orchestrator · {}", session.title)),
+                    })
+            }
+            ItemRef::Provider(_) | ItemRef::History => None,
+        }
+    }
+
+    fn selected_message_subject(&self) -> Option<ActivitySubject<'_>> {
+        let run_orchestrator = |run_id: &str| {
+            self.state
+                .runs
+                .iter()
+                .find(|run| run.id == run_id)
+                .and_then(|run| run.orchestrator_id.as_deref())
+                .and_then(|id| self.state.sessions.iter().find(|session| session.id == id))
+        };
+        match self.selected()? {
+            ItemRef::Session(id) => self
+                .state
+                .sessions
+                .iter()
+                .find(|session| session.id == id)
+                .map(|session| ActivitySubject {
+                    key: &session.id,
+                    session,
+                    provenance: None,
+                }),
+            ItemRef::Run(run_id) => run_orchestrator(&run_id).map(|session| ActivitySubject {
+                key: &session.id,
+                session,
+                provenance: None,
+            }),
+            ItemRef::Node(run_id, node_id) => {
+                let run = self.state.runs.iter().find(|run| run.id == run_id)?;
+                let node = run.nodes.iter().find(|node| node.id == node_id)?;
+                node.session_id
+                    .as_deref()
+                    .and_then(|id| self.state.sessions.iter().find(|session| session.id == id))
+                    .or_else(|| run_orchestrator(&run_id))
+                    .map(|session| ActivitySubject {
+                        key: &session.id,
+                        session,
+                        provenance: None,
                     })
             }
             ItemRef::Provider(_) | ItemRef::History => None,
@@ -1962,7 +2081,7 @@ impl App {
                     self.set_status("select an agent or workflow first");
                     return;
                 }
-                self.output_tab = OutputTab::Timeline;
+                self.output_tab = OutputTab::Activity;
                 if self.dock == Dock::Hidden {
                     self.dock = Dock::Bottom;
                 }
@@ -2014,7 +2133,7 @@ impl App {
                 result,
             });
         });
-        self.output_tab = OutputTab::Result;
+        self.output_tab = OutputTab::Health;
         self.focus = Focus::Inspector;
     }
 
@@ -2278,6 +2397,9 @@ impl App {
                 self.enrichment_requested = true;
                 self.request_refresh(tx);
                 self.request_provider_refresh(tx);
+                if self.output_view_is_open() {
+                    self.request_output(tx, true);
+                }
                 if self.changes_view_is_open() {
                     self.request_changes(tx, true);
                 }
@@ -2513,6 +2635,9 @@ impl App {
                 self.enrichment_requested = true;
                 self.request_refresh(tx);
                 self.request_provider_refresh(tx);
+                if self.output_view_is_open() {
+                    self.request_output(tx, true);
+                }
                 if self.changes_view_is_open() {
                     self.request_changes(tx, true);
                 }
@@ -2838,26 +2963,29 @@ fn provider_action_key(key: KeyEvent) -> bool {
 fn inspector_tabs(item: Option<&ItemRef>) -> &'static [(OutputTab, &'static str)] {
     const RUN: &[(OutputTab, &str)] = &[
         (OutputTab::Summary, "Overview"),
-        (OutputTab::Timeline, "Activity"),
-        (OutputTab::Result, "Gates"),
+        (OutputTab::Activity, "Activity"),
+        (OutputTab::Output, "Output"),
+        (OutputTab::Gates, "Gates"),
         (OutputTab::Changes, "Changes"),
     ];
     const STAGE: &[(OutputTab, &str)] = &[
         (OutputTab::Summary, "Contract"),
-        (OutputTab::Timeline, "Activity"),
-        (OutputTab::Result, "Output"),
+        (OutputTab::Activity, "Activity"),
+        (OutputTab::Output, "Output"),
+        (OutputTab::Checkpoint, "Checkpoint"),
         (OutputTab::Changes, "Changes"),
     ];
     const AGENT: &[(OutputTab, &str)] = &[
         (OutputTab::Summary, "Details"),
-        (OutputTab::Timeline, "Activity"),
-        (OutputTab::Result, "Output"),
+        (OutputTab::Activity, "Activity"),
+        (OutputTab::Output, "Output"),
+        (OutputTab::Checkpoint, "Checkpoint"),
         (OutputTab::Changes, "Changes"),
     ];
     const PROVIDER: &[(OutputTab, &str)] = &[
         (OutputTab::Summary, "Details"),
-        (OutputTab::Result, "Health"),
-        (OutputTab::Timeline, "Activity"),
+        (OutputTab::Health, "Health"),
+        (OutputTab::Activity, "Activity"),
     ];
     match item {
         Some(ItemRef::Run(_)) => RUN,
@@ -4479,8 +4607,11 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &mut App) {
     );
     let body = match app.output_tab {
         OutputTab::Summary => details(app),
-        OutputTab::Timeline => selected_timeline(app),
-        OutputTab::Result => selected_result(app),
+        OutputTab::Activity => selected_timeline(app),
+        OutputTab::Gates => selected_gates(app),
+        OutputTab::Health => selected_health(app),
+        OutputTab::Checkpoint => selected_checkpoint(app),
+        OutputTab::Output => selected_message_output(app),
         OutputTab::Changes => {
             if app.changes_loading {
                 "Scanning workspace changes…".into()
@@ -4493,7 +4624,13 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &mut App) {
             }
         }
     };
-    let body = bounded_inspector_body(&body);
+    let omission = match app.output_tab {
+        OutputTab::Activity => "… earlier activity omitted",
+        OutputTab::Output => "… earlier output omitted",
+        OutputTab::Checkpoint => "… earlier checkpoint omitted",
+        _ => "… earlier content omitted",
+    };
+    let body = bounded_inspector_body(&body, omission);
     let body = if app.output_tab == OutputTab::Summary {
         styled_details(&body)
     } else {
@@ -4539,7 +4676,7 @@ const MAX_INSPECTOR_LINES: usize = 2_000;
 const MAX_SESSION_OUTPUT_INSPECTOR_BYTES: usize = 64 * 1024;
 const MAX_SESSION_OUTPUT_INSPECTOR_LINES: usize = 1_000;
 
-fn bounded_inspector_body(body: &str) -> String {
+fn bounded_inspector_body(body: &str, omission: &str) -> String {
     let line_start = body
         .match_indices('\n')
         .rev()
@@ -4559,47 +4696,50 @@ fn bounded_inspector_body(body: &str) -> String {
     if start == 0 {
         body.to_owned()
     } else {
-        format!("… earlier activity omitted\n{}", &body[start..])
+        format!("{omission}\n{}", &body[start..])
     }
 }
 
-fn selected_result(app: &App) -> String {
-    match app.selected() {
-        Some(ItemRef::Run(id)) => app
-            .state
-            .runs
-            .iter()
-            .find(|run| run.id == id)
-            .map(|run| {
-                if run.pending_gates.is_empty() {
-                    "No gates need attention.".into()
-                } else {
-                    run.pending_gates
-                        .iter()
-                        .map(|gate| format!("{} before {}\n{}", gate.id, gate.before, gate.reason))
-                        .collect::<Vec<_>>()
-                        .join("\n\n")
-                }
-            })
-            .unwrap_or_default(),
-        Some(ItemRef::Provider(name)) => {
-            let report = selected_provider_report(app);
-            if app.provider_validation_loading.contains(&name) {
-                if report.is_empty() {
-                    format!("{} Validating {name}…", spinner_glyph())
-                } else {
-                    format!(
-                        "{} Validating {name}…\n\nLast result\n{report}",
-                        spinner_glyph()
-                    )
-                }
-            } else if report.is_empty() {
-                "Press v to validate this provider.".into()
+fn selected_gates(app: &App) -> String {
+    let Some(ItemRef::Run(id)) = app.selected() else {
+        return String::new();
+    };
+    app.state
+        .runs
+        .iter()
+        .find(|run| run.id == id)
+        .map(|run| {
+            if run.pending_gates.is_empty() {
+                "No gates need attention.".into()
             } else {
-                report
+                run.pending_gates
+                    .iter()
+                    .map(|gate| format!("{} before {}\n{}", gate.id, gate.before, gate.reason))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
             }
+        })
+        .unwrap_or_default()
+}
+
+fn selected_health(app: &App) -> String {
+    let Some(ItemRef::Provider(name)) = app.selected() else {
+        return String::new();
+    };
+    let report = selected_provider_report(app);
+    if app.provider_validation_loading.contains(&name) {
+        if report.is_empty() {
+            format!("{} Validating {name}…", spinner_glyph())
+        } else {
+            format!(
+                "{} Validating {name}…\n\nLast result\n{report}",
+                spinner_glyph()
+            )
         }
-        _ => selected_output(app),
+    } else if report.is_empty() {
+        "Press v to validate this provider.".into()
+    } else {
+        report
     }
 }
 
@@ -4737,7 +4877,7 @@ fn session_activity(app: &App, id: &str) -> String {
     }
 }
 
-fn selected_output(app: &App) -> String {
+fn selected_checkpoint(app: &App) -> String {
     match app.selected() {
         Some(ItemRef::Node(run_id, node_id)) => app
             .state
@@ -4747,16 +4887,34 @@ fn selected_output(app: &App) -> String {
             .and_then(|run| run.nodes.iter().find(|node| node.id == node_id))
             .and_then(|node| node.output.as_ref())
             .and_then(|value| serde_json::to_string_pretty(value).ok())
-            .unwrap_or_else(|| "No output for this step.".into()),
+            .unwrap_or_else(|| "No structured checkpoint exists for this step.".into()),
         Some(ItemRef::Session(id)) => app
             .state
             .sessions
             .iter()
             .find(|session| session.id == id)
             .and_then(|session| session.reported_output.as_ref())
-            .map(|output| render_session_output(&output.value, &app.scope, &id))
-            .unwrap_or_else(|| "No structured output has been reported for this agent.".into()),
+            .map(|output| render_session_checkpoint(&output.value, &app.scope, &id))
+            .unwrap_or_else(|| "No structured checkpoint has been reported for this agent.".into()),
         _ => "Select a workflow step.".into(),
+    }
+}
+
+fn selected_message_output(app: &App) -> String {
+    let Some(subject) = app.selected_message_subject() else {
+        return "Select an agent, run, or step.".into();
+    };
+    let id = subject.key;
+    let output = app.output.get(id).map(String::as_str).unwrap_or_default();
+    let error = app.output_errors.get(id).map(String::as_str);
+    if app.output_loading.contains(id) && output.is_empty() {
+        return "Loading agent output…".into();
+    }
+    match (output.trim().is_empty(), error) {
+        (false, Some(error)) => format!("{output}\n\n[output refresh failed: {error}]"),
+        (false, None) => output.to_owned(),
+        (true, Some(error)) => format!("Output provider failed: {error}"),
+        (true, None) => "No user-visible assistant output is available for this agent.".into(),
     }
 }
 
@@ -4830,7 +4988,7 @@ impl io::Write for JsonPreviewWriter {
     }
 }
 
-fn render_session_output(value: &serde_json::Value, scope: &Path, session_id: &str) -> String {
+fn render_session_checkpoint(value: &serde_json::Value, scope: &Path, session_id: &str) -> String {
     let mut writer = JsonPreviewWriter::new(
         MAX_SESSION_OUTPUT_INSPECTOR_BYTES,
         MAX_SESSION_OUTPUT_INSPECTOR_LINES,
@@ -4848,7 +5006,7 @@ fn render_session_output(value: &serde_json::Value, scope: &Path, session_id: &s
         shell_quote(session_id)
     );
     let exact = format!(
-        "Output preview (first {} rendered bytes)\nFull value: {command}\n\n{}\n… output omitted",
+        "Checkpoint preview (first {} rendered bytes)\nFull value: {command}\n\n{}\n… checkpoint omitted",
         output.len(),
         output,
         command = exact_command
@@ -4861,7 +5019,7 @@ fn render_session_output(value: &serde_json::Value, scope: &Path, session_id: &s
         shell_quote(&scope.to_string_lossy())
     );
     format!(
-        "Output preview (first {} rendered bytes)\nFull value: {command}\n\n{}\n… output omitted",
+        "Checkpoint preview (first {} rendered bytes)\nFull value: {command}\n\n{}\n… checkpoint omitted",
         output.len(),
         output,
         command = list_command
@@ -5832,6 +5990,7 @@ pub fn run(config: Config, scope: &Path) -> Result<()> {
             app.enrichment_inflight,
             app.provider_refresh_inflight,
             app.activity_loading.len(),
+            app.output_loading.len(),
             app.provider_activity_loading.len(),
             app.changes_loading,
         );
@@ -5846,6 +6005,7 @@ pub fn run(config: Config, scope: &Path) -> Result<()> {
         if matches!(app.boot, BootState::Ready) {
             app.request_enrichment(&tx);
             app.request_activity(&tx, false);
+            app.request_output(&tx, false);
             app.request_provider_activity(&tx, false);
             if app.changes_view_is_open() {
                 app.request_changes(&tx, false);
@@ -5856,6 +6016,7 @@ pub fn run(config: Config, scope: &Path) -> Result<()> {
             app.enrichment_inflight,
             app.provider_refresh_inflight,
             app.activity_loading.len(),
+            app.output_loading.len(),
             app.provider_activity_loading.len(),
             app.changes_loading,
         );
@@ -6325,10 +6486,44 @@ mod tests {
     fn activity_polling_follows_the_visible_inspector_tab() {
         let mut app = app();
         assert!(!app.activity_view_is_open());
-        app.output_tab = OutputTab::Timeline;
+        app.output_tab = OutputTab::Activity;
         assert!(app.activity_view_is_open());
         app.dock = Dock::Hidden;
         assert!(!app.activity_view_is_open());
+    }
+
+    #[test]
+    fn output_polling_follows_its_own_visible_inspector_tab() {
+        let mut app = app();
+        assert!(!app.output_view_is_open());
+        app.output_tab = OutputTab::Output;
+        assert!(app.output_view_is_open());
+        assert!(!app.activity_view_is_open());
+        app.dock = Dock::Hidden;
+        assert!(!app.output_view_is_open());
+    }
+
+    #[test]
+    fn completed_run_output_resolves_its_archived_orchestrator() {
+        let mut app = app();
+        app.state.sessions[0].status = LifecycleStatus::Archived;
+        let mut run = workflow_run();
+        run.status = LifecycleStatus::Done;
+        run.orchestrator_id = Some("root".into());
+        app.state.runs.push(run);
+        app.active_run = Some("run".into());
+        app.explorer_view = ExplorerView::Graph;
+        app.rebuild(true);
+        app.flow.select_node("run:run");
+        app.output_tab = OutputTab::Output;
+
+        let subject = app
+            .selected_message_subject()
+            .expect("archived orchestrator output subject");
+
+        assert_eq!(subject.key, "root");
+        assert!(app.output_view_is_open());
+        assert!(app.selected_activity_subject().is_none());
     }
 
     #[test]
@@ -6494,7 +6689,7 @@ mod tests {
             row: 20,
             modifiers: KeyModifiers::NONE,
         });
-        assert_eq!(app.output_tab, OutputTab::Timeline);
+        assert_eq!(app.output_tab, OutputTab::Activity);
         assert_eq!(app.focus, Focus::Inspector);
     }
 
@@ -6762,9 +6957,9 @@ mod tests {
 
         app.validate_provider(&tx);
 
-        assert_eq!(app.output_tab, OutputTab::Result);
+        assert_eq!(app.output_tab, OutputTab::Health);
         assert_eq!(app.focus, Focus::Inspector);
-        assert!(selected_result(&app).contains("Validating provider"));
+        assert!(selected_health(&app).contains("Validating provider"));
     }
 
     #[test]
@@ -6982,7 +7177,7 @@ actions:
         app.output_tab = OutputTab::Summary;
 
         app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE), &tx);
-        assert_eq!(app.output_tab, OutputTab::Timeline);
+        assert_eq!(app.output_tab, OutputTab::Activity);
         assert_eq!(app.explorer_view, ExplorerView::Tree);
 
         app.handle_key(key(KeyCode::BackTab, KeyModifiers::SHIFT), &tx);
@@ -7087,13 +7282,26 @@ actions:
             .collect::<Vec<_>>()
             .join("\n");
 
-        let bounded = bounded_inspector_body(&body);
+        let bounded = bounded_inspector_body(&body, "… earlier activity omitted");
 
         assert!(bounded.starts_with("… earlier activity omitted\n"));
         assert!(bounded.contains("line 2499 — activity"));
         assert!(!bounded.contains("line 0 — activity"));
         assert!(bounded.len() <= MAX_INSPECTOR_BYTES + 64);
         assert!(bounded.lines().count() <= MAX_INSPECTOR_LINES + 1);
+    }
+
+    #[test]
+    fn output_truncation_uses_an_output_specific_marker() {
+        let body = (0..2_500)
+            .map(|line| format!("assistant line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let bounded = bounded_inspector_body(&body, "… earlier output omitted");
+
+        assert!(bounded.starts_with("… earlier output omitted\n"));
+        assert!(!bounded.contains("earlier activity omitted"));
     }
 
     #[test]
@@ -7783,8 +7991,9 @@ actions:
             inspector_tabs(Some(&ItemRef::Run("run".into()))),
             &[
                 (OutputTab::Summary, "Overview"),
-                (OutputTab::Timeline, "Activity"),
-                (OutputTab::Result, "Gates"),
+                (OutputTab::Activity, "Activity"),
+                (OutputTab::Output, "Output"),
+                (OutputTab::Gates, "Gates"),
                 (OutputTab::Changes, "Changes"),
             ]
         );
@@ -7792,13 +8001,13 @@ actions:
             inspector_tabs(Some(&ItemRef::Provider("executor-a".into()))),
             &[
                 (OutputTab::Summary, "Details"),
-                (OutputTab::Result, "Health"),
-                (OutputTab::Timeline, "Activity"),
+                (OutputTab::Health, "Health"),
+                (OutputTab::Activity, "Activity"),
             ]
         );
         assert!(
             inspector_tabs(Some(&ItemRef::Session("root".into())))
-                .contains(&(OutputTab::Result, "Output"))
+                .contains(&(OutputTab::Output, "Output"))
         );
         let mut app = app();
         app.focus = Focus::Inspector;
@@ -7810,9 +8019,9 @@ actions:
     }
 
     #[test]
-    fn agent_output_tab_has_an_honest_structured_output_empty_state() {
+    fn checkpoint_tab_has_an_honest_structured_output_empty_state() {
         let mut app = app();
-        app.output_tab = OutputTab::Result;
+        app.output_tab = OutputTab::Checkpoint;
         let backend = TestBackend::new(120, 36);
         let mut terminal = Terminal::new(backend).expect("test terminal");
 
@@ -7828,36 +8037,36 @@ actions:
             .collect::<String>();
 
         assert_eq!(
-            selected_result(&app),
-            "No structured output has been reported for this agent."
+            selected_checkpoint(&app),
+            "No structured checkpoint has been reported for this agent."
         );
-        assert!(rendered.contains("Output"));
-        assert!(rendered.contains("No structured output has been reported for this agent."));
+        assert!(rendered.contains("Checkpoint"));
+        assert!(rendered.contains("No structured checkpoint has been reported for this agent."));
     }
 
     #[test]
-    fn agent_output_tab_renders_complete_reported_json() {
+    fn checkpoint_tab_renders_complete_reported_json() {
         let mut app = app();
         app.state.sessions[0].reported_output = Some(crate::domain::ReportedOutput {
             value: serde_json::json!({"answer": 42, "verified": true}),
         });
-        app.output_tab = OutputTab::Result;
+        app.output_tab = OutputTab::Checkpoint;
 
-        let rendered = selected_result(&app);
+        let rendered = selected_checkpoint(&app);
 
         assert_eq!(rendered, "{\n  \"answer\": 42,\n  \"verified\": true\n}");
         assert!(!rendered.contains("activity"));
     }
 
     #[test]
-    fn agent_output_tab_preserves_an_explicit_json_null() {
+    fn checkpoint_tab_preserves_an_explicit_json_null() {
         let mut app = app();
         app.state.sessions[0].reported_output = Some(crate::domain::ReportedOutput {
             value: serde_json::Value::Null,
         });
-        app.output_tab = OutputTab::Result;
+        app.output_tab = OutputTab::Checkpoint;
 
-        assert_eq!(selected_result(&app), "null");
+        assert_eq!(selected_checkpoint(&app), "null");
     }
 
     #[test]
@@ -7866,11 +8075,11 @@ actions:
         app.state.sessions[0].reported_output = Some(crate::domain::ReportedOutput {
             value: serde_json::Value::String("x".repeat(MAX_SESSION_OUTPUT_INSPECTOR_BYTES + 1)),
         });
-        app.output_tab = OutputTab::Result;
+        app.output_tab = OutputTab::Checkpoint;
 
-        let rendered = selected_result(&app);
+        let rendered = selected_checkpoint(&app);
 
-        assert!(rendered.contains("Output preview ("));
+        assert!(rendered.contains("Checkpoint preview ("));
         assert!(rendered.contains("rendered bytes)"));
         assert!(!rendered.contains(" of "));
         assert!(
@@ -7878,7 +8087,7 @@ actions:
                 .contains("Full value: orc session show --json --scope '/tmp/orc-test' -- 'root'")
         );
         assert!(!rendered.contains("orc session list"));
-        assert!(rendered.contains("… output omitted"));
+        assert!(rendered.contains("… checkpoint omitted"));
         assert!(!rendered.contains("earlier activity omitted"));
         assert!(rendered.len() < MAX_INSPECTOR_BYTES);
     }
@@ -7890,9 +8099,9 @@ actions:
             value = serde_json::Value::Array(vec![value]);
         }
         assert!(serde_json::to_vec(&value).expect("compact JSON").len() < 1024 * 1024);
-        let rendered = render_session_output(&value, Path::new("/tmp/orc-test"), "root");
+        let rendered = render_session_checkpoint(&value, Path::new("/tmp/orc-test"), "root");
 
-        assert!(rendered.contains("Output preview (first "));
+        assert!(rendered.contains("Checkpoint preview (first "));
         assert!(
             rendered
                 .contains("Full value: orc session show --json --scope '/tmp/orc-test' -- 'root'")
@@ -7911,9 +8120,9 @@ actions:
         let mut state = WorkspaceState::empty(scope.display().to_string());
         state.sessions = vec![root];
         let mut app = App::new(Config::default(), scope, state, Vec::new());
-        app.output_tab = OutputTab::Result;
+        app.output_tab = OutputTab::Checkpoint;
 
-        let rendered = selected_result(&app);
+        let rendered = selected_checkpoint(&app);
 
         assert!(rendered.contains(
             "orc session show --json --scope '/private/tmp/a project'\\''s resolved scope' -- '--json'"
@@ -7935,9 +8144,9 @@ actions:
         let mut state = WorkspaceState::empty(scope.display().to_string());
         state.sessions = vec![root];
         let mut app = App::new(Config::default(), scope, state, Vec::new());
-        app.output_tab = OutputTab::Result;
+        app.output_tab = OutputTab::Checkpoint;
         app.focus = Focus::Inspector;
-        let body = selected_result(&app);
+        let body = selected_checkpoint(&app);
         let backend = TestBackend::new(160, 42);
         let mut terminal = Terminal::new(backend).expect("test terminal");
 
@@ -7965,16 +8174,55 @@ actions:
     }
 
     #[test]
-    fn activity_does_not_become_agent_output() {
+    fn activity_does_not_become_a_checkpoint() {
         let mut app = app();
         app.activity
             .insert("root".into(), "agent reported a visible message".into());
-        app.output_tab = OutputTab::Result;
+        app.output_tab = OutputTab::Checkpoint;
 
         assert_eq!(
-            selected_result(&app),
-            "No structured output has been reported for this agent."
+            selected_checkpoint(&app),
+            "No structured checkpoint has been reported for this agent."
         );
+    }
+
+    #[test]
+    fn user_visible_output_is_separate_from_activity_and_checkpoint() {
+        let mut app = app();
+        app.activity.insert("root".into(), "tool call".into());
+        app.state.sessions[0].reported_output = Some(crate::domain::ReportedOutput {
+            value: serde_json::json!({"status": "verified"}),
+        });
+        app.apply_background(BackgroundResult::Output {
+            session_id: "root".into(),
+            result: Ok("I finished the provider migration.".into()),
+        });
+
+        assert_eq!(
+            selected_message_output(&app),
+            "I finished the provider migration."
+        );
+        assert_eq!(selected_log(&app), "tool call");
+        assert!(selected_checkpoint(&app).contains("verified"));
+    }
+
+    #[test]
+    fn failed_output_refresh_preserves_the_last_good_message_and_scroll() {
+        let mut app = app();
+        app.output_tab = OutputTab::Output;
+        app.inspector_scroll = 7;
+        app.output
+            .insert("root".into(), "The previous answer remains visible.".into());
+
+        app.apply_background(BackgroundResult::Output {
+            session_id: "root".into(),
+            result: Err("reader unavailable".into()),
+        });
+
+        let rendered = selected_message_output(&app);
+        assert!(rendered.starts_with("The previous answer remains visible."));
+        assert!(rendered.contains("output refresh failed: reader unavailable"));
+        assert_eq!(app.inspector_scroll, 7);
     }
 
     #[test]
@@ -8378,7 +8626,7 @@ actions:
         app.state.runs.push(workflow_run());
         app.active_run = Some("run".into());
         app.explorer_view = ExplorerView::Graph;
-        app.output_tab = OutputTab::Timeline;
+        app.output_tab = OutputTab::Activity;
         app.rebuild(true);
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).expect("compact terminal");

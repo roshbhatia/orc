@@ -34,6 +34,8 @@ use crate::{
 
 const MAX_ACTIVITY_BYTES: u64 = 256 * 1024;
 const MAX_ACTIVITY_LINES: usize = 100;
+const MAX_MESSAGE_BYTES: u64 = 256 * 1024;
+const MAX_MESSAGE_LINES: usize = 1_000;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PROVIDER_CACHE_ENTRIES: usize = 256;
 const MAX_PROVIDER_CACHE_ENTRY_BYTES: u64 = 1024 * 1024;
@@ -48,6 +50,8 @@ pub enum Capability {
     ProviderValidate,
     #[serde(rename = "activity.read")]
     ActivityRead,
+    #[serde(rename = "messages.read")]
+    MessagesRead,
     #[serde(rename = "changes.inspect")]
     ChangesInspect,
     #[serde(rename = "session.attach")]
@@ -369,6 +373,7 @@ pub enum Action {
     Focus,
     Inspect,
     Launch,
+    Output,
     Guide,
     Stop,
 }
@@ -395,6 +400,7 @@ impl Action {
                 (Capability::SessionPersist, true),
                 (Capability::ExecutionRun, false),
             ],
+            Self::Output => &[(Capability::MessagesRead, false)],
             Self::Guide => &[(Capability::SessionGuide, false)],
             Self::Stop => &[(Capability::SessionStop, false)],
         }
@@ -410,10 +416,39 @@ impl Action {
             Self::Focus => "focus",
             Self::Inspect => "inspect",
             Self::Launch => "launch",
+            Self::Output => "output",
             Self::Guide => "guide",
             Self::Stop => "stop",
         }
     }
+}
+
+pub fn resolve_messages_plan(
+    config: &Config,
+    providers: &[Manifest],
+    mut request: Value,
+) -> Result<CommandPlan> {
+    request["maxBytes"] = json!(MAX_MESSAGE_BYTES);
+    request["maxLines"] = json!(MAX_MESSAGE_LINES);
+    request["capability"] = Value::String(Capability::MessagesRead.to_string());
+    let mut failures = Vec::new();
+    for provider in activity_candidates(providers, Capability::MessagesRead, &request) {
+        request["plan"] = Value::Null;
+        match invoke_raw(provider, &request, config, None)
+            .and_then(|value| parse_plan(provider, value))
+        {
+            Ok(Some(plan)) => return Ok(plan),
+            Ok(None) => failures.push(format!("{} declined messages.read", provider.name)),
+            Err(error) => failures.push(format!("{}: {error:#}", provider.name)),
+        }
+    }
+    if failures.is_empty() {
+        bail!("no provider advertises messages.read");
+    }
+    bail!(
+        "no message provider accepted the session: {}",
+        failures.join("; ")
+    )
 }
 
 pub fn resolve_activity_plan(
@@ -1527,6 +1562,7 @@ fn capability_action(capability: Capability) -> &'static str {
     match capability {
         Capability::ProviderValidate => "validate",
         Capability::ActivityRead => "activity",
+        Capability::MessagesRead => "output",
         Capability::ChangesInspect => "changes",
         Capability::SessionAttach => "attach",
         Capability::SessionBind => "bind",
@@ -2899,6 +2935,78 @@ pub fn capture_activity_plan(
         bail!("{message}");
     }
     Ok(result.stdout)
+}
+
+pub fn capture_messages_plan(
+    plan: &CommandPlan,
+    scope: &Path,
+    timeout: std::time::Duration,
+) -> Result<String> {
+    let result = run_plan_with_timeout_retention(
+        plan,
+        scope,
+        timeout,
+        MAX_MESSAGE_BYTES as usize,
+        Some(MAX_MESSAGE_LINES),
+        OutputRetention::Tail,
+    )?;
+    if !plan.accepts(result.code) {
+        let message = result.stderr.trim();
+        if message.is_empty() {
+            bail!("command plan exited with {}", result.code);
+        }
+        bail!("{message}");
+    }
+    Ok(sanitize_message_ansi(&result.stdout))
+}
+
+fn sanitize_message_ansi(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut rendered = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\n' | b'\t' | 0x20..=0x7e | 0x80..=0xff if bytes[at] != 0x1b => {
+                rendered.push(bytes[at]);
+                at += 1;
+            }
+            0x1b if bytes.get(at + 1) == Some(&b'[') => {
+                let Some(end) = bytes[at + 2..]
+                    .iter()
+                    .position(|byte| (0x40..=0x7e).contains(byte))
+                    .map(|offset| at + 2 + offset)
+                else {
+                    break;
+                };
+                if bytes[end] == b'm' {
+                    rendered.extend_from_slice(&bytes[at..=end]);
+                }
+                at = end + 1;
+            }
+            0x1b if bytes.get(at + 1) == Some(&b']') => {
+                at += 2;
+                while at < bytes.len() {
+                    if bytes[at] == 0x07 {
+                        at += 1;
+                        break;
+                    }
+                    if bytes[at] == 0x1b && bytes.get(at + 1) == Some(&b'\\') {
+                        at += 2;
+                        break;
+                    }
+                    at += 1;
+                }
+            }
+            0x1b => {
+                at += 1;
+                if bytes.get(at).is_some_and(u8::is_ascii) {
+                    at += 1;
+                }
+            }
+            _ => at += 1,
+        }
+    }
+    String::from_utf8_lossy(&rendered).into_owned()
 }
 
 pub fn action_request(
@@ -4293,6 +4401,51 @@ third line
     }
 
     #[test]
+    fn message_resolution_uses_only_the_messages_capability_and_sends_limits() {
+        let directory = tempfile::tempdir().expect("message provider directory");
+        let recorded = directory.path().join("request.json");
+        let command = write_provider(
+            directory.path(),
+            "message-provider",
+            &render_fixture(
+                ACTIVITY_PROVIDER,
+                json!({"request": recorded.display().to_string()}),
+            ),
+        );
+        let mut provider = provider_manifest("messages", &command, 0);
+        provider.actions = BTreeMap::from([
+            (Capability::ActivityRead, "Read activity".into()),
+            (Capability::MessagesRead, "Read assistant output".into()),
+        ]);
+
+        resolve_messages_plan(
+            &Config::default(),
+            &[provider],
+            json!({"scope": directory.path(), "session": {}}),
+        )
+        .expect("message plan");
+        let request: Value =
+            serde_json::from_slice(&fs::read(recorded).expect("recorded message request"))
+                .expect("message request json");
+
+        assert_eq!(request["capability"], "messages.read");
+        assert_eq!(request["maxBytes"], MAX_MESSAGE_BYTES);
+        assert_eq!(request["maxLines"], MAX_MESSAGE_LINES);
+    }
+
+    #[test]
+    fn message_resolution_does_not_fall_back_to_activity() {
+        let mut provider = provider_manifest("activity", Path::new("true"), 0);
+        provider.actions =
+            BTreeMap::from([(Capability::ActivityRead, "Read recent activity".into())]);
+
+        let error = resolve_messages_plan(&Config::default(), &[provider], json!({}))
+            .expect_err("activity must not become output");
+
+        assert!(error.to_string().contains("messages.read"));
+    }
+
+    #[test]
     fn activity_capture_retains_the_newest_lines() {
         let plan = CommandPlan {
             version: "orc.provider/v1".into(),
@@ -4335,6 +4488,70 @@ third line
         assert!(activity.starts_with("[earlier output truncated by Orc]"));
         assert!(activity.ends_with("LATEST"));
         assert!(activity.len() <= MAX_ACTIVITY_BYTES as usize + 64);
+    }
+
+    #[test]
+    fn message_capture_retains_recent_utf8_and_complete_ansi_lines() {
+        let plan = CommandPlan {
+            version: "orc.provider/v1".into(),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "i=0; while [ $i -lt 1100 ]; do printf '\\033[32mmessage-%04d café\\033[0m\\n' \"$i\"; i=$((i + 1)); done"
+                    .into(),
+            ],
+            cwd: None,
+            environment: BTreeMap::new(),
+            success_codes: vec![0],
+        };
+
+        let output = capture_messages_plan(&plan, Path::new("."), Duration::from_secs(1))
+            .expect("message capture");
+
+        assert!(output.starts_with("[earlier output truncated by Orc]\n\u{1b}[32m"));
+        assert!(output.ends_with("café\u{1b}[0m\n"));
+        assert!(!output.contains('\u{fffd}'));
+        assert!(output.lines().count() <= MAX_MESSAGE_LINES + 1);
+    }
+
+    #[test]
+    fn message_capture_keeps_sgr_but_removes_terminal_control_sequences() {
+        let plan = CommandPlan {
+            version: "orc.provider/v1".into(),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "printf '\\033]52;c;secret\\007\\033[2J\\033[31mvisible\\033[0m\\n'".into(),
+            ],
+            cwd: None,
+            environment: BTreeMap::new(),
+            success_codes: vec![0],
+        };
+
+        let output = capture_messages_plan(&plan, Path::new("."), Duration::from_secs(1))
+            .expect("message capture");
+
+        assert_eq!(output, "\u{1b}[31mvisible\u{1b}[0m\n");
+    }
+
+    #[test]
+    fn message_capture_handles_a_stray_escape_before_utf8_without_panicking() {
+        let plan = CommandPlan {
+            version: "orc.provider/v1".into(),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "printf '\\033\\303\\251\\n'".into(),
+            ],
+            cwd: None,
+            environment: BTreeMap::new(),
+            success_codes: vec![0],
+        };
+
+        let output = capture_messages_plan(&plan, Path::new("."), Duration::from_secs(1))
+            .expect("message capture");
+
+        assert_eq!(output, "é\n");
     }
 
     #[cfg(unix)]

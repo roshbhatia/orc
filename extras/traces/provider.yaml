@@ -7,6 +7,7 @@ command: orc-provider-traces
 actions:
   provider.validate: Validate the Traces adapter and command
   activity.read: Read recent messages and tool activity for a session
+  messages.read: Read user-visible assistant output for a session
   session.bind: Link a session to its trace identity
   session.describe: Read the session title and goal
   session.inspect: Open a read-only Traces view for an active session

@@ -1,61 +1,59 @@
 ## Why
 
-Orc exposes an Output tab for orchestrator sessions, but its state model cannot store or report orchestrator output. The tab therefore remains an empty placeholder even after an orchestrator produces a structured result.
+Orc used Output for structured JSON reported through its control-plane API. Users expect Output to show the assistant prose they would see in the harness. Activity and structured checkpoints are different data and need separate views.
 
 ## What Changes
 
-- Add an optional reported-output envelope to the persisted session contract without breaking existing workspace files or losing explicit JSON `null`.
-- Add one bounded domain operation for an active orchestrator to report or replace its own structured output.
-- Expose equivalent CLI and MCP reporting entry points.
-- Add an exact non-interactive session read for retained inactive output.
-- Render the reported value in the existing orchestrator Output inspector without deriving content from Activity.
-- Preserve reported output across same-session registration, refresh, lifecycle updates, and serialization. Root replacement keeps output on the archived reporter.
+- Add provider-neutral `messages.read` discovery and command-plan execution.
+- Render user-visible assistant prose in Output for sessions, runs, and assigned workflow nodes.
+- Rename the structured reported-output view to Checkpoint without removing its CLI or MCP report API.
+- Keep Activity, Gates, Health, Checkpoint, and Output as distinct inspector states.
+- Poll only the visible Output view, cache it separately, preserve its last good value on refresh errors, and keep scroll position stable.
+- Extend the Traces extra with a `messages.read` adapter. Orc core remains unaware of Traces or any harness transcript format.
 
 ### Non-goals
 
-- Do not infer output from transcripts, messages, reasoning, or provider logs.
-- Do not add output history or provider-specific readers.
-- Do not let one harness session report output for another session.
+- Do not persist transcripts or assistant messages in `WorkspaceState`.
+- Do not derive Output from Activity, structured checkpoints, reasoning, prompts, or tool rows.
+- Do not remove the existing session report API.
+- Do not add provider-specific readers to Orc core.
 
 ## Capabilities
 
 ### New Capabilities
 
-None.
+- `messages.read`: Return a command plan that prints bounded, chronological, user-visible assistant prose for one exact session.
 
 ### Modified Capabilities
 
-- `session-lifecycle`: Persist bounded structured output on an orchestrator session and preserve it across lifecycle operations.
-- `orchestrator-api`: Let an orchestrator report structured output through equivalent CLI and MCP operations.
-- `terminal-dashboard`: Render explicitly reported orchestrator output in the existing Output inspector.
+- `terminal-dashboard`: Separate Output, Checkpoint, Activity, Gates, and Health and refresh visible provider-backed Output.
+- `session-lifecycle`: Keep the existing structured reported-output envelope as checkpoint state.
+- `orchestrator-api`: Keep the existing CLI and MCP report operations as the checkpoint reporting contract.
 
 ## Impact
 
-- `src/domain.rs` gains one backward-compatible optional session field.
-- `src/control.rs` owns validation, authorization, size limits, persistence, and preservation.
-- `src/cli.rs` and `src/mcp.rs` expose the same domain operation.
-- `src/tui.rs` renders the stored value.
-- Generated schemas, documentation, and tests change with the public contract.
+- `src/provider.rs` gains the provider-neutral capability, resolution, validation, and bounded capture path.
+- `src/tui.rs` gains separate inspector variants and Output cache state.
+- `extras/traces/` implements the optional Traces adapter through its native non-interactive output view.
+- Generated provider schemas and reference documentation include `messages.read`.
 
 ## Behavior
 
 Must do:
-- An active, non-terminating orchestrator can report one bounded structured JSON value through CLI or MCP.
-- CLI accepts inline JSON or a file, including standard input, so the transport supports values near the domain limit.
-- Existing workspaces without session output continue to load with output absent.
-- Later registration, adoption, keepalive, and lifecycle changes preserve reported output.
-- The Output inspector renders a clearly bounded preview and directs users to the full structured value through the non-interactive session read.
-- A preview command reads the complete retained value from the resolved scope. It selects the exact session when that command fits the inspector budget and otherwise uses the bounded session list.
-- Invalid JSON, unauthorized roles, inactive sessions, and oversized values leave state unchanged.
+- Output shows only user-visible assistant prose supplied by `messages.read`.
+- Activity retains messages, thinking, tool calls, and provider activity exactly as before.
+- Checkpoint shows the existing structured node or session report.
+- A failed refresh keeps the last successful Output value visible and reports the refresh error.
+- Provider output remains bounded and valid UTF-8. ANSI styling remains safe to render after truncation.
+- Selecting a run or unassigned node reads from its orchestrator session. An assigned node reads from its assigned session.
 
 Must still hold:
-- Orc core remains provider-neutral.
-- Node output and session output remain separate contracts.
-- CLI and MCP call one domain operation with the same validation rules.
-- `ORC_SESSION_ID` is trusted runtime routing context, not authentication. Role and lifecycle checks prevent cooperative or accidental misuse; spoof resistance requires sandboxed execution.
+- Orc core stays provider-neutral.
+- Adoption and backfill remain provider-backed and do not store transcript content in workspace state.
+- CLI and MCP structured reporting continue to call one domain operation.
 
 Runs where it ships:
-- Domain, CLI, MCP, serialization, generated-interface, and TUI inspector tests run before release.
+- Provider, TUI, extra adapter, generated-interface, Rust, Nix, and strict OpenSpec checks run before release.
 
 Human-owned decision:
-- The owner decides whether a single replaceable structured value is sufficient before output history is considered.
+- The owner chooses which optional `messages.read` provider to install.

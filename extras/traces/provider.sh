@@ -100,5 +100,20 @@ case "$capability" in
     emit_plan_with_codes '[0, 2]' "$scope" '{}' \
       "$provider_program" __activity "$executable" "$trace_id" "$harness" "$max_bytes" "$max_lines"
     ;;
+  messages.read)
+    executable=$(command -v traces || true)
+    if [[ -z $executable ]]; then
+      emit_declined "traces is unavailable"
+      exit 0
+    fi
+    native_id=$(jq -er '.session.nativeId | select(type == "string" and length > 0)' <<< "$request")
+    harness=$(jq -r '.session.harness // empty' <<< "$request")
+    traces_args=(--view output --once --session "$native_id")
+    if [[ -n $harness ]]; then
+      traces_args+=(--service "$harness")
+    fi
+    traces_args+=(--color always)
+    emit_plan_with_codes '[0]' "$scope" '{}' "$executable" "${traces_args[@]}"
+    ;;
   *) unsupported_capability ;;
 esac

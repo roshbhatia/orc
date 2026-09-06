@@ -1,29 +1,38 @@
-## 1. Structured session output
+## 1. Provider-backed assistant output
 
 - **SHAPE** graph
 - MERGE 1.3
 
-- [x] 1.1 Add a backward-compatible reported-output envelope with JSON-null round-trip and preservation tests `deps:` none `writes:` src/domain.rs,src/control.rs
-- [x] 1.2 Add bounded self-scoped orchestrator reporting with terminating-session, oversized-value, and unchanged-state inverse tests `deps:` 1.1 `writes:` src/control.rs
-- [x] 1.3 Adversarial review: audit state integrity, authorization, and size enforcement `deps:` 1.2 `writes:` openspec/changes/report-orchestrator-output/review.md
+- [x] 1.1 Add provider-neutral `messages.read` discovery, validation, plan resolution, and bounded capture `deps:` none `writes:` src/provider.rs
+- [x] 1.2 Add separate Output cache, loading, refresh-error, and polling state without persisting transcript data `deps:` 1.1 `writes:` src/tui.rs
+- [x] 1.3 Add the optional Traces adapter for the native one-shot output command `deps:` 1.1 `writes:` extras/traces
+- [x] 1.4 Adversarial review: verify provider neutrality, capability isolation, capture bounds, and adapter compatibility `deps:` 1.3 `writes:` openspec/changes/report-orchestrator-output/review.md
 
-## 2. Public entry points and inspection
+## 2. Inspector semantics
 
 - **SHAPE** graph
-- MERGE 2.3
+- MERGE 2.2
 
-- [x] 2.1 Add equivalent CLI inline/file/stdin and MCP report operations with generated interface coverage `deps:` 1.2 `writes:` src/cli.rs,src/mcp.rs
-- [x] 2.2 Render complete or honestly bounded session output in the TUI and keep Activity isolated `deps:` 2.1 `writes:` src/tui.rs
-- [x] 2.3 Adversarial review: audit interface parity and inspector behavior `deps:` 2.2 `writes:` openspec/changes/report-orchestrator-output/review.md
+- [x] 2.1 Split Activity, Output, Checkpoint, Gates, and Health variants and move structured reports to Checkpoint `deps:` 1.2 `writes:` src/tui.rs
+- [x] 2.2 Add focused separation, refresh-preservation, UTF-8, ANSI, and adapter tests `deps:` 1.3,2.1 `writes:` src/provider.rs,src/tui.rs,extras/traces/test.sh
+- [x] 2.3 Adversarial review: verify inspector selection, loading, error retention, scrolling, and live polling `deps:` 2.2 `writes:` openspec/changes/report-orchestrator-output/review.md
 
-## 3. Verification and rollout
+## 3. Existing structured checkpoint contract
+
+- **SHAPE** graph
+- MERGE 3.4
+
+- [x] 3.1 Keep the backward-compatible `reportedOutput` envelope and JSON-null round trip
+- [x] 3.2 Keep bounded self-scoped CLI and MCP report operations
+- [x] 3.3 Keep complete or honestly bounded structured JSON rendering under Checkpoint
+- [x] 3.4 Adversarial review: retain the prior structured report integrity and authorization findings `deps:` 3.3 `writes:` openspec/changes/report-orchestrator-output/review.md
+
+## 4. Verification and rollout
 
 - **SHAPE** loop
-- **STOP** `cargo test --all-targets`, generated-file checks, and strict OpenSpec validation exit 0
+- **STOP** `cargo test --all-targets`, generated-file checks, strict OpenSpec validation, and Nix checks exit 0
 - **MAX-ITERS** 3
-- TERMINAL STALLED after 2 iterations without fewer failing checks, or CAPPED at MAX-ITERS
 
-- [x] 3.1 Regenerate schemas, completions, and reference documentation
-- [x] 3.2 Run focused and full checks, strict OpenSpec validation, and mediated adversarial review
-- [ ] 3.3 Commit, release, update sysinit and Laurel, switch, and verify the installed flow
-- [ ] 3.4 Follow up separately on compact or bounded workspace-state persistence; this change does not alter state serialization `deps:` 3.2 `writes:` src/state.rs
+- [x] 4.1 Regenerate schemas, completions, and reference documentation
+- [x] 4.2 Run focused and full checks, strict OpenSpec validation, and Nix checks
+- [ ] 4.3 Complete mediated review, commit, release, update consumers, and verify the installed flow

@@ -61,17 +61,17 @@ The dashboard MUST animate active and idle runtimes distinctly, MUST use a stati
 - **WHEN** reduced motion is enabled
 - **THEN** Orc MUST render deterministic static frames for active and idle states
 
-### Requirement: Orchestrator output inspection
-The dashboard MUST expose an Output inspector tab for the orchestrator root and MUST render only structured output explicitly reported for that root.
+### Requirement: Structured orchestrator checkpoint inspection
+The dashboard MUST expose a Checkpoint inspector tab for the orchestrator root and MUST render only structured checkpoint data explicitly reported for that root.
 
-#### Scenario: Root output is reported
+#### Scenario: Root checkpoint is reported
 - **WHEN** the selected orchestrator root has explicitly reported structured output
-- **THEN** the Output tab MUST render that output without replacing or duplicating the Activity view
+- **THEN** the Checkpoint tab MUST render that data without replacing or duplicating the Activity or Output view
 
-#### Scenario: Root output is absent
+#### Scenario: Root checkpoint is absent
 - **WHEN** the selected orchestrator root has no explicitly reported structured output
-- **THEN** the Output tab MUST show an explicit empty state
+- **THEN** the Checkpoint tab MUST show an explicit empty state
 
 #### Scenario: Root has rendered activity only
 - **WHEN** the selected orchestrator root has messages, reasoning summaries, tool activity, or provider logs but no structured output
-- **THEN** the Output tab MUST remain empty and MUST NOT parse, summarize, or infer output from that activity
+- **THEN** the Checkpoint tab MUST remain empty and MUST NOT parse, summarize, or infer checkpoint data from that activity
