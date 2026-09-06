@@ -4,43 +4,68 @@ set timeout 5
 set provider [lindex $argv 0]
 set scenario [lindex $argv 1]
 set duration [lindex $argv 2]
+set controlled_path [lindex $argv 3]
+set real_sleep [lindex $argv 4]
+set watchdog_state ""
+set should_hold true
 
 if {$scenario eq "failure"} {
-  set command "exit 19"
+  set duration 0
   set message "Command exited with 19. Press Enter to close."
   set expected_status 19
 } elseif {$scenario eq "short-success"} {
-  set command "exit 0"
+  set duration 0
   set message "Command exited before an interactive session was ready. Press Enter to close."
   set expected_status 0
 } elseif {$scenario eq "success-hold"} {
-  set command "sleep $duration; exit 0"
+  set watchdog_state running
   set message "Command exited before an interactive session was ready. Press Enter to close."
   set expected_status 0
 } elseif {$scenario eq "success-close"} {
-  set command "sleep $duration; exit 0"
+  set watchdog_state expired
   set message ""
   set expected_status 0
-} elseif {$scenario eq "failure-hold"} {
-  set command "sleep $duration; exit 19"
+  set should_hold false
+} elseif {$scenario eq "failure-hold-running"} {
+  set watchdog_state running
   set message "Command exited with 19. Press Enter to close."
   set expected_status 19
+} elseif {$scenario eq "failure-hold-expired"} {
+  set watchdog_state expired
+  set message "Command exited with 19. Press Enter to close."
+  set expected_status 19
+} elseif {$scenario eq "real-success-hold"} {
+  set message "Command exited before an interactive session was ready. Press Enter to close."
+  set expected_status 0
+} elseif {$scenario eq "real-success-close"} {
+  set message ""
+  set expected_status 0
+  set should_hold false
 } else {
   error "unknown scenario: $scenario"
 }
 
 # Keep a controlling terminal while reproducing Zmx's closed standard input.
-spawn -noecho bash -c {exec </dev/null; exec bash "$1" hold bash -c "$2"} hold-test $provider $command
-if {$scenario eq "success-close"} {
+set child {"$1" "$2"; exit "$3"}
+if {$watchdog_state eq ""} {
+  spawn -noecho bash -c {exec </dev/null; exec bash "$1" hold bash -c "$2" hold-child "$3" "$4" "$5"} hold-test $provider $child $real_sleep $duration $expected_status
+} else {
+  spawn -noecho bash -c {exec </dev/null; exec env PATH="$6:$PATH" ORC_WEZTERM_TEST_WATCHDOG_STATE="$7" ORC_WEZTERM_TEST_REAL_SLEEP="$3" bash "$1" hold bash -c "$2" hold-child "$3" "$4" "$5"} hold-test $provider $child $real_sleep $duration $expected_status $controlled_path $watchdog_state
+}
+if {!$should_hold} {
   expect {
     -exact "Command exited before an interactive session was ready. Press Enter to close." {
       error "long successful command unexpectedly held its pane"
     }
     eof {}
+    timeout {error "$scenario timed out waiting for the command to close"}
   }
 } else {
-  expect -exact $message
-  send "\r"
+  expect {
+    -exact $message {send "\r"}
+    eof {error "$scenario closed before its hold prompt"}
+    timeout {error "$scenario timed out waiting for its hold prompt"}
+  }
   expect eof
 }
 
