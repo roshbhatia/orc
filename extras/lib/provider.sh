@@ -174,11 +174,18 @@ read_command() {
 }
 
 current_session_matches() {
-  local current_session_id native_id session_id
+  local current_session_id harness native_id session_id
   current_session_id=$(jq -r '.currentSessionId // empty' <<< "$request")
   session_id=$(jq -r '.session.id // empty' <<< "$request")
+  harness=$(jq -r '.session.harness // empty' <<< "$request")
   native_id=$(jq -r '.session.nativeId // empty' <<< "$request")
-  [[ -n $current_session_id && -n $session_id && $current_session_id == "$session_id" ]] ||
+  if [[ -n ${ORC_HARNESS:-} && ( -z $harness || $ORC_HARNESS != "$harness" ) ]]; then
+    return 1
+  fi
+  if [[ -n $current_session_id && -n $session_id && $current_session_id == "$session_id" ]]; then
+    return 0
+  fi
+  [[ -n $harness && -n ${ORC_HARNESS:-} && $ORC_HARNESS == "$harness" ]] &&
     [[ -n $native_id && -n ${ORC_NATIVE_SESSION_ID:-} && $ORC_NATIVE_SESSION_ID == "$native_id" ]]
 }
 

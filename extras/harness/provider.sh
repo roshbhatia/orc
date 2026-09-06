@@ -13,6 +13,7 @@ session_environment() {
     {
       ORC_SCOPE: $scope,
       ORC_SESSION_ID: .session.id,
+      ORC_HARNESS: .session.harness,
       ORC_NATIVE_SESSION_ID: .session.nativeId,
       ORC_PARENT_SESSION_ID: .session.parentId,
       ORC_RUN_ID: .session.runId,
@@ -21,7 +22,7 @@ session_environment() {
       ORC_MODEL: .session.model
     }
     | with_entries(select(.value | type == "string" and length > 0))
-    | if has("ORC_SESSION_ID") and has("ORC_NATIVE_SESSION_ID")
+    | if has("ORC_SESSION_ID") and has("ORC_HARNESS") and has("ORC_NATIVE_SESSION_ID")
       then .
       else error("session linkage is incomplete")
       end

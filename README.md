@@ -1010,6 +1010,7 @@ Arguments:
 
 Options:
       --scope <SCOPE>          [env: ORC_SCOPE=] [default: .]
+      --harness <HARNESS>
       --native-id <NATIVE_ID>
       --hook-input
       --quiet

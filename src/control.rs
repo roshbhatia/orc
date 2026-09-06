@@ -99,6 +99,7 @@ pub struct SessionLease {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DuplicateNativeSession {
+    pub harness: String,
     pub native_id: String,
     pub canonical_id: String,
     pub duplicate_ids: Vec<String>,
@@ -168,17 +169,19 @@ fn repair_duplicate_native_sessions(
     workspace: &mut WorkspaceState,
     repair: bool,
 ) -> Result<DoctorReport> {
-    let mut groups = BTreeMap::<String, Vec<usize>>::new();
+    let mut groups = BTreeMap::<(String, String), Vec<usize>>::new();
     for (index, session) in workspace.sessions.iter().enumerate() {
         if session.status.active() && session.status != LifecycleStatus::Terminating {
             groups
-                .entry(session.native_id.clone())
+                .entry((session.harness.clone(), session.native_id.clone()))
                 .or_default()
                 .push(index);
         }
     }
     let mut duplicates = Vec::new();
-    for (native_id, indices) in groups.into_iter().filter(|(_, indices)| indices.len() > 1) {
+    for ((harness, native_id), indices) in
+        groups.into_iter().filter(|(_, indices)| indices.len() > 1)
+    {
         let canonical = indices
             .iter()
             .copied()
@@ -200,6 +203,7 @@ fn repair_duplicate_native_sessions(
             .collect::<Vec<_>>();
         duplicate_ids.sort();
         duplicates.push(DuplicateNativeSession {
+            harness,
             native_id,
             canonical_id: canonical_id.clone(),
             duplicate_ids: duplicate_ids.clone(),
@@ -250,7 +254,9 @@ fn repair_duplicate_native_sessions(
             }
         }
     }
-    duplicates.sort_by(|left, right| left.native_id.cmp(&right.native_id));
+    duplicates.sort_by(|left, right| {
+        (&left.harness, &left.native_id).cmp(&(&right.harness, &right.native_id))
+    });
     Ok(DoctorReport {
         scope: workspace.scope.clone(),
         repaired: repair && !duplicates.is_empty(),
@@ -346,7 +352,9 @@ fn register_for_caller(
             })
             .transpose()?;
         let refreshes_caller = caller.as_ref().is_some_and(|caller| {
-            explicit_id.as_deref() == Some(caller.id.as_str()) || caller.native_id == native_id
+            (explicit_id.as_deref() == Some(caller.id.as_str())
+                && caller.harness == contract.harness)
+                || caller.has_native_identity(&contract.harness, &native_id)
         });
         let base_id = registration_base_id(
             workspace,
@@ -360,11 +368,22 @@ fn register_for_caller(
                 .iter()
                 .find(|session| session.status != LifecycleStatus::Archived && session.id == id)
         });
+        if let Some(explicit_match) = explicit_match
+            && explicit_match.harness != contract.harness
+        {
+            bail!(
+                "session id {} belongs to harness {}, not {}",
+                explicit_match.id,
+                explicit_match.harness,
+                contract.harness
+            );
+        }
         let native_match = workspace
             .sessions
             .iter()
             .filter(|session| {
-                session.status != LifecycleStatus::Archived && session.native_id == native_id
+                session.status != LifecycleStatus::Archived
+                    && session.has_native_identity(&contract.harness, &native_id)
             })
             .max_by_key(|session| session.updated_at);
         if let (Some(explicit_match), Some(native_match)) = (explicit_match, native_match)
@@ -401,8 +420,13 @@ fn register_for_caller(
         {
             bail!("a managed child can only refresh its own Orc registration");
         }
+        let reconnects_native = current
+            .as_ref()
+            .is_some_and(|session| session.has_native_identity(&contract.harness, &native_id));
         let governed = current.as_ref().filter(|session| {
-            session.registration == RegistrationSource::Managed || refreshes_caller
+            session.registration == RegistrationSource::Managed
+                || refreshes_caller
+                || reconnects_native
         });
         let id = current
             .as_ref()
@@ -455,7 +479,6 @@ fn register_for_caller(
                     && current
                         .as_ref()
                         .is_none_or(|current| session.id != current.id)
-                    && session.native_id != native_id
             })
         {
             bail!(
@@ -602,9 +625,7 @@ fn register_for_caller(
             idle_timeout_seconds: governed.map_or(link.idle_timeout_seconds, |session| {
                 session.idle_timeout_seconds
             }),
-            heartbeat_at: governed
-                .and_then(|session| session.heartbeat_at)
-                .or(Some(now)),
+            heartbeat_at: Some(now),
             termination_reason: governed.and_then(|session| session.termination_reason.clone()),
             termination_cause: governed.and_then(|session| session.termination_cause.clone()),
             termination_attempt_at: governed.and_then(|session| session.termination_attempt_at),
@@ -628,7 +649,7 @@ fn register_for_caller(
             .iter_mut()
             .filter(|candidate| {
                 candidate.id != session.id
-                    && candidate.native_id == session.native_id
+                    && candidate.has_native_identity(&session.harness, &session.native_id)
                     && candidate.status != LifecycleStatus::Archived
                     && candidate.status != LifecycleStatus::Terminating
             })
@@ -710,7 +731,7 @@ pub fn adopt(scope: &Path, mut contract: Contract, native_id: Option<String>) ->
             );
         }
         if let Some(owner) = workspace.sessions.iter().find(|session| {
-            session.native_id == native_id
+            session.has_native_identity(&contract.harness, &native_id)
                 && session.role != SessionRole::Orchestrator
                 && session.status != LifecycleStatus::Archived
         }) {
@@ -1334,16 +1355,24 @@ pub(crate) fn terminable(session: &Session) -> bool {
 pub(crate) fn has_active_session(
     scope: &Path,
     id: Option<&str>,
-    native_id: Option<&str>,
+    native_identity: Option<(&str, &str)>,
 ) -> Result<bool> {
     Ok(read_workspace(scope)?.sessions.iter().any(|session| {
         session.status.active()
-            && (id.is_some_and(|id| session.id == id)
-                || native_id.is_some_and(|native| session.native_id == native))
+            && if let Some(id) = id {
+                session.id == id
+            } else {
+                native_identity
+                    .is_some_and(|(harness, native)| session.has_native_identity(harness, native))
+            }
     }))
 }
 
-pub fn archive(scope: &Path, id: Option<&str>, native_id: Option<&str>) -> Result<Session> {
+pub fn archive(
+    scope: &Path,
+    id: Option<&str>,
+    native_identity: Option<(&str, &str)>,
+) -> Result<Session> {
     let scope = state::resolve_scope(scope)?;
     state::update(&scope, |workspace| {
         let session = workspace
@@ -1351,8 +1380,13 @@ pub fn archive(scope: &Path, id: Option<&str>, native_id: Option<&str>) -> Resul
             .iter_mut()
             .filter(|session| session.status != LifecycleStatus::Archived)
             .filter(|session| {
-                id.is_some_and(|id| session.id == id)
-                    || native_id.is_some_and(|native| session.native_id == native)
+                if let Some(id) = id {
+                    session.id == id
+                } else {
+                    native_identity.is_some_and(|(harness, native)| {
+                        session.has_native_identity(harness, native)
+                    })
+                }
             })
             .max_by_key(|session| session.updated_at)
             .ok_or(NoMatchingActiveSession)?;
@@ -1417,23 +1451,26 @@ pub fn reconcile_with_current(
     let scope = state::resolve_scope(scope)?;
     let providers = provider::discover(config)?;
     let snapshot = state::read(&scope)?;
-    let current_id = if rebind_current {
-        current_rebind_id(
+    let selection = if rebind_current {
+        current_rebind_selection(
             &snapshot,
             env::var("ORC_SESSION_ID").ok().as_deref(),
+            env::var("ORC_HARNESS").ok().as_deref(),
             env::var("ORC_NATIVE_SESSION_ID").ok().as_deref(),
         )
     } else {
-        None
+        ReconcileSelection::All
     };
+    if selection == ReconcileSelection::IdentityMismatch {
+        return Ok(snapshot);
+    }
     let enrichments = snapshot
         .sessions
         .iter()
         .filter(|session| session.status != LifecycleStatus::Archived)
         .filter(|session| {
-            current_id
-                .as_ref()
-                .is_none_or(|current_id| session.id == *current_id)
+            matches!(&selection, ReconcileSelection::All)
+                || matches!(&selection, ReconcileSelection::One(id) if session.id == *id)
         })
         .map(|session| {
             let bindings =
@@ -1458,22 +1495,46 @@ pub fn reconcile_with_current(
     })
 }
 
-fn current_rebind_id(
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReconcileSelection {
+    All,
+    One(String),
+    IdentityMismatch,
+}
+
+fn current_rebind_selection(
     snapshot: &WorkspaceState,
     session_id: Option<&str>,
+    harness: Option<&str>,
     native_id: Option<&str>,
-) -> Option<String> {
-    session_id
-        .and_then(|id| snapshot.current_session_for(Some(id)))
-        .or_else(|| {
-            native_id.and_then(|native_id| {
-                snapshot
-                    .active_sessions()
-                    .filter(|session| session.native_id == native_id)
-                    .max_by_key(|session| session.updated_at)
-            })
+) -> ReconcileSelection {
+    if session_id.is_none() && harness.is_none() && native_id.is_none() {
+        return ReconcileSelection::All;
+    }
+    if let Some(session_id) = session_id {
+        let Some(session) = snapshot.current_session_for(Some(session_id)) else {
+            return ReconcileSelection::IdentityMismatch;
+        };
+        if harness.is_some_and(|harness| harness != session.harness)
+            || native_id.is_some_and(|native_id| native_id != session.native_id)
+        {
+            return ReconcileSelection::IdentityMismatch;
+        }
+        return ReconcileSelection::One(session.id.clone());
+    }
+    let (Some(harness), Some(native_id)) = (harness, native_id) else {
+        return ReconcileSelection::IdentityMismatch;
+    };
+    snapshot
+        .active_sessions()
+        .filter(|session| {
+            session.has_native_identity(harness, native_id)
+                && session.status != LifecycleStatus::Terminating
         })
-        .map(|session| session.id.clone())
+        .max_by_key(|session| session.updated_at)
+        .map_or(ReconcileSelection::IdentityMismatch, |session| {
+            ReconcileSelection::One(session.id.clone())
+        })
 }
 
 fn apply_enrichment(
@@ -2330,6 +2391,7 @@ pub fn launch(
                 .current_dir(&scope)
                 .env("ORC_SCOPE", &scope)
                 .env("ORC_SESSION_ID", &session.id)
+                .env("ORC_HARNESS", &session.harness)
                 .env("ORC_NATIVE_SESSION_ID", &native_id);
             if let Some(model) = &model {
                 child.env("ORC_MODEL", model);
@@ -3048,25 +3110,54 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
     }
 
     #[test]
-    fn current_rebind_uses_only_the_hook_identity() {
+    fn current_rebind_validates_every_supplied_identity_field() {
         let mut workspace = WorkspaceState::empty("/tmp".into());
         let mut older = session("older", SessionRole::Orchestrator, LifecycleStatus::Working);
         older.native_id = "native".into();
         older.updated_at = Utc::now() - chrono::Duration::minutes(1);
         let mut newer = session("newer", SessionRole::Orchestrator, LifecycleStatus::Working);
         newer.native_id = "native".into();
+        newer.harness = "other".into();
         workspace.sessions = vec![older, newer];
 
         assert_eq!(
-            current_rebind_id(&workspace, Some("older"), Some("native")).as_deref(),
-            Some("older")
+            current_rebind_selection(&workspace, Some("older"), None, Some("native")),
+            ReconcileSelection::One("older".into())
         );
         assert_eq!(
-            current_rebind_id(&workspace, None, Some("native")).as_deref(),
-            Some("newer")
+            current_rebind_selection(&workspace, None, Some("test"), Some("native")),
+            ReconcileSelection::One("older".into())
         );
-        assert_eq!(current_rebind_id(&workspace, None, None), None);
-        assert_eq!(current_rebind_id(&workspace, Some("missing"), None), None);
+        assert_eq!(
+            current_rebind_selection(&workspace, None, None, Some("native")),
+            ReconcileSelection::IdentityMismatch
+        );
+        assert_eq!(
+            current_rebind_selection(&workspace, None, Some("other"), Some("native")),
+            ReconcileSelection::One("newer".into())
+        );
+        assert_eq!(
+            current_rebind_selection(&workspace, Some("older"), Some("other"), Some("native")),
+            ReconcileSelection::IdentityMismatch
+        );
+        assert_eq!(
+            current_rebind_selection(&workspace, Some("older"), Some("test"), Some("different")),
+            ReconcileSelection::IdentityMismatch
+        );
+        assert_eq!(
+            current_rebind_selection(&workspace, Some("missing"), None, None),
+            ReconcileSelection::IdentityMismatch
+        );
+    }
+
+    #[test]
+    fn empty_current_identity_selects_workspace_enrichment() {
+        let workspace = WorkspaceState::empty("/tmp".into());
+
+        assert_eq!(
+            current_rebind_selection(&workspace, None, None, None),
+            ReconcileSelection::All
+        );
     }
 
     #[cfg(unix)]
@@ -3157,8 +3248,15 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         newer.updated_at = now;
         let mut child = session("child", SessionRole::Implementer, LifecycleStatus::Working);
         child.parent_id = Some("older".into());
+        let mut other_harness = session(
+            "other-harness",
+            SessionRole::Implementer,
+            LifecycleStatus::Working,
+        );
+        other_harness.harness = "other".into();
+        other_harness.native_id = "native".into();
         newer.parent_id = Some("child".into());
-        workspace.sessions = vec![older, newer, child];
+        workspace.sessions = vec![older, newer, child, other_harness];
         workspace.runs.push(run_with_assignment("older", "older"));
 
         let audit = repair_duplicate_native_sessions(&mut workspace, false).expect("audit");
@@ -3201,6 +3299,12 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         assert_eq!(
             workspace.runs[0].nodes[0].session_id.as_deref(),
             Some("newer")
+        );
+        assert_eq!(
+            selected_session(&workspace, "other-harness")
+                .expect("other harness session")
+                .status,
+            LifecycleStatus::Working
         );
         let mut cursor = Some("child");
         let mut visited = BTreeSet::new();
@@ -3631,7 +3735,7 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         let reregistered = register(
             &scope,
             Contract {
-                harness: "replacement-harness".into(),
+                harness: "original-harness".into(),
                 model: Some("replacement-model".into()),
                 role: SessionRole::Orchestrator,
                 ..Contract::default()
@@ -3815,7 +3919,7 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         )
         .expect("worker");
         let mut forged = Contract {
-            harness: "replacement".into(),
+            harness: "worker-harness".into(),
             role: SessionRole::Orchestrator,
             ..Contract::default()
         };
@@ -3841,7 +3945,7 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
     }
 
     #[test]
-    fn registering_one_native_session_under_another_harness_reuses_the_root() {
+    fn registering_one_native_session_under_another_harness_requires_adoption() {
         let directory = tempfile::tempdir().expect("scope");
         let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
         let first = register(
@@ -3858,7 +3962,8 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         )
         .expect("first registration");
 
-        let second = register(
+        let before = read_workspace(&scope).expect("workspace before rejected registration");
+        let error = register(
             &scope,
             Contract {
                 harness: "claude".into(),
@@ -3870,17 +3975,116 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
                 ..SessionLink::default()
             },
         )
-        .expect("same native registration");
+        .expect_err("a different harness must not reuse a native identity");
 
         let workspace = read_workspace(&scope).expect("workspace");
-        assert_eq!(second.id, first.id);
-        assert_eq!(second.harness, "claude");
+        assert!(error.to_string().contains("session adopt"), "{error:#}");
+        assert_eq!(workspace, before);
+        assert_eq!(workspace.sessions[0].id, first.id);
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn same_harness_reconnect_preserves_authority_and_refreshes_liveness() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let root = register(
+            &scope,
+            Contract {
+                harness: "codex".into(),
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("root-native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("root registration");
+        let worker = register(
+            &scope,
+            Contract {
+                harness: "claude".into(),
+                model: Some("original-model".into()),
+                role: SessionRole::Implementer,
+                title: "Implement identity safety".into(),
+                purpose: "Prevent cross-harness mutation".into(),
+                goal: "Qualify native identities".into(),
+                expected_output: "Verified identity invariants".into(),
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("shared-native".into()),
+                parent_id: Some(root.id.clone()),
+                run_id: Some("identity-run".into()),
+                node_id: Some("implement".into()),
+                source: RegistrationSource::Hook,
+                ..SessionLink::default()
+            },
+        )
+        .expect("worker registration");
+        let old_heartbeat = Utc::now() - chrono::Duration::hours(1);
+        let existing_binding = binding("activity", ProviderKind::Activity, BindingStatus::Active);
+        state::update(&scope, |workspace| {
+            let existing = workspace
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == worker.id)
+                .context("worker disappeared")?;
+            existing.status = LifecycleStatus::Disconnected;
+            existing.heartbeat_at = Some(old_heartbeat);
+            existing.providers = vec![existing_binding.clone()];
+            existing.reported_output = Some(ReportedOutput {
+                value: serde_json::json!({"result": "retained"}),
+            });
+            Ok(())
+        })
+        .expect("disconnect worker");
+
+        let reconnected = register(
+            &scope,
+            Contract {
+                harness: "claude".into(),
+                model: Some("replacement-model".into()),
+                role: SessionRole::Judge,
+                title: "Replacement title".into(),
+                purpose: "Replacement purpose".into(),
+                goal: "Replacement goal".into(),
+                expected_output: "Replacement output".into(),
+                ..Contract::default()
+            },
+            SessionLink {
+                native_id: Some("shared-native".into()),
+                source: RegistrationSource::Connected,
+                ..SessionLink::default()
+            },
+        )
+        .expect("same-harness reconnect");
+
+        assert_eq!(reconnected.id, worker.id);
+        assert_eq!(reconnected.harness, "claude");
+        assert_eq!(reconnected.model.as_deref(), Some("original-model"));
+        assert_eq!(reconnected.role, SessionRole::Implementer);
+        assert_eq!(reconnected.title, "Implement identity safety");
+        assert_eq!(reconnected.purpose, "Prevent cross-harness mutation");
+        assert_eq!(reconnected.goal, "Qualify native identities");
+        assert_eq!(reconnected.expected_output, "Verified identity invariants");
+        assert_eq!(reconnected.registration, RegistrationSource::Hook);
+        assert_eq!(reconnected.parent_id.as_deref(), Some(root.id.as_str()));
+        assert_eq!(reconnected.run_id.as_deref(), Some("identity-run"));
+        assert_eq!(reconnected.node_id.as_deref(), Some("implement"));
+        assert_eq!(reconnected.providers, vec![existing_binding]);
         assert_eq!(
-            workspace
-                .active_sessions()
-                .filter(|session| session.role == SessionRole::Orchestrator)
-                .count(),
-            1
+            reconnected.reported_output,
+            Some(ReportedOutput {
+                value: serde_json::json!({"result": "retained"}),
+            })
+        );
+        assert_eq!(reconnected.status, LifecycleStatus::Working);
+        assert!(
+            reconnected
+                .heartbeat_at
+                .is_some_and(|at| at > old_heartbeat)
         );
         let _ = std::fs::remove_file(state::path(&scope));
     }
@@ -3907,7 +4111,7 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         let error = register(
             &scope,
             Contract {
-                harness: "worker-harness".into(),
+                harness: "root-harness".into(),
                 role: SessionRole::Worker,
                 ..Contract::default()
             },
@@ -3924,6 +4128,46 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         assert_eq!(current.sessions.len(), 1);
         assert_eq!(current.sessions[0].native_id, "root-native");
         assert_eq!(current.sessions[0].role, SessionRole::Orchestrator);
+        let _ = std::fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn explicit_id_cannot_register_under_another_harness() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let root = register(
+            &scope,
+            Contract {
+                harness: "codex".into(),
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some("root".into()),
+                native_id: Some("native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("root registration");
+        let before = read_workspace(&scope).expect("workspace before rejected registration");
+
+        let error = register(
+            &scope,
+            Contract {
+                harness: "claude".into(),
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some(root.id),
+                native_id: Some("native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect_err("explicit cross-harness registration must fail");
+
+        assert!(error.to_string().contains("belongs to harness codex"));
+        assert_eq!(read_workspace(&scope).expect("unchanged workspace"), before);
         let _ = std::fs::remove_file(state::path(&scope));
     }
 
@@ -4156,7 +4400,7 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         let reregistered = register(
             &scope,
             Contract {
-                harness: "replacement-harness".into(),
+                harness: root.harness.clone(),
                 role: SessionRole::Orchestrator,
                 ..Contract::default()
             },
@@ -4500,7 +4744,7 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         let error = adopt(
             &scope,
             Contract {
-                harness: "claude".into(),
+                harness: "pi".into(),
                 ..Contract::default()
             },
             Some(child.native_id.clone()),

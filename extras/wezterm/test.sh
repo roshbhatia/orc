@@ -21,6 +21,7 @@ bind_request() {
       currentSessionId: "orc-session",
       session: {
         id: "orc-session",
+        harness: "codex",
         nativeId: "native-session",
         providers: []
       }
@@ -54,6 +55,7 @@ bind_with_tty() {
   bind_request |
     env -u WEZTERM_PANE \
       ORC_PROVIDER_LIB="$provider_library" \
+      ORC_HARNESS=codex \
       ORC_TEST_PS_TTY="$tty" \
       ORC_TEST_WEZTERM_CLIENTS="$clients" \
       ORC_TEST_WEZTERM_PANES="$panes" \
@@ -63,6 +65,15 @@ bind_with_tty() {
 live_clients='[{"pid":123}]'
 exact_panes='[{"pane_id":73,"tty_name":"/dev/ttys007"}]'
 assert_bind_status 73 "$(bind_with_tty "$live_clients" "$exact_panes" ttys007)"
+
+exact_id_output=$(bind_request |
+  env -u ORC_HARNESS -u ORC_NATIVE_SESSION_ID -u WEZTERM_PANE \
+    ORC_PROVIDER_LIB="$provider_library" \
+    ORC_TEST_PS_TTY=ttys007 \
+    ORC_TEST_WEZTERM_CLIENTS="$live_clients" \
+    ORC_TEST_WEZTERM_PANES="$exact_panes" \
+    bash "$provider_script")
+assert_bind_status 73 "$exact_id_output"
 
 other_panes='[{"pane_id":73,"tty_name":"/dev/ttys008"}]'
 assert_bind_status '' "$(bind_with_tty "$live_clients" "$other_panes" ttys007)"
@@ -78,14 +89,26 @@ mismatched_request=$(bind_request | jq '.currentSessionId = "other-session"')
 mismatched_output=$(printf '%s\n' "$mismatched_request" |
   env -u ORC_NATIVE_SESSION_ID -u WEZTERM_PANE \
     ORC_PROVIDER_LIB="$provider_library" \
+    ORC_HARNESS=codex \
     ORC_TEST_PS_TTY=ttys007 \
     ORC_TEST_WEZTERM_CLIENTS="$live_clients" \
     ORC_TEST_WEZTERM_PANES="$exact_panes" \
     bash "$provider_script")
 assert_bind_status '' "$mismatched_output"
 
+harness_mismatched_output=$(bind_request |
+  env -u ORC_NATIVE_SESSION_ID -u WEZTERM_PANE \
+    ORC_PROVIDER_LIB="$provider_library" \
+    ORC_HARNESS=claude \
+    ORC_TEST_PS_TTY=ttys007 \
+    ORC_TEST_WEZTERM_CLIENTS="$live_clients" \
+    ORC_TEST_WEZTERM_PANES="$exact_panes" \
+    bash "$provider_script")
+assert_bind_status '' "$harness_mismatched_output"
+
 bind_request | jq 'del(.currentSessionId)' |
   ORC_NATIVE_SESSION_ID=native-session \
+    ORC_HARNESS=codex \
     ORC_PROVIDER_LIB="$provider_library" \
     ORC_TEST_PS_TTY=ttys007 \
     ORC_TEST_WEZTERM_CLIENTS="$live_clients" \

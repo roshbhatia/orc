@@ -346,6 +346,12 @@ pub struct Session {
     pub updated_at: DateTime<Utc>,
 }
 
+impl Session {
+    pub(crate) fn has_native_identity(&self, harness: &str, native_id: &str) -> bool {
+        self.harness == harness && self.native_id == native_id
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RegistrationSource {
@@ -583,15 +589,11 @@ impl WorkspaceState {
             }) {
                 return Some(session);
             }
-            let native_id = &self
-                .sessions
-                .iter()
-                .find(|session| session.id == id)?
-                .native_id;
+            let previous = self.sessions.iter().find(|session| session.id == id)?;
             return self
                 .active_sessions()
                 .filter(|session| {
-                    session.native_id == *native_id
+                    session.has_native_identity(&previous.harness, &previous.native_id)
                         && session.status != LifecycleStatus::Terminating
                 })
                 .max_by_key(|session| session.updated_at);
@@ -704,6 +706,28 @@ mod tests {
                 .map(|session| session.id.as_str()),
             Some("active")
         );
+    }
+
+    #[test]
+    fn archived_incarnation_does_not_cross_harnesses() {
+        let mut workspace = WorkspaceState::empty("/tmp".into());
+        let archived = session(
+            "archived",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Archived,
+            1,
+        );
+        let mut active = session(
+            "active",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+            2,
+        );
+        active.harness = "other".into();
+        active.native_id = archived.native_id.clone();
+        workspace.sessions = vec![active, archived];
+
+        assert!(workspace.current_session_for(Some("archived")).is_none());
     }
 
     #[test]

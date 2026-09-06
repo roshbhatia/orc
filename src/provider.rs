@@ -2094,6 +2094,7 @@ fn apply_session_linkage(plan: &mut CommandPlan, request: &Value) {
     };
     let fields = [
         ("ORC_SESSION_ID", "id"),
+        ("ORC_HARNESS", "harness"),
         ("ORC_NATIVE_SESSION_ID", "nativeId"),
         ("ORC_PARENT_SESSION_ID", "parentId"),
         ("ORC_RUN_ID", "runId"),
@@ -3460,6 +3461,7 @@ fi
             "scope": "/workspace",
             "session": {
                 "id": "session-1",
+                "harness": "codex",
                 "nativeId": "native-1",
                 "parentId": "parent-1",
                 "runId": "run-1",
@@ -3473,6 +3475,7 @@ fi
 
         assert_eq!(plan.environment["ORC_SCOPE"], "/workspace");
         assert_eq!(plan.environment["ORC_SESSION_ID"], "session-1");
+        assert_eq!(plan.environment["ORC_HARNESS"], "codex");
         assert_eq!(plan.environment["ORC_NATIVE_SESSION_ID"], "native-1");
         assert_eq!(plan.environment["ORC_PARENT_SESSION_ID"], "parent-1");
         assert_eq!(plan.environment["ORC_RUN_ID"], "run-1");

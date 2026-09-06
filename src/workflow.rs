@@ -2480,6 +2480,7 @@ fn agent_launch_request(request: AgentLaunchRequest<'_>) -> serde_json::Value {
         "environment": {
             "ORC_SCOPE": request.scope,
             "ORC_SESSION_ID": request.session.id,
+            "ORC_HARNESS": request.session.harness,
             "ORC_NATIVE_SESSION_ID": request.native_id,
             "ORC_PARENT_SESSION_ID": request.run.orchestrator_id,
             "ORC_RUN_ID": request.run.id,
@@ -3999,6 +4000,7 @@ fn spawn_executor_with_direction(
     }
     for name in [
         "ORC_SESSION_ID",
+        "ORC_HARNESS",
         "ORC_NATIVE_SESSION_ID",
         "ORC_PARENT_SESSION_ID",
         "ORC_RUN_ID",
@@ -4651,6 +4653,7 @@ actions:
         });
 
         assert_eq!(request["direction"], "bottom");
+        assert_eq!(request["environment"]["ORC_HARNESS"], session.harness);
         assert_eq!(read_display_direction(&scope, &run.id).unwrap(), "bottom");
         assert!(write_display_direction(&scope, &run.id, "diagonal").is_err());
         remove_fixture_state(&scope, &run.id);

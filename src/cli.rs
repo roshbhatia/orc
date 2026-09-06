@@ -415,6 +415,8 @@ enum SessionCommand {
         id: Option<String>,
         #[command(flatten)]
         scope: ScopeArgs,
+        #[arg(long)]
+        harness: Option<String>,
         #[arg(long = "native-id")]
         native_id: Option<String>,
         #[arg(long = "hook-input")]
@@ -990,7 +992,8 @@ pub fn run() -> Result<u8> {
             } else {
                 for duplicate in &report.duplicates {
                     println!(
-                        "{} · keep {} · {} {}",
+                        "{}:{} · keep {} · {} {}",
+                        duplicate.harness,
                         duplicate.native_id,
                         duplicate.canonical_id,
                         if report.repaired {
@@ -1290,6 +1293,7 @@ pub fn run() -> Result<u8> {
             SessionCommand::Archive {
                 id,
                 scope,
+                harness,
                 mut native_id,
                 hook_input,
                 quiet,
@@ -1304,15 +1308,45 @@ pub fn run() -> Result<u8> {
                 if id.is_none() && native_id.is_none() {
                     return Ok(0);
                 }
+                let requested_harness = harness.or_else(|| env::var("ORC_HARNESS").ok());
+                let stored_harness = if let Ok(session_id) = env::var("ORC_SESSION_ID") {
+                    control::read_workspace(&scope.scope)?
+                        .sessions
+                        .into_iter()
+                        .find(|session| session.id == session_id)
+                        .map(|session| session.harness)
+                } else {
+                    None
+                };
+                if id.is_none()
+                    && let (Some(requested), Some(stored)) =
+                        (requested_harness.as_deref(), stored_harness.as_deref())
+                    && requested != stored
+                {
+                    if hook_input {
+                        return Ok(0);
+                    }
+                    bail!(
+                        "session harness {requested} conflicts with ORC_SESSION_ID harness {stored}"
+                    );
+                }
+                let native_harness = requested_harness.or(stored_harness);
+                if id.is_none() && native_id.is_some() && native_harness.is_none() {
+                    if hook_input {
+                        return Ok(0);
+                    }
+                    bail!("--harness is required when selecting a session by --native-id");
+                }
+                let native_identity = native_harness.as_deref().zip(native_id.as_deref());
                 if hook_input
                     && let Ok((_, current)) = control::ensure_active_context(&scope.scope)
                     && current.registration == RegistrationSource::Managed
                     && current.role != SessionRole::Orchestrator
                 {
                     let targets_current = id.as_deref().is_none_or(|id| id == current.id)
-                        && native_id
-                            .as_deref()
-                            .is_none_or(|native| native == current.native_id);
+                        && native_identity.is_none_or(|(harness, native)| {
+                            current.has_native_identity(harness, native)
+                        });
                     if !targets_current {
                         bail!("a managed child exit hook can only disconnect its own session");
                     }
@@ -1327,25 +1361,18 @@ pub fn run() -> Result<u8> {
                     return Ok(0);
                 }
                 if hook_input
-                    && !control::has_active_session(
-                        &scope.scope,
-                        id.as_deref(),
-                        native_id.as_deref(),
-                    )?
+                    && !control::has_active_session(&scope.scope, id.as_deref(), native_identity)?
                 {
                     return Ok(0);
                 }
                 require_orchestrator_or_operator(&scope.scope)?;
-                let session =
-                    match control::archive(&scope.scope, id.as_deref(), native_id.as_deref()) {
-                        Ok(session) => session,
-                        Err(error)
-                            if hook_input && error.is::<control::NoMatchingActiveSession>() =>
-                        {
-                            return Ok(0);
-                        }
-                        Err(error) => return Err(error),
-                    };
+                let session = match control::archive(&scope.scope, id.as_deref(), native_identity) {
+                    Ok(session) => session,
+                    Err(error) if hook_input && error.is::<control::NoMatchingActiveSession>() => {
+                        return Ok(0);
+                    }
+                    Err(error) => return Err(error),
+                };
                 if !quiet {
                     println!("{}", session.id);
                 }
