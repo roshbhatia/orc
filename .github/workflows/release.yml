@@ -13,6 +13,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.88.0
       - name: Match the tag to Cargo.toml
         run: |
           package_version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "orc") | .version')
@@ -44,6 +46,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.88.0
           targets: ${{ matrix.target }}
       - uses: cachix/install-nix-action@v31
       - name: Run required checks
@@ -73,6 +76,7 @@ jobs:
           "$binary" completion zsh > "$archive/share/zsh/site-functions/_orc"
           "$binary" schema config > "$archive/share/orc/config.schema.json"
           "$binary" schema animation > "$archive/share/orc/terminal.animation.v1.schema.json"
+          "$binary" schema message > "$archive/share/orc/message.schema.json"
           "$binary" schema provider > "$archive/share/orc/provider.schema.json"
           "$binary" schema resource > "$archive/share/orc/resource.schema.json"
           "$binary" schema state > "$archive/share/orc/state.schema.json"

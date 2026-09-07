@@ -11,7 +11,7 @@
 }:
 rustPlatform.buildRustPackage {
   pname = "orc";
-  version = "0.11.1";
+  version = "0.12.0";
   src = lib.fileset.toSource {
     root = ./.;
     fileset = lib.fileset.unions [
@@ -60,6 +60,7 @@ rustPlatform.buildRustPackage {
     "$out/bin/orc" schema animation > "$out/share/orc/terminal.animation.v1.schema.json"
     "$out/bin/orc" schema resource > "$out/share/orc/resource.schema.json"
     "$out/bin/orc" schema provider > "$out/share/orc/provider.schema.json"
+    "$out/bin/orc" schema message > "$out/share/orc/message.schema.json"
     "$out/bin/orc" schema workflow > "$out/share/orc/workflow.schema.json"
     "$out/bin/orc" schema state > "$out/share/orc/state.schema.json"
     install -Dm644 ${./assets/animations.yaml} "$out/share/orc/animations.yaml"

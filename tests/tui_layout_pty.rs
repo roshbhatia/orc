@@ -30,19 +30,31 @@ fn tui_layout_commands_persist_through_a_pty() {
 
     let mut master = -1;
     let mut slave = -1;
+    #[cfg(target_os = "linux")]
+    let dimensions = libc::winsize {
+        ws_row: 36,
+        ws_col: 120,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    #[cfg(not(target_os = "linux"))]
     let mut dimensions = libc::winsize {
         ws_row: 36,
         ws_col: 120,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
+    #[cfg(target_os = "linux")]
+    let dimensions = std::ptr::from_ref(&dimensions);
+    #[cfg(not(target_os = "linux"))]
+    let dimensions = std::ptr::from_mut(&mut dimensions);
     let opened = unsafe {
         libc::openpty(
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut dimensions,
+            dimensions,
         )
     };
     assert_eq!(opened, 0, "open PTY");

@@ -1,5 +1,6 @@
 {
   bash,
+  coreutils,
   lib,
   makeWrapper,
   shellcheck,
@@ -15,10 +16,14 @@
   script,
 }:
 let
-  providerRuntimeInputs = [ bash ] ++ runtimeInputs;
+  providerRuntimeInputs = [
+    bash
+    coreutils
+  ]
+  ++ runtimeInputs;
   adapter = stdenvNoCC.mkDerivation {
     pname = "orc-provider-${name}-adapter";
-    version = "0.11.1";
+    version = "0.12.0";
     dontUnpack = true;
     strictDeps = true;
 

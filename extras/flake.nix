@@ -17,12 +17,12 @@
       inputs.systems.follows = "systems";
     };
     changes = {
-      url = "github:roshbhatia/changes/main";
+      url = "github:roshbhatia/changes/v0.9.1";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.systems.follows = "systems";
     };
     traces = {
-      url = "github:roshbhatia/traces/main";
+      url = "github:roshbhatia/traces/v0.7.0";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.systems.follows = "systems";
     };
@@ -241,6 +241,49 @@
                 jq -e 'length == 1 and .[0].name == "harness"' providers.json > /dev/null
                 touch "$out"
               '';
+          changesPinnedBehavior =
+            pkgs.runCommand "orc-changes-pinned-behavior"
+              {
+                nativeBuildInputs = [
+                  pkgs.git
+                  pkgs.jq
+                ];
+              }
+              ''
+                export HOME="$TMPDIR/home"
+                export XDG_CONFIG_HOME="$TMPDIR/config"
+                export XDG_DATA_HOME="$TMPDIR/data"
+                fixture="$TMPDIR/repository"
+                mkdir -p "$fixture"
+                git -C "$fixture" init --quiet
+                git -C "$fixture" config user.name "Orc provider validation"
+                git -C "$fixture" config user.email "orc@example.invalid"
+                printf 'before\n' > "$fixture/example.txt"
+                git -C "$fixture" add example.txt
+                git -C "$fixture" commit --quiet --message base
+                printf 'after\n' > "$fixture/example.txt"
+
+                ${lib.getExe changesPackage} \
+                  -r -root "$fixture" -color always > changes.txt
+                grep -a -F 'example.txt' changes.txt > /dev/null
+
+                env -i \
+                  HOME="$HOME" \
+                  ORC_AGENT_REGISTRY=${registry} \
+                  TMPDIR="$TMPDIR" \
+                  XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
+                  XDG_DATA_HOME="$XDG_DATA_HOME" \
+                  ${lib.getExe packages.full} \
+                    provider validate changes --scope "$fixture" --json > validation.json
+                jq -e '
+                  length == 1
+                  and .[0].provider.name == "changes"
+                  and .[0].status == "ok"
+                  and any(.[0].checks[];
+                    .name == "action:changes.inspect" and .status == "ok")
+                ' validation.json > /dev/null
+                touch "$out"
+              '';
           providerAggregateBoundary = pkgs.runCommand "orc-provider-aggregate-boundary" { } ''
             ${lib.concatMapStringsSep "\n" (name: ''
               test -x ${packages.all}/bin/orc-provider-${name}
@@ -389,6 +432,7 @@
           provider-aggregate-boundary = providerAggregateBoundary;
           full-main-program = fullMainProgram;
           installed-provider-discovery = installedProviderDiscovery;
+          changes-pinned-behavior = changesPinnedBehavior;
           harness-registry-requirement = harnessRegistry;
           wezterm-composed-environment = weztermEnvironment;
           wezterm-zmx-early-exit = weztermZmxEarlyExit;

@@ -38,7 +38,7 @@ metadata:
 spec:
   workflowRef: release
   parameters:
-    version: v0.11.1
+    version: v0.12.0
 ---
 apiVersion: orc.dev/v1alpha1
 kind: Session
