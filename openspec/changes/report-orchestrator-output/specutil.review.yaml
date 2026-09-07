@@ -1,9 +1,9 @@
 version: 2
 change: report-orchestrator-output
 decision: approved
-note: approved after independent Output tail and display receipt review
-change_hash: 555508f4c4d66d07
-base_commit: 4aaae4e78951c88022045f1f8d9babc9233ff416
+note: owner-authorized scope; mediated Output review reached CLEAN; release remains pending
+change_hash: 5aed768e43f6919b
+base_commit: 58c52fe5690231363b389009eeb97881a04d30a3
 items:
     0c006ee499f5879b:
         hash: 335b6728ae399ca8
@@ -35,12 +35,21 @@ items:
     3283135936f50bc2:
         hash: d111cca5e6902cd0
         text: Split Activity, Output, Checkpoint, Gates, and Health variants and move structured reports to Checkpoint writes:` src/tui.rs
+    19639298188ddd63:
+        hash: e367185ebbae32ad
+        text: Validate malformed records, cross-session data, duplicate IDs, aggregate bounds, safe color, partial failures, cache isolation, and refresh behavior writes:` src/provider.rs,src/tui.rs,extras/traces/test.sh
     82048444719867bc:
         hash: 557216f45f9a6cde
         text: 'Adversarial review: verify inspector selection, loading, error retention, scrolling, and live polling writes:` openspec/changes/report-orchestrator-output/review.md'
     a2e2ce538bc4b53b:
         hash: 6f52960dc8fc9bf3
         text: 'Adversarial review: retain the prior structured report integrity and authorization findings writes:` openspec/changes/report-orchestrator-output/review.md'
+    a7f1ef22737864a4:
+        hash: 4bcc24a929c93ca3
+        text: Replace opaque message text with validated `orc.message/v1` JSONL and translate the optional Traces record stream in its adapter writes:` src/provider.rs,extras/traces,schema/message.schema.json
+    a905f41bf17998a2:
+        hash: e0bd490452ccdaab
+        text: Keep session, assigned-node, unassigned-node, and run Output scopes exact; merge explicit run members with stable boundaries and independent cache keys writes:` src/tui.rs
     e8ef5c3374d6a2c6:
         hash: 4a9f736ab691cce8
         text: Follow the newest Output on first load and selection, follow refreshes only from the tail, and preserve a scrolled-up position writes:` src/tui.rs

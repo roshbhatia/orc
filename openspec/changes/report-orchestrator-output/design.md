@@ -22,7 +22,17 @@ Orc already has two distinct data sources. Activity is a provider-backed operati
 
 ### Reserve Output for provider-backed assistant prose
 
-`messages.read` accepts the standard session request and returns a command plan. The command prints chronological, user-visible assistant text. Providers exclude user prompts, reasoning, and tool rows. Orc does not parse a native transcript.
+`messages.read` accepts the standard session request with `format: jsonl` and
+returns a command plan. The command prints chronological `orc.message/v1`
+records with a stable ID, exact native session identity, RFC 3339 timestamp,
+body, and optional truncation and body-format fields. Providers exclude user
+prompts, reasoning, and tool rows. Orc does not parse a native transcript.
+
+Plain bodies discard all terminal controls. A record can explicitly declare
+`bodyFormat: ansi`; Orc then keeps only SGR sequences whose parameters contain
+digits, semicolons, or colons. It strips every other CSI, OSC, C0, and C1
+control. Orc styles its own time and agent boundaries after validation.
+It resets SGR after every body so provider styling cannot cross a boundary.
 
 Resolution never falls back to `activity.read`, `execution.logs`, or `session.inspect`. A provider may advertise both Activity and Output, but each capability follows its own plan.
 
@@ -34,7 +44,28 @@ This is a UI correction, not a state migration. Old workspaces remain readable, 
 
 ### Keep Output cache state independent
 
-The TUI keeps per-session Output values, load times, in-flight markers, and refresh errors separately from Activity. It polls only while the Output tab is visible. A successful refresh replaces the value and clears the error. A failed refresh records the error without deleting the last successful value or changing inspector scroll.
+The TUI keeps per-selected-subject Output values, load times, in-flight markers,
+and refresh errors separately from Activity. Session, node, and run keys never
+share a cache entry. It polls only while the Output tab is visible. A successful
+refresh replaces the value and clears the error. A failed refresh records the
+error without deleting the last successful value or changing inspector scroll.
+
+Session selection has one exact source. An assigned node has only its explicit
+`sessionId`; an unassigned node has no source. A run includes its exact
+orchestrator, node assignments, and sessions whose `runId` names the run. Orc
+deduplicates those source sessions, reads each through `messages.read`, merges
+records by timestamp, and deduplicates stable IDs within each native session.
+It retains successful sources when another run member fails and labels the
+partial result. It also retains that failed member's prior records and marks
+them stale. An explicit session reference that cannot resolve remains a visible
+source error; Orc does not relabel it as unassigned.
+
+Session, node, and run cache keys use stable selected-object identity. They do
+not include mutable membership. Each value records its current exact membership;
+when membership changes, Orc drops records from removed sessions before a new
+read. Orc caps all Output cache maps and in-flight reads at 256 selected objects.
+Boundaries show time, title, role, and harness. When those labels collide for
+distinct sessions, Orc adds the shortest unique session suffix.
 
 The first successful load follows the newest line. Selecting another Output subject or returning to Output also follows its newest line. A refresh follows appended content only while the viewer is already at the tail. Scrolling upward disables tail following until the viewport reaches the tail again.
 
@@ -42,7 +73,12 @@ The refresh interval reuses the configured live-activity interval. This avoids a
 
 ### Bound text at the provider boundary and inspector boundary
 
-The provider request supplies byte and line limits. Orc also caps captured stdout using tail retention, so an uncooperative provider cannot allocate an unbounded TUI value. Truncation drops an incomplete leading line, preserves valid UTF-8, and retains complete ANSI sequences in ordinary line-oriented output. The inspector applies its existing final byte and line bounds before rendering ANSI into Ratatui text.
+The provider request supplies byte and line limits. Orc also caps captured
+stdout using tail retention, so an uncooperative provider cannot allocate an
+unbounded TUI value. Truncation drops an incomplete leading record. The parser
+rejects malformed remaining JSONL, wrong session identities, unsupported
+versions, empty IDs, and conflicting duplicate IDs. The merged cache and final
+inspector each apply their own byte and record or line bounds.
 
 ### Keep adoption and backfill metadata-only
 
@@ -56,13 +92,17 @@ The receipt remains optional. Plans without one keep their current stdout behavi
 
 ### Implement Traces as an optional extra
 
-The Traces manifest advertises `messages.read`. Its adapter returns this plan:
+The Traces manifest advertises `messages.read`. Its adapter runs:
 
 ```text
-traces --view output --once --session <native-id> [--service <harness>] --color always
+traces --view output --format jsonl --once --session <native-id> [--service <harness>] --color never
 ```
 
-The command contract returns user-visible assistant prose only. Orc knows only the manifest capability and returned command plan.
+The adapter validates the `traces.message/v1` stream and rewrites only its
+version field to `orc.message/v1`. Orc knows only the manifest capability and
+its own returned record contract. Provider validation runs the same structured
+command against a deterministic local record and requires the exact session,
+timestamp, and body before accepting an installed Traces binary.
 
 ## Risks / Trade-offs
 

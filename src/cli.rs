@@ -762,6 +762,7 @@ struct GuideArgs {
 enum SchemaTarget {
     Config,
     Animation,
+    Message,
     Resource,
     Provider,
     Workflow,
@@ -1747,6 +1748,7 @@ pub fn run() -> Result<u8> {
                 SchemaTarget::Animation => {
                     serde_json::from_str(&rs_utils::animation::AnimationConfig::json_schema()?)?
                 }
+                SchemaTarget::Message => provider::message_schema(),
                 SchemaTarget::Resource => control_plane::schema(),
                 SchemaTarget::Provider => provider::schema(),
                 SchemaTarget::Workflow => workflow::schema(),
@@ -2028,6 +2030,7 @@ fn generate_artifacts(root: &std::path::Path, check: bool) -> Result<()> {
         ),
         ("resource.schema.json", control_plane::schema()),
         ("provider.schema.json", provider::schema()),
+        ("message.schema.json", provider::message_schema()),
         ("workflow.schema.json", workflow::schema()),
         (
             "state.schema.json",

@@ -65,3 +65,35 @@ Both independent reviewers returned CLEAN after the corrections. They verified p
 A live foundation review found two receipt-boundary defects. The binding parser accepted an old protocol version, and a rejected receipt command could print its reserved stdout. Orc now validates the receipt envelope before the binding and suppresses receipt stdout for every exit status. Focused regressions cover both failures.
 
 The reviewer returned CLEAN after rechecking Output tail following, scrolled-up preservation, error retention, provider ownership, accepted-exit-only persistence, and first-open/second-focus behavior. All checks remained native and isolated from the Orc runtime and broker.
+
+### Round 8
+
+Two independent critics reported seven correctness defects. The mediator
+accepted all seven and rejected none. The implementation now:
+
+- retains a failed run member's last-good records and marks them stale;
+- reports unresolved explicit session references;
+- uses stable, bounded selected-object cache keys;
+- disambiguates otherwise identical agent labels;
+- resets provider SGR before each Orc-owned boundary;
+- detects conflicting duplicate IDs before dropping sanitized-empty bodies; and
+- locks the Traces extra to the structured-output contract revision.
+
+### Round 9
+
+The next critics reported two defects, and the mediator accepted both. Orc now
+defers a new Output read when 256 reads are already in flight. Traces validation
+executes the structured command against a deterministic local fixture instead
+of trusting help text.
+
+### Round 10
+
+The final critics found two stale-contract paths. A reassigned node could retain
+its previous agent's cache, and provider validation accepted a malformed
+timestamp. Cache values now record exact subject membership and retain only the
+intersection after membership changes. The Traces probe requires the fixture's
+exact RFC 3339 timestamp and body.
+
+The independent mediator rechecked both revisions and returned
+`NO SURVIVING OBJECTION`. Terminal state: CLEAN. This is model evidence, not
+owner or peer approval.

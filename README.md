@@ -368,6 +368,7 @@ Actions resolve through capability chains. Optional steps are marked with `?`:
 attach    session.attach -> session.persist? -> terminal.open
 inspect   session.inspect -> terminal.open
 activity  activity.read | execution.logs | session.inspect
+output    messages.read
 changes   changes.inspect
 launch    session.launch -> session.persist? -> execution.run
 execute   execution.run
@@ -379,6 +380,27 @@ can return a command plan, a session binding, a description, or an explicit
 decline. An explicit decline lets the next provider handle that capability.
 Command plans may declare `successCodes`; the default is `[0]`. This lets a
 provider preserve command-specific results such as Traces exit status 2.
+`messages.read` requests include `format: jsonl`, `maxBytes`, and `maxLines`.
+The accepted command prints one `orc.message/v1` object per line:
+
+```json
+{"version":"orc.message/v1","id":"msg_123","session":"native-id","timestamp":"2026-09-06T12:34:56.123456789Z","body":"Finished the change."}
+```
+
+`id` stays stable across overlapping reads. `session` must equal the requested
+native session identity. `timestamp` uses RFC 3339. `body` is plain text by
+default. A provider can set `bodyFormat` to `ansi`; Orc then preserves only SGR
+palette sequences and removes every other terminal control. Set `truncated` to
+`true` when the body contains only the tail of one message. Orc validates,
+deduplicates, sorts, and bounds these records before rendering them. Run Output
+merges only its exact orchestrator and explicit member sessions. A partial run
+refresh keeps a failed member's last known records, labels them stale, and
+reports the source error. Orc adds a compact session suffix only when agent
+labels collide. A node never falls back to another session. When membership
+changes, last-good retention keeps only sessions that remain in the selected
+subject. Output cache keys stay stable per selected object and retain at most
+256 entries, including in-flight reads.
+
 Lifecycle requests include an immutable `operationId`. A `session.stop` or
 `execution.cancel` provider must make retries with the same operation ID
 idempotent. Providers must bind the action to the strongest stable identity
@@ -392,8 +414,9 @@ Local command plans must stay in their assigned process group. A command that
 detaches with `setsid` leaves local supervision. Use an execution provider when
 work needs an independent daemon or a stronger containment boundary.
 
-The final command plan inherits terminal state. Captured output preserves ANSI
-color in the TUI. Reconciliation caches content-addressed description
+The final command plan inherits terminal state. Captured Activity preserves
+ANSI color. Output preserves only the safe color declared by its message
+records. Reconciliation caches content-addressed description
 responses for the configured TTL. Dynamic bindings are always read again.
 Orc itself does not import Zmx,
 WezTerm, Traces, or Changes.
@@ -1808,7 +1831,7 @@ Print generated JSON schemas
 Usage: orc schema <SCHEMA>
 
 Arguments:
-  <SCHEMA>  [possible values: config, animation, resource, provider, workflow, state]
+  <SCHEMA>  [possible values: config, animation, message, resource, provider, workflow, state]
 
 Options:
   -h, --help  Print help

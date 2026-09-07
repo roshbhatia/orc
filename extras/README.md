@@ -9,7 +9,10 @@ contains optional adapters for common local tools.
 - `orc-provider-local` executes command plans on the current machine.
 - `orc-provider-zmx` adds persistence.
 - `orc-provider-wezterm` adds display panes and keeps failed commands visible.
-- `orc-provider-traces` adds session descriptions and activity.
+- `orc-provider-traces` adds session descriptions, activity, and assistant
+  Output. Its adapter translates the Traces record stream into Orc's provider
+  message contract and validation rejects Traces versions without structured
+  output support. Orc core does not import or identify Traces.
 - `orc-provider-changes` adds repository changes.
 
 Each provider directory owns three files: `default.nix`, `provider.yaml`, and

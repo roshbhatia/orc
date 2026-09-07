@@ -1,0 +1,48 @@
+{
+  "$defs": {
+    "MessageBodyFormat": {
+      "enum": [
+        "plain",
+        "ansi"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "body": {
+      "type": "string"
+    },
+    "bodyFormat": {
+      "$ref": "#/$defs/MessageBodyFormat",
+      "default": "plain"
+    },
+    "id": {
+      "type": "string"
+    },
+    "session": {
+      "type": "string"
+    },
+    "timestamp": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "truncated": {
+      "default": false,
+      "type": "boolean"
+    },
+    "version": {
+      "const": "orc.message/v1",
+      "type": "string"
+    }
+  },
+  "required": [
+    "version",
+    "id",
+    "session",
+    "timestamp",
+    "body"
+  ],
+  "title": "MessageRecord",
+  "type": "object"
+}

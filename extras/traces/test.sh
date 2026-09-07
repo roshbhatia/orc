@@ -34,5 +34,76 @@ response=$(
 {"version":"orc.provider/v1","action":"output","capability":"messages.read","scope":"/tmp/orc","session":{"id":"orc-session","nativeId":"native-session","harness":"codex"}}
 EOF
 )
-[[ $(jq -r '.command[0]' <<< "$response") == "$fake_traces" ]]
-[[ $(jq -c '.command[1:]' <<< "$response") == '["--view","output","--once","--session","native-session","--service","codex","--color","always"]' ]]
+provider_path=$(cd -- "$(dirname -- "$provider")" && pwd)/$(basename -- "$provider")
+[[ $(jq -r '.command[0]' <<< "$response") == "$provider_path" ]]
+[[ $(jq -c '.command[1:]' <<< "$response") == "[\"__messages\",\"$fake_traces\",\"native-session\",\"codex\"]" ]]
+
+cat > "$fake_traces" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ " $* " == *' --view output '* ]]
+[[ " $* " == *' --format jsonl '* ]]
+[[ " $* " == *' --once '* ]]
+[[ " $* " == *' --session native-session '* ]]
+[[ " $* " == *' --service codex '* ]]
+[[ " $* " == *' --color never '* ]]
+printf '%s\n' '{"version":"traces.message/v1","id":"msg_one","session":"native-session","timestamp":"2026-09-06T12:34:56.123456789Z","body":"finished"}'
+EOF
+chmod +x "$fake_traces"
+
+output=$("$provider" __messages "$fake_traces" native-session codex)
+[[ $(jq -r '.version' <<< "$output") == orc.message/v1 ]]
+[[ $(jq -r '.id' <<< "$output") == msg_one ]]
+[[ $(jq -r '.body' <<< "$output") == finished ]]
+
+validation_request='{"version":"orc.provider/v1","capability":"provider.validate","scope":"/tmp/orc","manifest":{"requires":{"commands":["jq","tail","traces"]}}}'
+cat > "$fake_traces" << 'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'Usage: traces [-view tree]'
+EOF
+chmod +x "$fake_traces"
+validation=$(PATH="$fixture:$PATH" "$provider" <<< "$validation_request")
+[[ $(jq -r '.status' <<< "$validation") == failed ]]
+[[ $(jq -r '.checks[] | select(.name == "contract:messages-jsonl") | .status' <<< "$validation") == failed ]]
+
+cat > "$fake_traces" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' '{"version":"traces.message/v1","id":"validation-message","session":"orc-validation","timestamp":"not-rfc3339","body":"validation message"}'
+EOF
+chmod +x "$fake_traces"
+validation=$(PATH="$fixture:$PATH" "$provider" <<< "$validation_request")
+[[ $(jq -r '.status' <<< "$validation") == failed ]]
+[[ $(jq -r '.checks[] | select(.name == "contract:messages-jsonl") | .status' <<< "$validation") == failed ]]
+
+cat > "$fake_traces" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == --help ]]; then
+  printf '%s\n' 'Usage: traces [-format string]'
+  exit
+fi
+printf '%s\n' 'plain text only'
+EOF
+chmod +x "$fake_traces"
+validation=$(PATH="$fixture:$PATH" "$provider" <<< "$validation_request")
+[[ $(jq -r '.status' <<< "$validation") == failed ]]
+[[ $(jq -r '.checks[] | select(.name == "contract:messages-jsonl") | .status' <<< "$validation") == failed ]]
+
+cat > "$fake_traces" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ -n ${XDG_CONFIG_HOME:-} ]]
+[[ " $* " == *' --file '* ]]
+[[ " $* " == *' --view output '* ]]
+[[ " $* " == *' --format jsonl '* ]]
+[[ " $* " == *' --once '* ]]
+[[ " $* " == *' --session orc-validation '* ]]
+[[ " $* " == *' --service orc-validation '* ]]
+[[ " $* " == *' --color never '* ]]
+printf '%s\n' '{"version":"traces.message/v1","id":"validation-message","session":"orc-validation","timestamp":"1970-01-01T00:00:01Z","body":"validation message"}'
+EOF
+chmod +x "$fake_traces"
+validation=$(PATH="$fixture:$PATH" "$provider" <<< "$validation_request")
+[[ $(jq -r '.status' <<< "$validation") == ok ]]
+[[ $(jq -r '.checks[] | select(.name == "contract:messages-jsonl") | .status' <<< "$validation") == ok ]]

@@ -12,5 +12,5 @@ actions:
   session.describe: Read the session title and goal
   session.inspect: Open a read-only Traces view for an active session
 requires:
-  commands: [tail, traces]
+  commands: [jq, tail, traces]
 priority: 100

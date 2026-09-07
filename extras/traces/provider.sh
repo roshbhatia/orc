@@ -45,6 +45,72 @@ if [[ ${1:-} == __activity ]]; then
   exit "${pipeline_status[0]}"
 fi
 
+if [[ ${1:-} == __messages ]]; then
+  executable=$2
+  native_id=$3
+  harness=$4
+  traces_args=(--view output --format jsonl --once --session "$native_id")
+  if [[ -n $harness ]]; then
+    traces_args+=(--service "$harness")
+  fi
+  traces_args+=(--color never)
+  "$executable" "${traces_args[@]}" | jq -c '
+    if .version != "traces.message/v1" then
+      error("unsupported Traces message version")
+    else
+      .version = "orc.message/v1"
+    end
+  '
+  exit
+fi
+
+validate_traces_contract() {
+  local command_ok executable message output status validation validation_dir validation_file
+  validation=$(validate_manifest_requirements)
+  executable=$(command -v traces || true)
+  validation_dir=$(mktemp -d)
+  validation_file=$validation_dir/messages.json
+  cat >"$validation_file" <<'JSON'
+{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"orc-validation"}},{"key":"session.id","value":{"stringValue":"orc-validation"}}]},"scopeLogs":[{"logRecords":[{"timeUnixNano":"1000000000","eventName":"assistant","body":{"stringValue":"validation message"},"attributes":[{"key":"request_id","value":{"stringValue":"validation-request"}}]}]}]}]}
+JSON
+  command_ok=false
+  if output=$(
+    XDG_CONFIG_HOME="$validation_dir/config" "$executable" \
+      --file "$validation_file" \
+      --view output \
+      --format jsonl \
+      --once \
+      --session orc-validation \
+      --service orc-validation \
+      --color never 2>/dev/null
+  ); then
+    command_ok=true
+  fi
+  if [[ $command_ok == true ]] && jq -e -s '
+    length > 0
+    and all(.[];
+      type == "object"
+      and .version == "traces.message/v1"
+      and (.id | type == "string" and length > 0)
+      and .session == "orc-validation"
+      and .timestamp == "1970-01-01T00:00:01Z"
+      and .body == "validation message"
+    )
+  ' <<<"$output" >/dev/null 2>&1; then
+    status=ok
+    message="traces supports structured message output"
+  else
+    status=failed
+    message="traces does not support --format jsonl"
+  fi
+  rm -rf -- "$validation_dir"
+  jq \
+    --arg status "$status" \
+    --arg message "$message" \
+    '.checks += [{name: "contract:messages-jsonl", status: $status, message: $message}]
+     | if $status == "failed" then .status = "failed" else . end' <<< "$validation"
+}
+
 provider_program=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")
 provider_library=${ORC_PROVIDER_LIB:-"$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/lib/provider.sh"}
 # shellcheck source=lib/provider.sh
@@ -54,7 +120,7 @@ provider_init "traces"
 
 case "$capability" in
   provider.validate)
-    validate_manifest_requirements
+    validate_traces_contract
     ;;
   session.bind)
     trace_id=$(jq -r '.session.traceId // .session.nativeId // empty' <<< "$request")
@@ -108,12 +174,8 @@ case "$capability" in
     fi
     native_id=$(jq -er '.session.nativeId | select(type == "string" and length > 0)' <<< "$request")
     harness=$(jq -r '.session.harness // empty' <<< "$request")
-    traces_args=(--view output --once --session "$native_id")
-    if [[ -n $harness ]]; then
-      traces_args+=(--service "$harness")
-    fi
-    traces_args+=(--color always)
-    emit_plan_with_codes '[0]' "$scope" '{}' "$executable" "${traces_args[@]}"
+    emit_plan_with_codes '[0]' "$scope" '{}' \
+      "$provider_program" __messages "$executable" "$native_id" "$harness"
     ;;
   *) unsupported_capability ;;
 esac

@@ -218,6 +218,32 @@ impl ActivitySubject<'_> {
     }
 }
 
+#[derive(Clone, Debug)]
+struct MessageSubject {
+    key: String,
+    sessions: Vec<Session>,
+    missing_session_ids: Vec<String>,
+    unassigned: bool,
+}
+
+#[derive(Clone, Debug)]
+struct DisplayMessage {
+    record: provider::MessageRecord,
+    session_id: String,
+    title: String,
+    harness: String,
+    role: String,
+    stale: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MessageOutput {
+    messages: Vec<DisplayMessage>,
+    warnings: Vec<String>,
+    session_ids: BTreeSet<String>,
+    truncated: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AttachReadiness {
     Focus,
@@ -745,8 +771,8 @@ enum BackgroundResult {
         result: Result<String, String>,
     },
     Output {
-        session_id: String,
-        result: Result<String, String>,
+        subject_key: String,
+        result: Result<MessageOutput, String>,
     },
     ProviderActivity {
         provider_name: String,
@@ -791,7 +817,7 @@ struct App {
     activity_loaded_at: BTreeMap<String, Instant>,
     activity_observed_at: BTreeMap<String, Instant>,
     activity_loading: BTreeSet<String>,
-    output: BTreeMap<String, String>,
+    output: BTreeMap<String, MessageOutput>,
     output_errors: BTreeMap<String, String>,
     output_loaded_at: BTreeMap<String, Instant>,
     output_loading: BTreeSet<String>,
@@ -1310,28 +1336,33 @@ impl App {
                 self.activity.insert(session_id, activity);
                 self.rebuild(false);
             }
-            BackgroundResult::Output { session_id, result } => {
-                self.output_loading.remove(&session_id);
+            BackgroundResult::Output {
+                subject_key,
+                result,
+            } => {
+                let cache_key = subject_key.clone();
+                self.output_loading.remove(&subject_key);
                 self.output_loaded_at
-                    .insert(session_id.clone(), Instant::now());
+                    .insert(subject_key.clone(), Instant::now());
                 match result {
                     Ok(output) => {
-                        let first_load = !self.output.contains_key(&session_id);
+                        let first_load = !self.output.contains_key(&subject_key);
                         let selected = self.output_view_is_open()
                             && self
                                 .selected_message_subject()
-                                .is_some_and(|subject| subject.key == session_id);
-                        self.output.insert(session_id.clone(), output);
-                        self.output_errors.remove(&session_id);
+                                .is_some_and(|subject| subject.key == subject_key);
+                        self.output.insert(subject_key.clone(), output);
+                        self.output_errors.remove(&subject_key);
                         if selected && (first_load || self.output_follow_tail) {
                             self.output_follow_tail = true;
                             self.inspector_scroll = u16::MAX;
                         }
                     }
                     Err(error) => {
-                        self.output_errors.insert(session_id, error);
+                        self.output_errors.insert(subject_key, error);
                     }
                 }
+                self.prune_output_cache(&cache_key);
             }
             BackgroundResult::ProviderActivity {
                 provider_name,
@@ -1452,7 +1483,7 @@ impl App {
         if !self.activity_view_is_open() {
             return;
         }
-        let Some(subject) = self.selected_message_subject() else {
+        let Some(subject) = self.selected_activity_subject() else {
             return;
         };
         let key = subject.key.to_owned();
@@ -1494,11 +1525,37 @@ impl App {
         if !self.output_view_is_open() {
             return;
         }
-        let Some(subject) = self.selected_activity_subject() else {
+        let Some(subject) = self.selected_message_subject() else {
             return;
         };
-        let key = subject.key.to_owned();
-        let session = subject.session.clone();
+        let key = subject.key.clone();
+        let session_ids = subject
+            .sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect::<BTreeSet<_>>();
+        if self
+            .output
+            .get(&key)
+            .is_some_and(|output| output.session_ids != session_ids)
+        {
+            let remove = if let Some(output) = self.output.get_mut(&key) {
+                output
+                    .messages
+                    .retain(|message| session_ids.contains(&message.session_id));
+                output.warnings.clear();
+                output.session_ids = session_ids.clone();
+                finalize_message_output(output);
+                output.messages.is_empty()
+            } else {
+                false
+            };
+            if remove {
+                self.output.remove(&key);
+            }
+            self.output_errors.remove(&key);
+            self.output_loaded_at.remove(&key);
+        }
         if self.output_loading.contains(&key) {
             return;
         }
@@ -1508,23 +1565,53 @@ impl App {
         if !force && fresh {
             return;
         }
+        if self.output_loading.len() >= MAX_OUTPUT_CACHE_ENTRIES {
+            return;
+        }
         self.output_loading.insert(key.clone());
+        let previous = self.output.get(&key).cloned();
         let config = self.config.clone();
         let providers = self.providers.clone();
         let scope = self.scope.clone();
         let tx = tx.clone();
         thread::spawn(move || {
-            let request = provider::action_request(Action::Output, &scope, Some(&session), "right");
-            let result = provider::resolve_messages_plan(&config, &providers, request)
-                .and_then(|plan| {
-                    provider::capture_messages_plan(&plan, &scope, config.provider_timeout())
-                })
-                .map_err(|error| format!("{error:#}"));
+            let result =
+                read_message_output(&config, &providers, &scope, &subject, previous.as_ref())
+                    .map_err(|error| format!("{error:#}"));
             let _ = tx.send(BackgroundResult::Output {
-                session_id: key,
+                subject_key: key,
                 result,
             });
         });
+    }
+
+    fn prune_output_cache(&mut self, keep: &str) {
+        if self.output_loaded_at.len() <= MAX_OUTPUT_CACHE_ENTRIES {
+            return;
+        }
+        let mut by_age = self
+            .output_loaded_at
+            .iter()
+            .map(|(key, loaded_at)| (key.clone(), *loaded_at))
+            .collect::<Vec<_>>();
+        by_age.sort_by_key(|(_, loaded_at)| *loaded_at);
+        let mut remove = self
+            .output_loaded_at
+            .len()
+            .saturating_sub(MAX_OUTPUT_CACHE_ENTRIES);
+        for (key, _) in by_age {
+            if remove == 0 {
+                break;
+            }
+            if key == keep {
+                continue;
+            }
+            self.output.remove(&key);
+            self.output_errors.remove(&key);
+            self.output_loaded_at.remove(&key);
+            self.output_loading.remove(&key);
+            remove -= 1;
+        }
     }
 
     fn request_provider_activity(&mut self, tx: &Sender<BackgroundResult>, force: bool) {
@@ -1660,43 +1747,80 @@ impl App {
         }
     }
 
-    fn selected_message_subject(&self) -> Option<ActivitySubject<'_>> {
-        let run_orchestrator = |run_id: &str| {
-            self.state
-                .runs
-                .iter()
-                .find(|run| run.id == run_id)
-                .and_then(|run| run.orchestrator_id.as_deref())
-                .and_then(|id| self.state.sessions.iter().find(|session| session.id == id))
-        };
+    fn selected_message_subject(&self) -> Option<MessageSubject> {
         match self.selected()? {
             ItemRef::Session(id) => self
                 .state
                 .sessions
                 .iter()
                 .find(|session| session.id == id)
-                .map(|session| ActivitySubject {
-                    key: &session.id,
-                    session,
-                    provenance: None,
+                .cloned()
+                .map(|session| MessageSubject {
+                    key: format!("session:{}", session.id),
+                    sessions: vec![session],
+                    missing_session_ids: Vec::new(),
+                    unassigned: false,
                 }),
-            ItemRef::Run(run_id) => run_orchestrator(&run_id).map(|session| ActivitySubject {
-                key: &session.id,
-                session,
-                provenance: None,
-            }),
+            ItemRef::Run(run_id) => {
+                let run = self.state.runs.iter().find(|run| run.id == run_id)?;
+                let mut ids = Vec::new();
+                if let Some(orchestrator_id) = &run.orchestrator_id {
+                    ids.push(orchestrator_id.as_str());
+                }
+                ids.extend(
+                    run.nodes
+                        .iter()
+                        .filter_map(|node| node.session_id.as_deref()),
+                );
+                ids.extend(
+                    self.state
+                        .sessions
+                        .iter()
+                        .filter(|session| session.run_id.as_deref() == Some(run.id.as_str()))
+                        .map(|session| session.id.as_str()),
+                );
+                let mut seen = BTreeSet::new();
+                let mut sessions = Vec::new();
+                let mut missing_session_ids = Vec::new();
+                for id in ids {
+                    if !seen.insert(id.to_owned()) {
+                        continue;
+                    }
+                    if let Some(session) =
+                        self.state.sessions.iter().find(|session| session.id == id)
+                    {
+                        sessions.push(session.clone());
+                    } else {
+                        missing_session_ids.push(id.to_owned());
+                    }
+                }
+                Some(MessageSubject {
+                    key: format!("run:{run_id}"),
+                    sessions,
+                    missing_session_ids,
+                    unassigned: false,
+                })
+            }
             ItemRef::Node(run_id, node_id) => {
                 let run = self.state.runs.iter().find(|run| run.id == run_id)?;
                 let node = run.nodes.iter().find(|node| node.id == node_id)?;
-                node.session_id
-                    .as_deref()
-                    .and_then(|id| self.state.sessions.iter().find(|session| session.id == id))
-                    .or_else(|| run_orchestrator(&run_id))
-                    .map(|session| ActivitySubject {
-                        key: &session.id,
-                        session,
-                        provenance: None,
-                    })
+                let mut sessions = Vec::new();
+                let mut missing_session_ids = Vec::new();
+                if let Some(id) = node.session_id.as_deref() {
+                    if let Some(session) =
+                        self.state.sessions.iter().find(|session| session.id == id)
+                    {
+                        sessions.push(session.clone());
+                    } else {
+                        missing_session_ids.push(id.to_owned());
+                    }
+                }
+                Some(MessageSubject {
+                    key: format!("node:{run_id}:{node_id}"),
+                    sessions,
+                    missing_session_ids,
+                    unassigned: node.session_id.is_none(),
+                })
             }
             ItemRef::Provider(_) | ItemRef::History => None,
         }
@@ -4719,6 +4843,9 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &mut App) {
 
 const MAX_INSPECTOR_BYTES: usize = 128 * 1024;
 const MAX_INSPECTOR_LINES: usize = 2_000;
+const MAX_AGGREGATE_MESSAGE_BYTES: usize = 256 * 1024;
+const MAX_AGGREGATE_MESSAGES: usize = 1_000;
+const MAX_OUTPUT_CACHE_ENTRIES: usize = 256;
 const MAX_SESSION_OUTPUT_INSPECTOR_BYTES: usize = 64 * 1024;
 const MAX_SESSION_OUTPUT_INSPECTOR_LINES: usize = 1_000;
 
@@ -4946,22 +5073,274 @@ fn selected_checkpoint(app: &App) -> String {
     }
 }
 
+fn read_message_output(
+    config: &Config,
+    providers: &[Manifest],
+    scope: &Path,
+    subject: &MessageSubject,
+    previous: Option<&MessageOutput>,
+) -> Result<MessageOutput> {
+    let mut sources = Vec::new();
+    let mut warnings = subject
+        .missing_session_ids
+        .iter()
+        .map(|id| format!("session {id}: referenced session is missing from workspace state"))
+        .collect::<Vec<_>>();
+    let mut failed_session_ids = Vec::new();
+    let mut successful_sources = 0;
+    for session in &subject.sessions {
+        let request = provider::action_request(Action::Output, scope, Some(session), "right");
+        let result = provider::resolve_messages_plan(config, providers, request).and_then(|plan| {
+            provider::capture_messages_plan(
+                &plan,
+                scope,
+                config.provider_timeout(),
+                &session.native_id,
+            )
+        });
+        match result {
+            Ok(batch) => {
+                successful_sources += 1;
+                sources.push((session.clone(), batch));
+            }
+            Err(error) => {
+                let retained = previous.is_some_and(|output| {
+                    output
+                        .messages
+                        .iter()
+                        .any(|message| message.session_id == session.id)
+                });
+                let suffix = if retained {
+                    "; showing last known messages"
+                } else {
+                    ""
+                };
+                warnings.push(format!("{}: {error:#}{suffix}", session.title));
+                failed_session_ids.push(session.id.clone());
+            }
+        }
+    }
+    if successful_sources == 0
+        && (!subject.sessions.is_empty() || !subject.missing_session_ids.is_empty())
+    {
+        return Err(anyhow::anyhow!(warnings.join("; ")));
+    }
+    let mut output = merge_message_batches(sources, warnings);
+    output.session_ids = subject
+        .sessions
+        .iter()
+        .map(|session| session.id.clone())
+        .collect();
+    retain_failed_source_messages(&mut output, previous, &failed_session_ids);
+    Ok(output)
+}
+
+fn retain_failed_source_messages(
+    output: &mut MessageOutput,
+    previous: Option<&MessageOutput>,
+    failed_session_ids: &[String],
+) {
+    let Some(previous) = previous else {
+        return;
+    };
+    let mut retained = previous
+        .messages
+        .iter()
+        .filter(|message| failed_session_ids.contains(&message.session_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if retained.is_empty() {
+        return;
+    }
+    for message in &mut retained {
+        message.stale = true;
+    }
+    output.messages.extend(retained);
+    output.truncated |= previous.truncated;
+    finalize_message_output(output);
+}
+
+fn merge_message_batches(
+    sources: Vec<(Session, provider::MessageBatch)>,
+    warnings: Vec<String>,
+) -> MessageOutput {
+    let mut output = MessageOutput {
+        warnings,
+        ..MessageOutput::default()
+    };
+    for (session, batch) in sources {
+        output.truncated |= batch.truncated;
+        output.session_ids.insert(session.id.clone());
+        output
+            .messages
+            .extend(batch.records.into_iter().map(|record| DisplayMessage {
+                record,
+                session_id: session.id.clone(),
+                title: session.title.clone(),
+                harness: session.harness.clone(),
+                role: session.role.to_string(),
+                stale: false,
+            }));
+    }
+    finalize_message_output(&mut output);
+    output
+}
+
+fn finalize_message_output(output: &mut MessageOutput) {
+    output.messages.sort_by(|left, right| {
+        left.record
+            .timestamp
+            .cmp(&right.record.timestamp)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+            .then_with(|| left.record.id.cmp(&right.record.id))
+    });
+    let mut seen = BTreeSet::new();
+    output.messages.retain(|message| {
+        seen.insert((
+            message.harness.clone(),
+            message.record.session.clone(),
+            message.record.id.clone(),
+        ))
+    });
+
+    let mut retained_bytes = 0usize;
+    let mut first = output.messages.len();
+    for (index, message) in output.messages.iter().enumerate().rev() {
+        let bytes = message.record.body.len().saturating_add(256);
+        if retained_bytes.saturating_add(bytes) > MAX_AGGREGATE_MESSAGE_BYTES
+            || output.messages.len().saturating_sub(index) > MAX_AGGREGATE_MESSAGES
+        {
+            output.truncated = true;
+            break;
+        }
+        retained_bytes += bytes;
+        first = index;
+    }
+    if first > 0 {
+        output.messages.drain(..first);
+    }
+}
+
 fn selected_message_output(app: &App) -> String {
     let Some(subject) = app.selected_message_subject() else {
         return "Select an agent, run, or step.".into();
     };
-    let id = subject.key;
-    let output = app.output.get(id).map(String::as_str).unwrap_or_default();
-    let error = app.output_errors.get(id).map(String::as_str);
-    if app.output_loading.contains(id) && output.is_empty() {
+    if subject.unassigned {
+        return "No agent is assigned to this step.".into();
+    }
+    if subject.sessions.is_empty() && !subject.missing_session_ids.is_empty() {
+        return format!(
+            "Output unavailable · referenced session is missing from workspace state: {}",
+            subject.missing_session_ids.join(", ")
+        );
+    }
+    if subject.sessions.is_empty() && subject.missing_session_ids.is_empty() {
+        return match app.selected() {
+            Some(ItemRef::Run(_)) => "No agents are attached to this run.".into(),
+            _ => "No agent is available for Output.".into(),
+        };
+    }
+    let key = &subject.key;
+    let session_ids = subject
+        .sessions
+        .iter()
+        .map(|session| session.id.clone())
+        .collect::<BTreeSet<_>>();
+    let membership_matches = app
+        .output
+        .get(key)
+        .is_none_or(|output| output.session_ids == session_ids);
+    let output = app
+        .output
+        .get(key)
+        .filter(|output| output.session_ids == session_ids);
+    let error = membership_matches
+        .then(|| app.output_errors.get(key))
+        .flatten()
+        .map(|error| provider::sanitize_message_text(error, false));
+    if app.output_loading.contains(key) && output.is_none() {
         return "Loading agent output…".into();
     }
-    match (output.trim().is_empty(), error) {
-        (false, Some(error)) => format!("{output}\n\n[output refresh failed: {error}]"),
-        (false, None) => output.to_owned(),
+    let rendered = output.map(render_message_output).unwrap_or_default();
+    match (rendered.trim().is_empty(), error.as_deref()) {
+        (false, Some(error)) => format!("{rendered}\n\n[output refresh failed: {error}]"),
+        (false, None) => rendered,
         (true, Some(error)) => format!("Output provider failed: {error}"),
         (true, None) => "No user-visible assistant output is available for this agent.".into(),
     }
+}
+
+fn render_message_output(output: &MessageOutput) -> String {
+    let mut chunks = Vec::new();
+    let mut label_sessions = BTreeMap::<(String, String, String), BTreeSet<String>>::new();
+    for message in &output.messages {
+        label_sessions
+            .entry((
+                provider::sanitize_message_text(&message.title, false),
+                provider::sanitize_message_text(&message.role, false),
+                provider::sanitize_message_text(&message.harness, false),
+            ))
+            .or_default()
+            .insert(message.session_id.clone());
+    }
+    if output.truncated {
+        chunks.push("\u{1b}[2m… earlier output omitted …\u{1b}[0m".into());
+    }
+    chunks.extend(output.messages.iter().map(|message| {
+        let timestamp = message.record.timestamp.format("%Y-%m-%d %H:%M:%S%.3fZ");
+        let title = provider::sanitize_message_text(&message.title, false);
+        let role = provider::sanitize_message_text(&message.role, false);
+        let harness = provider::sanitize_message_text(&message.harness, false);
+        let label = (title.clone(), role.clone(), harness.clone());
+        let disambiguation = label_sessions
+            .get(&label)
+            .filter(|sessions| sessions.len() > 1)
+            .map(|sessions| unique_session_suffix(&message.session_id, sessions))
+            .map(|suffix| format!(" · id …{suffix}"))
+            .unwrap_or_default();
+        let truncated = if message.record.truncated {
+            " \u{1b}[2m· message tail\u{1b}[0m"
+        } else {
+            ""
+        };
+        let stale = if message.stale {
+            " \u{1b}[33m· stale\u{1b}[0m"
+        } else {
+            ""
+        };
+        format!(
+            "\u{1b}[36m{timestamp}\u{1b}[0m  \u{1b}[1m{title}\u{1b}[0m \u{1b}[2m· {role} · {harness}{disambiguation}\u{1b}[0m{truncated}{stale}\n{}\u{1b}[0m",
+            message.record.body
+        )
+    }));
+    if !output.warnings.is_empty() {
+        let warnings = output
+            .warnings
+            .iter()
+            .map(|warning| provider::sanitize_message_text(warning, false))
+            .collect::<Vec<_>>()
+            .join("\n");
+        chunks.push(format!("\u{1b}[33mPartial output\u{1b}[0m\n{}", warnings));
+    }
+    chunks.join("\n\n")
+}
+
+fn unique_session_suffix(session_id: &str, sessions: &BTreeSet<String>) -> String {
+    let characters = session_id.chars().collect::<Vec<_>>();
+    for width in 4..=characters.len() {
+        let suffix = characters[characters.len() - width..]
+            .iter()
+            .collect::<String>();
+        if sessions
+            .iter()
+            .filter(|candidate| candidate.ends_with(&suffix))
+            .count()
+            == 1
+        {
+            return suffix;
+        }
+    }
+    session_id.to_owned()
 }
 
 struct JsonPreviewWriter {
@@ -6567,9 +6946,430 @@ mod tests {
             .selected_message_subject()
             .expect("archived orchestrator output subject");
 
-        assert_eq!(subject.key, "root");
+        assert_eq!(subject.key, "run:run");
+        assert_eq!(subject.sessions.len(), 1);
+        assert_eq!(subject.sessions[0].id, "root");
         assert!(app.output_view_is_open());
         assert!(app.selected_activity_subject().is_none());
+    }
+
+    #[test]
+    fn message_subjects_keep_session_node_and_run_scope_exact() {
+        let mut app = app();
+        let mut run = workflow_run();
+        let mut assigned = workflow_node("assigned", LifecycleStatus::Working, 1);
+        assigned.session_id = Some("native-child".into());
+        let unassigned = workflow_node("unassigned", LifecycleStatus::Queued, 0);
+        run.nodes = vec![assigned, unassigned];
+        app.state.sessions[2].run_id = Some("run".into());
+        app.state.runs.push(run);
+        app.active_run = Some("run".into());
+        app.explorer_view = ExplorerView::Graph;
+        app.rebuild(true);
+
+        app.flow.select_node("session:root");
+        let root = app.selected_message_subject().expect("root Output subject");
+        assert_eq!(root.key, "session:root");
+        assert_eq!(
+            root.sessions
+                .iter()
+                .map(|one| one.id.as_str())
+                .collect::<Vec<_>>(),
+            ["root"]
+        );
+
+        app.flow.select_node("node:run:assigned");
+        let node = app
+            .selected_message_subject()
+            .expect("assigned Output subject");
+        assert_eq!(node.key, "node:run:assigned");
+        assert_eq!(
+            node.sessions
+                .iter()
+                .map(|one| one.id.as_str())
+                .collect::<Vec<_>>(),
+            ["native-child"]
+        );
+
+        app.flow.select_node("node:run:unassigned");
+        let node = app
+            .selected_message_subject()
+            .expect("unassigned Output subject");
+        assert!(node.sessions.is_empty());
+        assert_eq!(
+            selected_message_output(&app),
+            "No agent is assigned to this step."
+        );
+
+        app.state
+            .runs
+            .iter_mut()
+            .find(|run| run.id == "run")
+            .unwrap()
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "unassigned")
+            .unwrap()
+            .session_id = Some("missing-child".into());
+        app.rebuild(true);
+        app.flow.select_node("node:run:unassigned");
+        let missing = app
+            .selected_message_subject()
+            .expect("missing assigned Output subject");
+        assert!(!missing.unassigned);
+        assert_eq!(missing.missing_session_ids, ["missing-child"]);
+        assert!(selected_message_output(&app).contains("missing-child"));
+
+        app.explorer_view = ExplorerView::Tree;
+        app.rebuild(true);
+        app.tree_at = app
+            .tree
+            .iter()
+            .position(|row| row.item == ItemRef::Run("run".into()))
+            .expect("run tree row");
+        let run = app.selected_message_subject().expect("run Output subject");
+        assert_eq!(
+            run.sessions
+                .iter()
+                .map(|one| one.id.as_str())
+                .collect::<Vec<_>>(),
+            ["root", "native-child", "harness-child"]
+        );
+        assert_eq!(run.missing_session_ids, ["missing-child"]);
+    }
+
+    #[test]
+    fn run_messages_merge_chronologically_and_deduplicate_stable_ids() {
+        let root = session("root", None, "agent-a");
+        let child = session("child", Some("root"), "agent-b");
+        let at = |value: &str| value.parse().expect("RFC3339 timestamp");
+        let batch = |records| provider::MessageBatch {
+            records,
+            truncated: false,
+        };
+        let output = merge_message_batches(
+            vec![
+                (
+                    child,
+                    batch(vec![provider_record(
+                        "later",
+                        "native-child",
+                        at("2026-09-06T12:00:02Z"),
+                        "child reply",
+                    )]),
+                ),
+                (
+                    root,
+                    batch(vec![
+                        provider_record(
+                            "earlier",
+                            "native-root",
+                            at("2026-09-06T12:00:01Z"),
+                            "root reply",
+                        ),
+                        provider_record(
+                            "earlier",
+                            "native-root",
+                            at("2026-09-06T12:00:01Z"),
+                            "root reply",
+                        ),
+                    ]),
+                ),
+            ],
+            Vec::new(),
+        );
+
+        assert_eq!(output.messages.len(), 2);
+        assert_eq!(output.messages[0].record.body, "root reply");
+        assert_eq!(output.messages[1].record.body, "child reply");
+        let rendered = render_message_output(&output);
+        assert!(rendered.contains(
+            "\u{1b}[1mroot\u{1b}[0m \u{1b}[2m· orchestrator · agent-a\u{1b}[0m\nroot reply\u{1b}[0m"
+        ));
+        assert!(rendered.contains(
+            "\u{1b}[1mchild\u{1b}[0m \u{1b}[2m· researcher · agent-b\u{1b}[0m\nchild reply\u{1b}[0m"
+        ));
+        assert!(rendered.contains("root reply\u{1b}[0m\n\n\u{1b}[36m"));
+    }
+
+    #[test]
+    fn message_boundaries_and_provider_failures_strip_terminal_controls() {
+        let mut output = message_output("answer");
+        output.messages[0].title = "root\u{1b}]52;c;secret\u{7}\u{1b}[2J".into();
+        output.warnings = vec!["provider\u{1b}[31m failed\u{1b}[0m\u{1b}]8;;link\u{7}".into()];
+
+        let rendered = render_message_output(&output);
+
+        assert!(rendered.contains("\u{1b}[1mroot\u{1b}[0m"));
+        assert!(rendered.contains("provider failed"));
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("link"));
+        assert!(!rendered.contains("\u{1b}[2J"));
+        assert!(!rendered.contains("\u{1b}[31m"));
+    }
+
+    #[test]
+    fn message_bodies_reset_sgr_and_duplicate_labels_gain_unique_suffixes() {
+        let timestamp = "2026-09-06T12:00:00Z".parse().expect("timestamp");
+        let make = |session_id: &str, body: &str| DisplayMessage {
+            record: provider_record(session_id, session_id, timestamp, body),
+            session_id: session_id.into(),
+            title: "worker".into(),
+            harness: "codex".into(),
+            role: "researcher".into(),
+            stale: false,
+        };
+        let output = MessageOutput {
+            messages: vec![
+                make("session-aaaa1111", "first\u{1b}[8m"),
+                make("session-bbbb2222", "second"),
+            ],
+            warnings: Vec::new(),
+            session_ids: ["session-aaaa1111".into(), "session-bbbb2222".into()]
+                .into_iter()
+                .collect(),
+            truncated: false,
+        };
+
+        let rendered = render_message_output(&output);
+
+        assert!(rendered.contains("first\u{1b}[8m\u{1b}[0m\n\n\u{1b}[36m"));
+        assert!(rendered.contains("id …1111"));
+        assert!(rendered.contains("id …2222"));
+    }
+
+    #[test]
+    fn partial_refresh_retains_failed_sources_as_stale_within_bounds() {
+        let root = session("root", None, "codex");
+        let child = session("child", Some("root"), "codex");
+        let previous = merge_message_batches(
+            vec![
+                (
+                    root.clone(),
+                    provider::MessageBatch {
+                        records: vec![provider_record(
+                            "root-old",
+                            &root.native_id,
+                            "2026-09-06T12:00:00Z".parse().unwrap(),
+                            "old root",
+                        )],
+                        truncated: false,
+                    },
+                ),
+                (
+                    child.clone(),
+                    provider::MessageBatch {
+                        records: vec![provider_record(
+                            "child-old",
+                            &child.native_id,
+                            "2026-09-06T12:00:01Z".parse().unwrap(),
+                            "old child",
+                        )],
+                        truncated: false,
+                    },
+                ),
+            ],
+            Vec::new(),
+        );
+        let mut refreshed = merge_message_batches(
+            vec![(
+                root.clone(),
+                provider::MessageBatch {
+                    records: vec![provider_record(
+                        "root-new",
+                        &root.native_id,
+                        "2026-09-06T12:00:02Z".parse().unwrap(),
+                        "new root",
+                    )],
+                    truncated: false,
+                },
+            )],
+            vec!["child: timed out; showing last known messages".into()],
+        );
+
+        retain_failed_source_messages(
+            &mut refreshed,
+            Some(&previous),
+            std::slice::from_ref(&child.id),
+        );
+
+        assert_eq!(refreshed.messages.len(), 2);
+        assert_eq!(refreshed.messages[0].record.body, "old child");
+        assert!(refreshed.messages[0].stale);
+        assert_eq!(refreshed.messages[1].record.body, "new root");
+        assert!(!refreshed.messages[1].stale);
+        assert!(render_message_output(&refreshed).contains("· stale"));
+    }
+
+    #[test]
+    fn run_message_cache_keeps_newest_records_with_partial_source_warning() {
+        let root = session("root", None, "agent-a");
+        let records = (0..=MAX_AGGREGATE_MESSAGES)
+            .map(|index| {
+                provider_record(
+                    &format!("msg_{index:04}"),
+                    "native-root",
+                    format!("2026-09-06T12:{:02}:{:02}Z", index / 60 % 60, index % 60)
+                        .parse()
+                        .expect("timestamp"),
+                    &format!("reply {index:04}"),
+                )
+            })
+            .collect();
+        let output = merge_message_batches(
+            vec![(
+                root,
+                provider::MessageBatch {
+                    records,
+                    truncated: false,
+                },
+            )],
+            vec!["worker: provider unavailable".into()],
+        );
+
+        assert!(output.truncated);
+        assert!(output.messages.len() <= MAX_AGGREGATE_MESSAGES);
+        assert_eq!(output.messages.last().unwrap().record.body, "reply 1000");
+        assert!(
+            !output
+                .messages
+                .iter()
+                .any(|one| one.record.body == "reply 0000")
+        );
+        let rendered = render_message_output(&output);
+        assert!(rendered.contains("Partial output"));
+        assert!(rendered.contains("worker: provider unavailable"));
+    }
+
+    #[test]
+    fn output_cache_isolated_by_selected_subject() {
+        let mut app = app();
+        let run = workflow_run();
+        app.state.runs.push(run);
+        app.active_run = Some("run".into());
+        app.explorer_view = ExplorerView::Graph;
+        app.rebuild(true);
+        app.output
+            .insert("session:root".into(), message_output("session only"));
+        app.explorer_view = ExplorerView::Tree;
+        app.rebuild(true);
+        app.tree_at = app
+            .tree
+            .iter()
+            .position(|row| row.item == ItemRef::Run("run".into()))
+            .expect("run tree row");
+        let run_key = app
+            .selected_message_subject()
+            .filter(|subject| subject.key == "run:run")
+            .map(|subject| subject.key)
+            .expect("run cache key");
+        app.output.insert(run_key, message_output("run only"));
+
+        let mut retry = session("retry", Some("root"), "codex");
+        retry.run_id = Some("run".into());
+        app.state.sessions.push(retry);
+        app.rebuild(true);
+        app.tree_at = app
+            .tree
+            .iter()
+            .position(|row| row.item == ItemRef::Run("run".into()))
+            .expect("run tree row after membership change");
+        assert_eq!(
+            app.selected_message_subject().unwrap().key,
+            "run:run",
+            "run membership changes must reuse one bounded cache entry"
+        );
+        assert!(
+            !selected_message_output(&app).contains("run only"),
+            "a value for old membership must wait for a scoped refresh"
+        );
+        let mut refreshed = message_output("run only");
+        refreshed.session_ids.insert("retry".into());
+        app.output.insert("run:run".into(), refreshed);
+
+        app.tree_at = app
+            .tree
+            .iter()
+            .position(|row| row.item == ItemRef::Session("root".into()))
+            .expect("root tree row");
+        assert!(selected_message_output(&app).contains("session only"));
+        assert!(!selected_message_output(&app).contains("run only"));
+        app.tree_at = app
+            .tree
+            .iter()
+            .position(|row| row.item == ItemRef::Run("run".into()))
+            .expect("run tree row");
+        assert!(selected_message_output(&app).contains("run only"));
+        assert!(!selected_message_output(&app).contains("session only"));
+    }
+
+    #[test]
+    fn output_cache_evicts_old_selected_objects_at_its_entry_bound() {
+        let mut app = app();
+        for index in 0..=MAX_OUTPUT_CACHE_ENTRIES {
+            app.apply_background(BackgroundResult::Output {
+                subject_key: format!("session:{index:04}"),
+                result: Ok(message_output(&format!("reply {index:04}"))),
+            });
+        }
+
+        assert_eq!(app.output.len(), MAX_OUTPUT_CACHE_ENTRIES);
+        assert_eq!(app.output_loaded_at.len(), MAX_OUTPUT_CACHE_ENTRIES);
+        assert!(!app.output.contains_key("session:0000"));
+        assert!(
+            app.output
+                .contains_key(&format!("session:{MAX_OUTPUT_CACHE_ENTRIES:04}"))
+        );
+    }
+
+    #[test]
+    fn output_requests_wait_when_the_inflight_cache_reaches_its_entry_bound() {
+        let mut app = app();
+        app.output_tab = OutputTab::Output;
+        for index in 0..MAX_OUTPUT_CACHE_ENTRIES {
+            app.output_loading.insert(format!("session:{index:04}"));
+        }
+        let (tx, rx) = mpsc::channel();
+
+        app.request_output(&tx, false);
+
+        assert_eq!(app.output_loading.len(), MAX_OUTPUT_CACHE_ENTRIES);
+        assert!(!app.output_loading.contains("session:root"));
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn reassigned_node_never_renders_the_previous_agents_cached_output() {
+        let mut app = app();
+        let mut run = workflow_run();
+        let mut node = workflow_node("implement", LifecycleStatus::Working, 1);
+        node.session_id = Some("root".into());
+        run.nodes.push(node);
+        app.state.runs.push(run);
+        app.active_run = Some("run".into());
+        app.explorer_view = ExplorerView::Graph;
+        app.output_tab = OutputTab::Output;
+        app.rebuild(true);
+        app.flow.select_node("node:run:implement");
+        app.output.insert(
+            "node:run:implement".into(),
+            message_output("This belongs only to the previous agent."),
+        );
+
+        app.state.runs[0].nodes[0].session_id = Some("native-child".into());
+        app.rebuild(true);
+        app.flow.select_node("node:run:implement");
+
+        assert!(!selected_message_output(&app).contains("previous agent"));
+        let (tx, _rx) = mpsc::channel();
+        app.request_output(&tx, false);
+        assert!(!app.output.contains_key("node:run:implement"));
+        app.apply_background(BackgroundResult::Output {
+            subject_key: "node:run:implement".into(),
+            result: Err("new agent unavailable".into()),
+        });
+        assert!(!selected_message_output(&app).contains("previous agent"));
+        assert!(selected_message_output(&app).contains("new agent unavailable"));
     }
 
     #[test]
@@ -8240,14 +9040,11 @@ actions:
             value: serde_json::json!({"status": "verified"}),
         });
         app.apply_background(BackgroundResult::Output {
-            session_id: "root".into(),
-            result: Ok("I finished the provider migration.".into()),
+            subject_key: "session:root".into(),
+            result: Ok(message_output("I finished the provider migration.")),
         });
 
-        assert_eq!(
-            selected_message_output(&app),
-            "I finished the provider migration."
-        );
+        assert!(selected_message_output(&app).contains("I finished the provider migration."));
         assert_eq!(selected_log(&app), "tool call");
         assert!(selected_checkpoint(&app).contains("verified"));
     }
@@ -8267,11 +9064,45 @@ actions:
             .collect()
     }
 
-    fn output_lines(last: usize) -> String {
-        (0..=last)
+    fn provider_record(
+        id: &str,
+        native_session: &str,
+        timestamp: chrono::DateTime<Utc>,
+        body: &str,
+    ) -> provider::MessageRecord {
+        provider::MessageRecord {
+            version: "orc.message/v1".into(),
+            id: id.into(),
+            session: native_session.into(),
+            timestamp,
+            body: body.into(),
+            truncated: false,
+            body_format: provider::MessageBodyFormat::Plain,
+        }
+    }
+
+    fn message_output(body: &str) -> MessageOutput {
+        MessageOutput {
+            messages: vec![DisplayMessage {
+                record: provider_record("msg_test", "native-root", Utc::now(), body),
+                session_id: "root".into(),
+                title: "Root".into(),
+                harness: "codex".into(),
+                role: "orchestrator".into(),
+                stale: false,
+            }],
+            warnings: Vec::new(),
+            session_ids: ["root".into()].into_iter().collect(),
+            truncated: false,
+        }
+    }
+
+    fn output_lines(last: usize) -> MessageOutput {
+        let body = (0..=last)
             .map(|index| format!("assistant line {index:04}"))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n");
+        message_output(&body)
     }
 
     #[test]
@@ -8281,7 +9112,7 @@ actions:
         app.reset_inspector_scroll();
 
         app.apply_background(BackgroundResult::Output {
-            session_id: "root".into(),
+            subject_key: "session:root".into(),
             result: Ok(output_lines(1_000)),
         });
 
@@ -8297,14 +9128,14 @@ actions:
         app.output_tab = OutputTab::Output;
         app.reset_inspector_scroll();
         app.apply_background(BackgroundResult::Output {
-            session_id: "root".into(),
+            subject_key: "session:root".into(),
             result: Ok(output_lines(1_000)),
         });
         render_output(&mut app);
         let previous_bottom = app.inspector_scroll;
 
         app.apply_background(BackgroundResult::Output {
-            session_id: "root".into(),
+            subject_key: "session:root".into(),
             result: Ok(output_lines(1_001)),
         });
 
@@ -8320,7 +9151,7 @@ actions:
         app.output_tab = OutputTab::Output;
         app.reset_inspector_scroll();
         app.apply_background(BackgroundResult::Output {
-            session_id: "root".into(),
+            subject_key: "session:root".into(),
             result: Ok(output_lines(1_000)),
         });
         render_output(&mut app);
@@ -8329,7 +9160,7 @@ actions:
         let scrolled_position = app.inspector_scroll;
 
         app.apply_background(BackgroundResult::Output {
-            session_id: "root".into(),
+            subject_key: "session:root".into(),
             result: Ok(output_lines(1_001)),
         });
         render_output(&mut app);
@@ -8343,16 +9174,18 @@ actions:
         let mut app = app();
         app.output_tab = OutputTab::Output;
         app.inspector_scroll = 7;
-        app.output
-            .insert("root".into(), "The previous answer remains visible.".into());
+        app.output.insert(
+            "session:root".into(),
+            message_output("The previous answer remains visible."),
+        );
 
         app.apply_background(BackgroundResult::Output {
-            session_id: "root".into(),
+            subject_key: "session:root".into(),
             result: Err("reader unavailable".into()),
         });
 
         let rendered = selected_message_output(&app);
-        assert!(rendered.starts_with("The previous answer remains visible."));
+        assert!(rendered.contains("The previous answer remains visible."));
         assert!(rendered.contains("output refresh failed: reader unavailable"));
         assert_eq!(app.inspector_scroll, 7);
     }

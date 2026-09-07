@@ -21,6 +21,7 @@ use std::os::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, Utc};
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -36,6 +37,7 @@ const MAX_ACTIVITY_BYTES: u64 = 256 * 1024;
 const MAX_ACTIVITY_LINES: usize = 100;
 const MAX_MESSAGE_BYTES: u64 = 256 * 1024;
 const MAX_MESSAGE_LINES: usize = 1_000;
+const MESSAGE_RECORD_VERSION: &str = "orc.message/v1";
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PROVIDER_CACHE_ENTRIES: usize = 256;
 const MAX_PROVIDER_CACHE_ENTRY_BYTES: u64 = 1024 * 1024;
@@ -344,6 +346,34 @@ pub struct ValidationCheck {
     pub message: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageBodyFormat {
+    #[default]
+    Plain,
+    Ansi,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageRecord {
+    pub version: String,
+    pub id: String,
+    pub session: String,
+    pub timestamp: DateTime<Utc>,
+    pub body: String,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub body_format: MessageBodyFormat,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MessageBatch {
+    pub records: Vec<MessageRecord>,
+    pub truncated: bool,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckStatus {
@@ -438,6 +468,7 @@ pub fn resolve_messages_plan(
 ) -> Result<CommandPlan> {
     request["maxBytes"] = json!(MAX_MESSAGE_BYTES);
     request["maxLines"] = json!(MAX_MESSAGE_LINES);
+    request["format"] = json!("jsonl");
     request["capability"] = Value::String(Capability::MessagesRead.to_string());
     let mut failures = Vec::new();
     for provider in activity_candidates(providers, Capability::MessagesRead, &request) {
@@ -546,6 +577,13 @@ pub fn schema() -> serde_json::Value {
             }
         ]
     }]);
+    schema
+}
+
+pub fn message_schema() -> serde_json::Value {
+    let mut schema =
+        serde_json::to_value(schema_for!(MessageRecord)).expect("message schema serializes");
+    schema["properties"]["version"] = json!({"const": MESSAGE_RECORD_VERSION, "type": "string"});
     schema
 }
 
@@ -1594,7 +1632,7 @@ fn capability_action(capability: Capability) -> &'static str {
 }
 
 fn validation_action_request(provider: &Manifest, capability: Capability, scope: &Path) -> Value {
-    json!({
+    let mut request = json!({
         "version": "orc.provider/v1",
         "action": capability_action(capability),
         "capability": capability,
@@ -1647,7 +1685,13 @@ fn validation_action_request(provider: &Manifest, capability: Capability, scope:
             "kind": provider.kind,
             "actions": provider.actions,
         },
-    })
+    });
+    if capability == Capability::MessagesRead {
+        request["format"] = json!("jsonl");
+        request["maxBytes"] = json!(MAX_MESSAGE_BYTES);
+        request["maxLines"] = json!(MAX_MESSAGE_LINES);
+    }
+    request
 }
 
 fn validate_action_response(
@@ -2977,7 +3021,8 @@ pub fn capture_messages_plan(
     plan: &CommandPlan,
     scope: &Path,
     timeout: std::time::Duration,
-) -> Result<String> {
+    expected_session: &str,
+) -> Result<MessageBatch> {
     let result = run_plan_with_timeout_retention(
         plan,
         scope,
@@ -2993,10 +3038,65 @@ pub fn capture_messages_plan(
         }
         bail!("{message}");
     }
-    Ok(sanitize_message_ansi(&result.stdout))
+    parse_message_records(&result.stdout, expected_session)
 }
 
-fn sanitize_message_ansi(source: &str) -> String {
+fn parse_message_records(source: &str, expected_session: &str) -> Result<MessageBatch> {
+    let (source, truncated) = source
+        .strip_prefix("[earlier output truncated by Orc]\n")
+        .map_or((source, false), |source| (source, true));
+    let mut records = Vec::new();
+    let mut seen = BTreeMap::<String, MessageRecord>::new();
+    for (index, line) in source.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut record: MessageRecord = serde_json::from_str(line)
+            .with_context(|| format!("messages.read line {} is not valid JSONL", index + 1))?;
+        if record.version != MESSAGE_RECORD_VERSION {
+            bail!(
+                "messages.read line {} uses unsupported version {}",
+                index + 1,
+                record.version
+            );
+        }
+        if record.id.trim().is_empty() {
+            bail!("messages.read line {} has an empty id", index + 1);
+        }
+        if record.session != expected_session {
+            bail!(
+                "messages.read line {} belongs to session {}, expected {}",
+                index + 1,
+                record.session,
+                expected_session
+            );
+        }
+        if let Some(previous) = seen.get(&record.id) {
+            if previous != &record {
+                bail!(
+                    "messages.read returned conflicting records for id {}",
+                    record.id
+                );
+            }
+            continue;
+        }
+        seen.insert(record.id.clone(), record.clone());
+        record.body =
+            sanitize_message_text(&record.body, record.body_format == MessageBodyFormat::Ansi);
+        if record.body.trim().is_empty() {
+            continue;
+        }
+        records.push(record);
+    }
+    records.sort_by(|left, right| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(MessageBatch { records, truncated })
+}
+
+pub(crate) fn sanitize_message_text(source: &str, allow_sgr: bool) -> String {
     let bytes = source.as_bytes();
     let mut rendered = Vec::with_capacity(bytes.len());
     let mut at = 0;
@@ -3014,7 +3114,13 @@ fn sanitize_message_ansi(source: &str) -> String {
                 else {
                     break;
                 };
-                if bytes[end] == b'm' {
+                let parameters = &bytes[at + 2..end];
+                if allow_sgr
+                    && bytes[end] == b'm'
+                    && parameters
+                        .iter()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b';' | b':'))
+                {
                     rendered.extend_from_slice(&bytes[at..=end]);
                 }
                 at = end + 1;
@@ -3042,7 +3148,10 @@ fn sanitize_message_ansi(source: &str) -> String {
             _ => at += 1,
         }
     }
-    String::from_utf8_lossy(&rendered).into_owned()
+    String::from_utf8_lossy(&rendered)
+        .chars()
+        .filter(|value| !matches!(*value as u32, 0x7f..=0x9f))
+        .collect()
 }
 
 pub fn action_request(
@@ -4516,6 +4625,7 @@ third line
                 .expect("message request json");
 
         assert_eq!(request["capability"], "messages.read");
+        assert_eq!(request["format"], "jsonl");
         assert_eq!(request["maxBytes"], MAX_MESSAGE_BYTES);
         assert_eq!(request["maxLines"], MAX_MESSAGE_LINES);
     }
@@ -4530,6 +4640,29 @@ third line
             .expect_err("activity must not become output");
 
         assert!(error.to_string().contains("messages.read"));
+    }
+
+    #[test]
+    fn message_validation_fixture_requests_the_structured_contract() {
+        let provider = provider_manifest("messages", Path::new("true"), 0);
+        let request =
+            validation_action_request(&provider, Capability::MessagesRead, Path::new("/tmp/orc"));
+
+        assert_eq!(request["format"], "jsonl");
+        assert_eq!(request["maxBytes"], MAX_MESSAGE_BYTES);
+        assert_eq!(request["maxLines"], MAX_MESSAGE_LINES);
+    }
+
+    #[test]
+    fn message_schema_publishes_the_core_record_version() {
+        let schema = message_schema();
+
+        assert_eq!(
+            schema["properties"]["version"]["const"],
+            MESSAGE_RECORD_VERSION
+        );
+        assert_eq!(schema["properties"]["timestamp"]["format"], "date-time");
+        assert_eq!(schema["properties"]["bodyFormat"]["default"], "plain");
     }
 
     #[test]
@@ -4580,70 +4713,188 @@ third line
     }
 
     #[test]
-    fn message_capture_retains_recent_utf8_and_complete_ansi_lines() {
+    fn message_capture_parses_sorts_and_deduplicates_jsonl() {
+        let directory = tempfile::tempdir().expect("message fixture");
+        let fixture = directory.path().join("messages.jsonl");
+        let first = json!({
+            "version": "orc.message/v1",
+            "id": "msg_first",
+            "session": "native-session",
+            "timestamp": "2026-09-06T12:00:00.000000001Z",
+            "body": "plain\u{1b}[31m text\u{1b}[0m\u{1b}]52;c;secret\u{7}"
+        });
+        let second = json!({
+            "version": "orc.message/v1",
+            "id": "msg_second",
+            "session": "native-session",
+            "timestamp": "2026-09-06T12:00:01.000000001Z",
+            "body": "\u{1b}[32mstyled café\u{1b}[0m\u{1b}[2J",
+            "bodyFormat": "ansi"
+        });
+        fs::write(&fixture, format!("{second}\n{first}\n{first}\n")).expect("message JSONL");
         let plan = CommandPlan {
             version: "orc.provider/v1".into(),
-            command: vec![
-                "sh".into(),
-                "-c".into(),
-                "i=0; while [ $i -lt 1100 ]; do printf '\\033[32mmessage-%04d café\\033[0m\\n' \"$i\"; i=$((i + 1)); done"
-                    .into(),
-            ],
+            command: vec!["cat".into(), fixture.display().to_string()],
             cwd: None,
             environment: BTreeMap::new(),
             success_codes: vec![0],
             receipt: None,
         };
 
-        let output = capture_messages_plan(&plan, Path::new("."), Duration::from_secs(1))
-            .expect("message capture");
+        let output = capture_messages_plan(
+            &plan,
+            Path::new("."),
+            Duration::from_secs(1),
+            "native-session",
+        )
+        .expect("message capture");
 
-        assert!(output.starts_with("[earlier output truncated by Orc]\n\u{1b}[32m"));
-        assert!(output.ends_with("café\u{1b}[0m\n"));
-        assert!(!output.contains('\u{fffd}'));
-        assert!(output.lines().count() <= MAX_MESSAGE_LINES + 1);
+        assert_eq!(output.records.len(), 2);
+        assert_eq!(output.records[0].id, "msg_first");
+        assert_eq!(output.records[0].body, "plain text");
+        assert_eq!(output.records[1].id, "msg_second");
+        assert_eq!(output.records[1].body, "\u{1b}[32mstyled café\u{1b}[0m");
     }
 
     #[test]
-    fn message_capture_keeps_sgr_but_removes_terminal_control_sequences() {
+    fn message_capture_retains_only_the_newest_bounded_jsonl_records() {
+        let directory = tempfile::tempdir().expect("message fixture");
+        let fixture = directory.path().join("messages.jsonl");
+        let contents = (0..=MAX_MESSAGE_LINES)
+            .map(|index| {
+                json!({
+                    "version": "orc.message/v1",
+                    "id": format!("msg_{index:04}"),
+                    "session": "native-session",
+                    "timestamp": format!("2026-09-06T12:{:02}:{:02}Z", index / 60 % 60, index % 60),
+                    "body": format!("reply {index:04}")
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&fixture, format!("{contents}\n")).expect("message JSONL");
         let plan = CommandPlan {
             version: "orc.provider/v1".into(),
-            command: vec![
-                "sh".into(),
-                "-c".into(),
-                "printf '\\033]52;c;secret\\007\\033[2J\\033[31mvisible\\033[0m\\n'".into(),
-            ],
+            command: vec!["cat".into(), fixture.display().to_string()],
             cwd: None,
             environment: BTreeMap::new(),
             success_codes: vec![0],
             receipt: None,
         };
 
-        let output = capture_messages_plan(&plan, Path::new("."), Duration::from_secs(1))
-            .expect("message capture");
+        let output = capture_messages_plan(
+            &plan,
+            Path::new("."),
+            Duration::from_secs(1),
+            "native-session",
+        )
+        .expect("bounded message capture");
 
-        assert_eq!(output, "\u{1b}[31mvisible\u{1b}[0m\n");
+        assert!(output.truncated);
+        assert_eq!(output.records.len(), MAX_MESSAGE_LINES);
+        assert_eq!(output.records.first().unwrap().id, "msg_0001");
+        assert_eq!(output.records.last().unwrap().id, "msg_1000");
     }
 
     #[test]
-    fn message_capture_handles_a_stray_escape_before_utf8_without_panicking() {
-        let plan = CommandPlan {
-            version: "orc.provider/v1".into(),
-            command: vec![
-                "sh".into(),
-                "-c".into(),
-                "printf '\\033\\303\\251\\n'".into(),
-            ],
-            cwd: None,
-            environment: BTreeMap::new(),
-            success_codes: vec![0],
-            receipt: None,
-        };
+    fn message_parser_rejects_malformed_wrong_session_and_conflicting_ids() {
+        let malformed = parse_message_records("not-json\n", "native-session")
+            .expect_err("malformed JSONL must fail");
+        assert!(malformed.to_string().contains("not valid JSONL"));
 
-        let output = capture_messages_plan(&plan, Path::new("."), Duration::from_secs(1))
-            .expect("message capture");
+        let unsupported = json!({
+            "version": "foreign.message/v1",
+            "id": "msg_one",
+            "session": "native-session",
+            "timestamp": "2026-09-06T12:00:00Z",
+            "body": "message"
+        });
+        let unsupported = parse_message_records(&format!("{unsupported}\n"), "native-session")
+            .expect_err("foreign record versions must fail");
+        assert!(unsupported.to_string().contains("unsupported version"));
 
-        assert_eq!(output, "é\n");
+        let empty_id = json!({
+            "version": "orc.message/v1",
+            "id": " ",
+            "session": "native-session",
+            "timestamp": "2026-09-06T12:00:00Z",
+            "body": "message"
+        });
+        let empty_id = parse_message_records(&format!("{empty_id}\n"), "native-session")
+            .expect_err("empty stable IDs must fail");
+        assert!(empty_id.to_string().contains("empty id"));
+
+        let wrong_session = json!({
+            "version": "orc.message/v1",
+            "id": "msg_one",
+            "session": "other",
+            "timestamp": "2026-09-06T12:00:00Z",
+            "body": "message"
+        });
+        let wrong_session = parse_message_records(&format!("{wrong_session}\n"), "expected")
+            .expect_err("wrong session must fail");
+        assert!(
+            wrong_session
+                .to_string()
+                .contains("belongs to session other")
+        );
+
+        let first = json!({
+            "version": "orc.message/v1",
+            "id": "msg_one",
+            "session": "expected",
+            "timestamp": "2026-09-06T12:00:00Z",
+            "body": "first"
+        });
+        let second = json!({
+            "version": "orc.message/v1",
+            "id": "msg_one",
+            "session": "expected",
+            "timestamp": "2026-09-06T12:00:00Z",
+            "body": "second"
+        });
+        let conflict = parse_message_records(&format!("{first}\n{second}\n"), "expected")
+            .expect_err("conflicting stable IDs must fail");
+        assert!(conflict.to_string().contains("conflicting records"));
+
+        let hidden = json!({
+            "version": "orc.message/v1",
+            "id": "msg_hidden",
+            "session": "expected",
+            "timestamp": "2026-09-06T12:00:00Z",
+            "body": "\u{1b}[2J"
+        });
+        let visible = json!({
+            "version": "orc.message/v1",
+            "id": "msg_hidden",
+            "session": "expected",
+            "timestamp": "2026-09-06T12:00:00Z",
+            "body": "approved"
+        });
+        let conflict = parse_message_records(&format!("{hidden}\n{visible}\n"), "expected")
+            .expect_err("sanitized-empty records still reserve their stable ID");
+        assert!(conflict.to_string().contains("conflicting records"));
+    }
+
+    #[test]
+    fn message_parser_handles_transport_truncation_and_rejects_unsafe_sgr() {
+        let record = json!({
+            "version": "orc.message/v1",
+            "id": "msg_one",
+            "session": "native-session",
+            "timestamp": "2026-09-06T12:00:00Z",
+            "body": "\u{1b}[?999mhidden\u{1b}[31m visible\u{1b}[0m\u{85}",
+            "bodyFormat": "ansi"
+        });
+        let output = parse_message_records(
+            &format!("[earlier output truncated by Orc]\n{record}\n"),
+            "native-session",
+        )
+        .expect("bounded JSONL");
+
+        assert!(output.truncated);
+        assert_eq!(output.records[0].body, "hidden\u{1b}[31m visible\u{1b}[0m");
     }
 
     #[cfg(unix)]
