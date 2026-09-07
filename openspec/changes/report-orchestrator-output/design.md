@@ -36,6 +36,8 @@ This is a UI correction, not a state migration. Old workspaces remain readable, 
 
 The TUI keeps per-session Output values, load times, in-flight markers, and refresh errors separately from Activity. It polls only while the Output tab is visible. A successful refresh replaces the value and clears the error. A failed refresh records the error without deleting the last successful value or changing inspector scroll.
 
+The first successful load follows the newest line. Selecting another Output subject or returning to Output also follows its newest line. A refresh follows appended content only while the viewer is already at the tail. Scrolling upward disables tail following until the viewport reaches the tail again.
+
 The refresh interval reuses the configured live-activity interval. This avoids another timing setting while preserving prompt updates after the provider reports new messages.
 
 ### Bound text at the provider boundary and inspector boundary
@@ -45,6 +47,12 @@ The provider request supplies byte and line limits. Orc also caps captured stdou
 ### Keep adoption and backfill metadata-only
 
 Session registration and provider enrichment continue to store identity, title, purpose, goal, and bindings. They do not copy transcript content into `WorkspaceState`. The Output cache is process-local and can be rebuilt from the selected provider.
+
+### Persist provider-owned display binding receipts
+
+A command plan may declare that its successful stdout is a provider binding receipt. The declaration names the provider that issued the plan. Orc validates that ownership during plan resolution, parses stdout with the existing binding contract, and persists the binding only after an accepted exit code.
+
+The receipt remains optional. Plans without one keep their current stdout behavior. A display extra can wrap its terminal creation command, convert the returned terminal identifier into an active display binding, and let later attach actions resolve `terminal.focus`. Orc core does not know the terminal program or identifier format.
 
 ### Implement Traces as an optional extra
 

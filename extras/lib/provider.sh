@@ -48,6 +48,14 @@ emit_plan() {
   emit_plan_with_codes '[0]' "$@"
 }
 
+emit_binding_plan() {
+  local provider
+  provider=$1
+  shift
+  emit_plan "$@" | jq --arg provider "$provider" \
+    '. + {receipt: {type: "providerBinding", provider: $provider}}'
+}
+
 emit_declined() {
   jq -n --arg reason "$1" \
     '{version: "orc.provider/v1", status: "declined", reason: $reason}'

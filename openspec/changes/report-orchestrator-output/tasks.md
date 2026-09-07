@@ -7,6 +7,7 @@
 - [x] 1.2 Add separate Output cache, loading, refresh-error, and polling state without persisting transcript data `deps:` 1.1 `writes:` src/tui.rs
 - [x] 1.3 Add the optional Traces adapter for the native one-shot output command `deps:` 1.1 `writes:` extras/traces
 - [x] 1.4 Adversarial review: verify provider neutrality, capability isolation, capture bounds, and adapter compatibility `deps:` 1.3 `writes:` openspec/changes/report-orchestrator-output/review.md
+- [x] 1.5 Add optional provider-owned binding receipts and persist a successful terminal-open display binding `deps:` none `writes:` src/provider.rs,src/control.rs,extras/lib/provider.sh,extras/wezterm
 
 ## 2. Inspector semantics
 
@@ -16,6 +17,7 @@
 - [x] 2.1 Split Activity, Output, Checkpoint, Gates, and Health variants and move structured reports to Checkpoint `deps:` 1.2 `writes:` src/tui.rs
 - [x] 2.2 Add focused separation, refresh-preservation, UTF-8, ANSI, and adapter tests `deps:` 1.3,2.1 `writes:` src/provider.rs,src/tui.rs,extras/traces/test.sh
 - [x] 2.3 Adversarial review: verify inspector selection, loading, error retention, scrolling, and live polling `deps:` 2.2 `writes:` openspec/changes/report-orchestrator-output/review.md
+- [x] 2.4 Follow the newest Output on first load and selection, follow refreshes only from the tail, and preserve a scrolled-up position `deps:` 1.2 `writes:` src/tui.rs
 
 ## 3. Existing structured checkpoint contract
 

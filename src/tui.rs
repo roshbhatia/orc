@@ -779,6 +779,7 @@ struct App {
     focus: Focus,
     output_tab: OutputTab,
     inspector_scroll: u16,
+    output_follow_tail: bool,
     dock: Dock,
     leader: bool,
     pending: Option<char>,
@@ -882,6 +883,7 @@ impl App {
             focus: Focus::Main,
             output_tab: OutputTab::Summary,
             inspector_scroll: 0,
+            output_follow_tail: false,
             dock: Dock::Bottom,
             leader: false,
             pending: None,
@@ -955,6 +957,7 @@ impl App {
         };
         self.config.ui.inspector_percent = preferences.inspector_percent;
         self.preferences = preferences;
+        self.reset_inspector_scroll();
     }
 
     fn persist_preferences(&mut self) {
@@ -993,6 +996,12 @@ impl App {
         self.clear_status();
         self.main_tab = tab;
         self.focus = Focus::Main;
+        self.reset_inspector_scroll();
+    }
+
+    fn reset_inspector_scroll(&mut self) {
+        self.output_follow_tail = self.output_tab == OutputTab::Output;
+        self.inspector_scroll = if self.output_follow_tail { u16::MAX } else { 0 };
     }
 
     fn visible_status(&self) -> Option<&str> {
@@ -1307,8 +1316,17 @@ impl App {
                     .insert(session_id.clone(), Instant::now());
                 match result {
                     Ok(output) => {
+                        let first_load = !self.output.contains_key(&session_id);
+                        let selected = self.output_view_is_open()
+                            && self
+                                .selected_message_subject()
+                                .is_some_and(|subject| subject.key == session_id);
                         self.output.insert(session_id.clone(), output);
                         self.output_errors.remove(&session_id);
+                        if selected && (first_load || self.output_follow_tail) {
+                            self.output_follow_tail = true;
+                            self.inspector_scroll = u16::MAX;
+                        }
                     }
                     Err(error) => {
                         self.output_errors.insert(session_id, error);
@@ -1887,6 +1905,7 @@ impl App {
     }
 
     fn move_main(&mut self, direction: Direction) {
+        let selected = self.selected();
         match self.main_tab {
             MainTab::Integrations => match direction {
                 Direction::Up => self.provider_at = self.provider_at.saturating_sub(1),
@@ -1906,7 +1925,9 @@ impl App {
             },
             MainTab::Work => self.flow.select_node_in_direction(direction),
         }
-        self.inspector_scroll = 0;
+        if self.selected() != selected {
+            self.reset_inspector_scroll();
+        }
     }
 
     fn expand(&mut self) {
@@ -2069,6 +2090,7 @@ impl App {
         self.explorer_view = ExplorerView::Graph;
         self.focus = Focus::Main;
         self.rebuild(true);
+        self.reset_inspector_scroll();
         request_flow_fit(&mut self.flow);
         self.set_status("opened workflow graph");
         self.persist_preferences();
@@ -2097,7 +2119,7 @@ impl App {
             _ => return,
         }
         self.focus = Focus::Inspector;
-        self.inspector_scroll = 0;
+        self.reset_inspector_scroll();
     }
 
     fn validate_provider(&mut self, tx: &Sender<BackgroundResult>) {
@@ -2362,7 +2384,7 @@ impl App {
                     self.dock = Dock::Bottom;
                     self.output_tab = OutputTab::Summary;
                     self.focus = Focus::Inspector;
-                    self.inspector_scroll = 0;
+                    self.reset_inspector_scroll();
                     self.set_status("opened inspector");
                 }
             }
@@ -2588,6 +2610,7 @@ impl App {
                 };
                 self.focus = Focus::Main;
                 self.rebuild(true);
+                self.reset_inspector_scroll();
                 self.persist_preferences();
             }
             (KeyCode::Char('['), _) if inspector(self) => self.next_inspector(-1),
@@ -2705,6 +2728,7 @@ impl App {
                 self.switch_main_tab(MainTab::Work);
                 self.explorer_view = ExplorerView::Tree;
                 self.rebuild(true);
+                self.reset_inspector_scroll();
                 self.persist_preferences();
                 return;
             }
@@ -2715,6 +2739,7 @@ impl App {
                 }
                 self.explorer_view = ExplorerView::Graph;
                 self.rebuild(true);
+                self.reset_inspector_scroll();
                 request_flow_fit(&mut self.flow);
                 self.persist_preferences();
                 return;
@@ -2731,6 +2756,7 @@ impl App {
             self.focus = Focus::Inspector;
             match mouse.kind {
                 MouseEventKind::ScrollUp => {
+                    self.output_follow_tail = false;
                     self.inspector_scroll = self.inspector_scroll.saturating_sub(3)
                 }
                 MouseEventKind::ScrollDown => {
@@ -2741,7 +2767,7 @@ impl App {
                         output_tab_at(inspector_tabs(self.selected().as_ref()), inspector, x)
                     {
                         self.output_tab = tab;
-                        self.inspector_scroll = 0;
+                        self.reset_inspector_scroll();
                     }
                 }
                 _ => {}
@@ -2755,6 +2781,7 @@ impl App {
         self.focus = Focus::Main;
         if self.main_tab == MainTab::Work && self.explorer_view == ExplorerView::Graph {
             if contains(self.hit.graph, x, y) {
+                let selected = self.selected();
                 let clamp_after = matches!(
                     mouse.kind,
                     MouseEventKind::Up(MouseButton::Left)
@@ -2766,7 +2793,9 @@ impl App {
                     clamp_flow_viewport(&mut self.flow);
                     self.persist_preferences();
                 }
-                self.inspector_scroll = 0;
+                if self.selected() != selected {
+                    self.reset_inspector_scroll();
+                }
             }
             return;
         }
@@ -2787,6 +2816,7 @@ impl App {
             return;
         }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            let selected = self.selected();
             let index = visible_row_at(
                 self.hit.main,
                 y,
@@ -2803,7 +2833,9 @@ impl App {
                     }
                     MainTab::Work => {}
                 }
-                self.inspector_scroll = 0;
+                if self.selected() != selected {
+                    self.reset_inspector_scroll();
+                }
             }
         }
     }
@@ -2828,7 +2860,10 @@ impl App {
         match self.focus {
             Focus::Main => self.move_main(direction),
             Focus::Inspector => match direction {
-                Direction::Up => self.inspector_scroll = self.inspector_scroll.saturating_sub(1),
+                Direction::Up => {
+                    self.output_follow_tail = false;
+                    self.inspector_scroll = self.inspector_scroll.saturating_sub(1);
+                }
                 Direction::Down => self.inspector_scroll = self.inspector_scroll.saturating_add(1),
                 _ => {}
             },
@@ -2845,6 +2880,9 @@ impl App {
     fn page(&mut self, by: i32) {
         match self.focus {
             Focus::Inspector => {
+                if by < 0 {
+                    self.output_follow_tail = false;
+                }
                 self.inspector_scroll = (self.inspector_scroll as i32 + by * 10).max(0) as u16
             }
             Focus::Main => {
@@ -2867,7 +2905,7 @@ impl App {
             .position(|(tab, _)| *tab == self.output_tab)
             .unwrap_or(0) as i32;
         self.output_tab = tabs[((current + by).rem_euclid(tabs.len() as i32)) as usize].0;
-        self.inspector_scroll = 0;
+        self.reset_inspector_scroll();
     }
 }
 
@@ -4589,6 +4627,7 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &mut App) {
     let tabs = inspector_tabs(selected.as_ref());
     if !tabs.iter().any(|(tab, _)| *tab == app.output_tab) {
         app.output_tab = tabs[0].0;
+        app.reset_inspector_scroll();
     }
     let title = Line::from(
         tabs.iter()
@@ -4644,7 +4683,14 @@ fn render_inspector(frame: &mut Frame, area: Rect, app: &mut App) {
         .map(|line| line.width().max(1).div_ceil(width))
         .sum::<usize>();
     let max_scroll = rendered_lines.saturating_sub(provisional_inner.height as usize) as u16;
-    app.inspector_scroll = app.inspector_scroll.min(max_scroll);
+    if app.output_tab == OutputTab::Output && app.output_follow_tail {
+        app.inspector_scroll = max_scroll;
+    } else {
+        app.inspector_scroll = app.inspector_scroll.min(max_scroll);
+    }
+    if app.output_tab == OutputTab::Output {
+        app.output_follow_tail = app.inspector_scroll == max_scroll;
+    }
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -8204,6 +8250,92 @@ actions:
         );
         assert_eq!(selected_log(&app), "tool call");
         assert!(selected_checkpoint(&app).contains("verified"));
+    }
+
+    fn render_output(app: &mut App) -> String {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, app))
+            .expect("output renders");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn output_lines(last: usize) -> String {
+        (0..=last)
+            .map(|index| format!("assistant line {index:04}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn first_output_load_opens_at_the_newest_line() {
+        let mut app = app();
+        app.output_tab = OutputTab::Output;
+        app.reset_inspector_scroll();
+
+        app.apply_background(BackgroundResult::Output {
+            session_id: "root".into(),
+            result: Ok(output_lines(1_000)),
+        });
+
+        let rendered = render_output(&mut app);
+        assert!(app.inspector_scroll > 0);
+        assert!(app.output_follow_tail);
+        assert!(rendered.contains("assistant line 1000"));
+    }
+
+    #[test]
+    fn appended_output_follows_when_the_viewer_is_at_the_bottom() {
+        let mut app = app();
+        app.output_tab = OutputTab::Output;
+        app.reset_inspector_scroll();
+        app.apply_background(BackgroundResult::Output {
+            session_id: "root".into(),
+            result: Ok(output_lines(1_000)),
+        });
+        render_output(&mut app);
+        let previous_bottom = app.inspector_scroll;
+
+        app.apply_background(BackgroundResult::Output {
+            session_id: "root".into(),
+            result: Ok(output_lines(1_001)),
+        });
+
+        let rendered = render_output(&mut app);
+        assert!(app.inspector_scroll > previous_bottom);
+        assert!(app.output_follow_tail);
+        assert!(rendered.contains("assistant line 1001"));
+    }
+
+    #[test]
+    fn appended_output_preserves_position_when_the_viewer_scrolled_up() {
+        let mut app = app();
+        app.output_tab = OutputTab::Output;
+        app.reset_inspector_scroll();
+        app.apply_background(BackgroundResult::Output {
+            session_id: "root".into(),
+            result: Ok(output_lines(1_000)),
+        });
+        render_output(&mut app);
+        app.focus = Focus::Inspector;
+        app.motion(Direction::Up);
+        let scrolled_position = app.inspector_scroll;
+
+        app.apply_background(BackgroundResult::Output {
+            session_id: "root".into(),
+            result: Ok(output_lines(1_001)),
+        });
+        render_output(&mut app);
+
+        assert_eq!(app.inspector_scroll, scrolled_position);
+        assert!(!app.output_follow_tail);
     }
 
     #[test]

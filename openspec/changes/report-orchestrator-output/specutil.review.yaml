@@ -1,9 +1,9 @@
 version: 2
 change: report-orchestrator-output
 decision: approved
-note: approved after independent provider semantics and live behavior reviews
-change_hash: 170ee123ec3e536e
-base_commit: 911b5fb10fcf5517b049322fe5065d1d8eaad381
+note: approved after independent Output tail and display receipt review
+change_hash: 555508f4c4d66d07
+base_commit: 4aaae4e78951c88022045f1f8d9babc9233ff416
 items:
     0c006ee499f5879b:
         hash: 335b6728ae399ca8
@@ -11,6 +11,9 @@ items:
     1cf64d9b99141edb:
         hash: c13a4b8bbb9208a4
         text: Regenerate schemas, completions, and reference documentation
+    4dc24154276e76fb:
+        hash: 1ee808e4c2a85fdf
+        text: Add optional provider-owned binding receipts and persist a successful terminal-open display binding writes:` src/provider.rs,src/control.rs,extras/lib/provider.sh,extras/wezterm
     24cab0f11f90de4e:
         hash: f52bf414a827119c
         text: Add provider-neutral `messages.read` discovery, validation, plan resolution, and bounded capture writes:` src/provider.rs
@@ -38,6 +41,9 @@ items:
     a2e2ce538bc4b53b:
         hash: 6f52960dc8fc9bf3
         text: 'Adversarial review: retain the prior structured report integrity and authorization findings writes:` openspec/changes/report-orchestrator-output/review.md'
+    e8ef5c3374d6a2c6:
+        hash: 4a9f736ab691cce8
+        text: Follow the newest Output on first load and selection, follow refreshes only from the tail, and preserve a scrolled-up position writes:` src/tui.rs
     f38a7143350df989:
         hash: 2b2705b148ed1870
         text: Add focused separation, refresh-preservation, UTF-8, ANSI, and adapter tests writes:` src/provider.rs,src/tui.rs,extras/traces/test.sh

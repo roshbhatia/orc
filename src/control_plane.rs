@@ -2915,6 +2915,7 @@ spec:
             cwd: None,
             environment: BTreeMap::new(),
             success_codes: vec![0],
+            receipt: None,
         };
 
         let result = reconcile_with(scope.path(), 2, false, |capability, _| {

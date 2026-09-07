@@ -148,7 +148,10 @@ for direction in right left top bottom; do
     '
       .command as $command
       | ($command | index("--")) as $separator
-      | $command[1:4] == ["cli", "--no-auto-start", "split-pane"]
+      | .receipt == {type: "providerBinding", provider: "wezterm"}
+      and $command[0] == $provider
+      and $command[1] == "open"
+      and $command[3:6] == ["cli", "--no-auto-start", "split-pane"]
       and ($command | index($direction)) != null
       and ($command | index("--pane-id")) != null
       and ($command | index("42")) != null
@@ -169,9 +172,10 @@ packaged_command=$(jq -er \
   '
     .command as $command
     | ($command | index("--")) as $separator
-    | ($command[$separator + 1:] | index($provider)) as $provider_offset
-    | select($provider_offset != null)
-    | select($command[$separator + $provider_offset + 2] == "hold")
+    | select(.receipt == {type: "providerBinding", provider: "wezterm"})
+    | select($command[0] == $provider and $command[1] == "open")
+    | select($command[$separator + 3] == $provider)
+    | select($command[$separator + 4] == "hold")
     | $provider
   ' "$test_scope/packaged.json")
 expect "$packaged_expect_script" "$(command -v env)" "$packaged_command"
@@ -179,9 +183,20 @@ expect "$packaged_expect_script" "$(command -v env)" "$packaged_command"
 request right |
   env -u WEZTERM_PANE ORC_PROVIDER_LIB="$provider_library" bash "$provider_script" > "$test_scope/outside.json"
 jq -e '
-  .command[1:4] == ["cli", "--no-auto-start", "spawn"]
+  .receipt == {type: "providerBinding", provider: "wezterm"}
+  and .command[1] == "open"
+  and .command[3:6] == ["cli", "--no-auto-start", "spawn"]
   and (.command | index("split-pane")) == null
 ' "$test_scope/outside.json" > /dev/null
+
+open_receipt=$(ORC_PROVIDER_LIB="$provider_library" \
+  bash "$provider_script" open sh -c 'printf 88')
+jq -e '
+  .binding.kind == "display"
+  and .binding.status == "active"
+  and .binding.ref == "88"
+  and .binding.label == "WezTerm pane 88"
+' <<< "$open_receipt" > /dev/null
 
 printf '\n' | bash "$provider_script" hold true > "$test_scope/short-success.txt"
 grep -Fq 'Command exited with 0. Press Enter to close.' \

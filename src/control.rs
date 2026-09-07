@@ -2222,7 +2222,7 @@ fn attach_with_output(
 ) -> Result<AttachOutcome> {
     let scope = state::resolve_scope(scope)?;
     let workspace = state::read(&scope)?;
-    let session = selected_session(&workspace, id)?;
+    let session = selected_session(&workspace, id)?.clone();
     let providers = provider::discover(config)?;
     let prefer_focus = action == provider::Action::Attach
         && session.status.active()
@@ -2235,14 +2235,59 @@ fn attach_with_output(
                     .is_some_and(|value| !value.is_empty())
         });
     execute_attach_with(action, prefer_focus, |selected_action| {
-        let request = provider::action_request(selected_action, &scope, Some(session), direction);
+        let request = provider::action_request(selected_action, &scope, Some(&session), direction);
         let plan = provider::resolve_plan(config, &providers, selected_action, request)?;
-        let code = if print_output {
-            provider::execute_plan(&plan, &scope, false)?
+        let result = provider::run_plan(&plan, &scope)?;
+        let (accepted, receipt, stdout) = interpret_plan_result(&providers, &plan, &result)?;
+        if let Some(binding) = receipt {
+            persist_provider_binding(&scope, &session.id, binding)?;
+        }
+        if print_output && let Some(stdout) = stdout {
+            print!("{stdout}");
+        }
+        if print_output {
+            eprint!("{}", result.stderr);
+        }
+        Ok((result.code, accepted))
+    })
+}
+
+fn interpret_plan_result<'a>(
+    providers: &[provider::Manifest],
+    plan: &provider::CommandPlan,
+    result: &'a provider::CommandResult,
+) -> Result<(bool, Option<ProviderBinding>, Option<&'a str>)> {
+    let accepted = plan.accepts(result.code);
+    let receipt = accepted
+        .then(|| provider::parse_plan_binding_receipt(providers, plan, &result.stdout))
+        .transpose()?
+        .flatten();
+    let stdout = plan.receipt.is_none().then_some(result.stdout.as_str());
+    Ok((accepted, receipt, stdout))
+}
+
+fn persist_provider_binding(
+    scope: &Path,
+    session_id: &str,
+    binding: ProviderBinding,
+) -> Result<()> {
+    state::update(scope, |workspace| {
+        let session = workspace
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .with_context(|| format!("session disappeared while attaching: {session_id}"))?;
+        if let Some(existing) = session
+            .providers
+            .iter_mut()
+            .find(|existing| existing.provider == binding.provider && existing.kind == binding.kind)
+        {
+            *existing = binding;
         } else {
-            provider::run_plan(&plan, &scope)?.code
-        };
-        Ok((code, plan.accepts(code)))
+            session.providers.push(binding);
+        }
+        session.updated_at = Utc::now();
+        Ok(())
     })
 }
 
@@ -2651,6 +2696,55 @@ kind: display
 command: {{ command }}
 actions:
   session.bind: Bind the current terminal
+"#;
+
+    const ATTACH_PROVIDER: &str = r#"#!/bin/sh
+request=$(cat)
+case "$request" in
+  *session.attach*) printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}' ;;
+  *) printf '%s\n' 'null' ;;
+esac
+"#;
+
+    const DISPLAY_RECEIPT_PROVIDER: &str = r#"#!/bin/sh
+case "${1:-}" in
+  open)
+    printf 'open\n' >> "$2"
+    printf '%s\n' '{"version":"orc.provider/v1","binding":{"kind":"display","status":"active","ref":"pane-7","label":"test pane"}}'
+    exit 0
+    ;;
+  focus)
+    printf 'focus\n' >> "$2"
+    exit 0
+    ;;
+esac
+request=$(cat)
+case "$request" in
+  *terminal.open*)
+    jq -n --arg command "$0" --arg marker '{{ opened }}' '{version:"orc.provider/v1",command:[$command,"open",$marker],receipt:{type:"providerBinding",provider:"display"}}'
+    ;;
+  *terminal.focus*)
+    jq -n --arg command "$0" --arg marker '{{ focused }}' '{version:"orc.provider/v1",command:[$command,"focus",$marker]}'
+    ;;
+  *) printf '%s\n' 'null' ;;
+esac
+"#;
+
+    const ATTACH_PROVIDER_MANIFEST: &str = r#"version: orc.provider/v1
+name: harness
+kind: persistence
+command: {{ command }}
+actions:
+  session.attach: Resume the harness session
+"#;
+
+    const DISPLAY_RECEIPT_MANIFEST: &str = r#"version: orc.provider/v1
+name: display
+kind: display
+command: {{ command }}
+actions:
+  terminal.open: Open a terminal pane
+  terminal.focus: Focus a terminal pane
 "#;
 
     const MISSING_SCOPE_STOP_PROVIDER: &str = r#"#!/bin/sh
@@ -6612,6 +6706,115 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         assert!(outcome.accepted);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn attach_persists_display_receipt_then_focuses_without_opening_again() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let scope_directory = directory.path().join("scope");
+        let provider_directory = directory.path().join("providers");
+        fs::create_dir_all(&scope_directory).expect("scope");
+        fs::create_dir_all(&provider_directory).expect("providers");
+        let scope = fs::canonicalize(scope_directory).expect("canonical scope");
+        let attach_provider = directory.path().join("attach.sh");
+        let display_provider = directory.path().join("display.sh");
+        let opened = directory.path().join("opened");
+        let focused = directory.path().join("focused");
+        fs::write(&attach_provider, ATTACH_PROVIDER).expect("attach provider");
+        fs::write(
+            &display_provider,
+            render_fixture(
+                DISPLAY_RECEIPT_PROVIDER,
+                serde_json::json!({
+                    "opened": opened.display().to_string(),
+                    "focused": focused.display().to_string(),
+                }),
+            ),
+        )
+        .expect("display provider");
+        for provider in [&attach_provider, &display_provider] {
+            fs::set_permissions(provider, fs::Permissions::from_mode(0o755))
+                .expect("provider executable");
+        }
+        fs::write(
+            provider_directory.join("harness.yaml"),
+            render_fixture(
+                ATTACH_PROVIDER_MANIFEST,
+                serde_json::json!({ "command": attach_provider.display().to_string() }),
+            ),
+        )
+        .expect("attach manifest");
+        fs::write(
+            provider_directory.join("display.yaml"),
+            render_fixture(
+                DISPLAY_RECEIPT_MANIFEST,
+                serde_json::json!({ "command": display_provider.display().to_string() }),
+            ),
+        )
+        .expect("display manifest");
+        let config = Config {
+            providers: crate::config::ProviderConfig {
+                directory: provider_directory,
+                ..crate::config::ProviderConfig::default()
+            },
+            ..Config::default()
+        };
+        let session = register(&scope, Contract::default(), SessionLink::default())
+            .expect("registered session");
+        state::update(&scope, |workspace| {
+            let session = selected_session(workspace, &session.id)?.clone();
+            workspace
+                .sessions
+                .iter_mut()
+                .find(|candidate| candidate.id == session.id)
+                .expect("session remains")
+                .providers
+                .push(ProviderBinding {
+                    provider: "display".into(),
+                    kind: ProviderKind::Display,
+                    r#ref: None,
+                    status: BindingStatus::Available,
+                    label: "test pane".into(),
+                });
+            Ok(())
+        })
+        .expect("available display binding");
+
+        let first = attach_quiet(
+            &config,
+            &scope,
+            &session.id,
+            provider::Action::Attach,
+            "right",
+        )
+        .expect("first attach");
+        assert_eq!(first.disposition, AttachDisposition::Launched);
+        assert_eq!(fs::read_to_string(&opened).expect("open marker"), "open\n");
+        let attached = selected_session(&state::read(&scope).expect("state"), &session.id)
+            .expect("attached session")
+            .clone();
+        assert!(attached.providers.iter().any(|binding| {
+            binding.provider == "display"
+                && binding.kind == ProviderKind::Display
+                && binding.status == BindingStatus::Active
+                && binding.r#ref.as_deref() == Some("pane-7")
+        }));
+
+        let second = attach_quiet(
+            &config,
+            &scope,
+            &session.id,
+            provider::Action::Attach,
+            "right",
+        )
+        .expect("second attach");
+        assert_eq!(second.disposition, AttachDisposition::Focused);
+        assert_eq!(fs::read_to_string(&opened).expect("open marker"), "open\n");
+        assert_eq!(
+            fs::read_to_string(&focused).expect("focus marker"),
+            "focus\n"
+        );
+    }
+
     #[test]
     fn active_session_without_persistence_uses_provider_neutral_attach() {
         let mut calls = Vec::new();
@@ -6636,6 +6839,32 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         assert_eq!(outcome.code, 17);
         assert!(!outcome.accepted);
         assert_eq!(outcome.disposition, AttachDisposition::Launched);
+    }
+
+    #[test]
+    fn rejected_binding_receipt_has_no_binding_or_visible_output() {
+        let plan = provider::CommandPlan {
+            version: "orc.provider/v1".into(),
+            command: vec!["false".into()],
+            cwd: None,
+            environment: BTreeMap::new(),
+            success_codes: vec![0],
+            receipt: Some(provider::CommandReceipt::ProviderBinding {
+                provider: "display".into(),
+            }),
+        };
+        let result = provider::CommandResult {
+            code: 7,
+            stdout: "reserved receipt".into(),
+            stderr: String::new(),
+        };
+
+        let (accepted, binding, stdout) = interpret_plan_result(&[], &plan, &result)
+            .expect("rejected command does not parse its receipt");
+
+        assert!(!accepted);
+        assert!(binding.is_none());
+        assert!(stdout.is_none());
     }
 
     #[test]

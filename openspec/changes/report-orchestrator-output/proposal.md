@@ -8,7 +8,8 @@ Orc used Output for structured JSON reported through its control-plane API. User
 - Render user-visible assistant prose in Output for sessions, runs, and assigned workflow nodes.
 - Rename the structured reported-output view to Checkpoint without removing its CLI or MCP report API.
 - Keep Activity, Gates, Health, Checkpoint, and Output as distinct inspector states.
-- Poll only the visible Output view, cache it separately, preserve its last good value on refresh errors, and keep scroll position stable.
+- Poll only the visible Output view, cache it separately, open at the newest message, follow new messages only from the tail, and preserve its last good value on refresh errors.
+- Let a terminal provider declare that a successful open command returns its active display binding, so later attach actions can focus that target.
 - Extend the Traces extra with a `messages.read` adapter. Orc core remains unaware of Traces or any harness transcript format.
 
 ### Non-goals
@@ -33,8 +34,11 @@ Orc used Output for structured JSON reported through its control-plane API. User
 ## Impact
 
 - `src/provider.rs` gains the provider-neutral capability, resolution, validation, and bounded capture path.
-- `src/tui.rs` gains separate inspector variants and Output cache state.
+- `src/provider.rs` also gains an optional provider-owned binding receipt for command plans.
+- `src/tui.rs` gains separate inspector variants and explicit Output tail-follow state.
+- `src/control.rs` persists a validated binding receipt after a successful terminal open.
 - `extras/traces/` implements the optional Traces adapter through its native non-interactive output view.
+- `extras/wezterm/` wraps terminal creation and returns the resulting display binding through the generic receipt contract.
 - Generated provider schemas and reference documentation include `messages.read`.
 
 ## Behavior
@@ -44,6 +48,8 @@ Must do:
 - Activity retains messages, thinking, tool calls, and provider activity exactly as before.
 - Checkpoint shows the existing structured node or session report.
 - A failed refresh keeps the last successful Output value visible and reports the refresh error.
+- A first Output load and a newly selected Output subject show the newest message. Refresh follows appended messages only while the viewer remains at the tail.
+- A successful terminal open can return an active display binding. The next attach focuses that binding instead of opening another target.
 - Provider output remains bounded and valid UTF-8. ANSI styling remains safe to render after truncation.
 - Selecting a run or unassigned node reads from its orchestrator session. An assigned node reads from its assigned session.
 

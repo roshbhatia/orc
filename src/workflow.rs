@@ -2639,6 +2639,7 @@ Success criteria:
                 cwd: Some(scope.display().to_string()),
                 environment: BTreeMap::new(),
                 success_codes: vec![0],
+                receipt: None,
             };
             let mut request = json!({
                 "version": "orc.provider/v1",
@@ -5868,6 +5869,7 @@ steps:
             cwd: None,
             environment: BTreeMap::new(),
             success_codes: vec![0],
+            receipt: None,
         };
         let worker = thread::spawn(move || {
             provider::run_plan_tracked(&plan, Path::new("."), Some(&worker_directory))

@@ -79,6 +79,21 @@ if [[ ${1:-} == run ]]; then
   exec "$@"
 fi
 
+if [[ ${1:-} == open ]]; then
+  shift
+  if (($# == 0)); then
+    printf 'orc-provider-wezterm: open requires a command\n' >&2
+    exit 2
+  fi
+  pane_id=$("$@")
+  if [[ ! $pane_id =~ ^[0-9]+$ ]]; then
+    printf 'orc-provider-wezterm: open returned an invalid pane id: %s\n' "$pane_id" >&2
+    exit 1
+  fi
+  emit_binding "display" "active" "$pane_id" "WezTerm pane $pane_id"
+  exit 0
+fi
+
 provider_init "wezterm"
 
 case "$capability" in
@@ -181,7 +196,8 @@ case "$capability" in
       split_command=("$executable" cli --no-auto-start spawn --cwd "$prior_cwd")
     fi
     split_command+=(-- "${session_command[@]}")
-    emit_plan "$scope" "$prior_environment" "${split_command[@]}"
+    emit_binding_plan "wezterm" "$scope" "$prior_environment" \
+      "$provider_self" open "${split_command[@]}"
     ;;
   *) unsupported_capability ;;
 esac

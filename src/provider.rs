@@ -308,6 +308,12 @@ fn launch_attach_route_ready_with(
     )
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum CommandReceipt {
+    ProviderBinding { provider: String },
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CommandPlan {
     pub version: String,
@@ -317,6 +323,8 @@ pub struct CommandPlan {
     pub environment: BTreeMap<String, String>,
     #[serde(default = "default_success_codes", rename = "successCodes")]
     pub success_codes: Vec<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<CommandReceipt>,
 }
 
 fn default_success_codes() -> Vec<i32> {
@@ -1805,7 +1813,35 @@ fn parse_plan(provider: &Manifest, value: Value) -> Result<Option<CommandPlan>> 
     {
         bail!("{} returned an invalid command plan", provider.name);
     }
+    if let Some(CommandReceipt::ProviderBinding { provider: owner }) = &plan.receipt
+        && owner != &provider.name
+    {
+        bail!(
+            "{} returned a provider binding receipt owned by {owner}",
+            provider.name
+        );
+    }
     Ok(Some(plan))
+}
+
+pub(crate) fn parse_plan_binding_receipt(
+    providers: &[Manifest],
+    plan: &CommandPlan,
+    output: &str,
+) -> Result<Option<ProviderBinding>> {
+    let Some(CommandReceipt::ProviderBinding { provider: owner }) = &plan.receipt else {
+        return Ok(None);
+    };
+    let provider = providers
+        .iter()
+        .find(|provider| provider.name == *owner)
+        .with_context(|| format!("unknown provider binding receipt owner: {owner}"))?;
+    let value: Value = serde_json::from_str(output.trim())
+        .with_context(|| format!("{owner} returned an invalid provider binding receipt"))?;
+    if value.get("version").and_then(Value::as_str) != Some("orc.provider/v1") {
+        bail!("{owner} returned a provider binding receipt with an invalid version");
+    }
+    parse_binding(provider, &value).map(Some)
 }
 
 fn parse_binding(provider: &Manifest, value: &Value) -> Result<ProviderBinding> {
@@ -3564,6 +3600,7 @@ fi
             cwd: None,
             environment: BTreeMap::from([("ORC_SESSION_ID".into(), "stale".into())]),
             success_codes: vec![0],
+            receipt: None,
         };
         let request = json!({
             "scope": "/workspace",
@@ -3608,6 +3645,7 @@ fi
             cwd: None,
             environment: BTreeMap::new(),
             success_codes: vec![0],
+            receipt: None,
         };
         let error =
             run_plan_with_timeout(&plan, Path::new("."), std::time::Duration::from_millis(10))
@@ -3989,6 +4027,7 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
             cwd: None,
             environment: BTreeMap::new(),
             success_codes: vec![0],
+            receipt: None,
         };
         let started = Instant::now();
 
@@ -4022,6 +4061,7 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
             cwd: None,
             environment: BTreeMap::new(),
             success_codes: vec![0],
+            receipt: None,
         };
         let started = Instant::now();
 
@@ -4055,6 +4095,7 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
             cwd: None,
             environment: BTreeMap::new(),
             success_codes: vec![0],
+            receipt: None,
         };
 
         let result =
@@ -4091,6 +4132,51 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
 
         assert!(plan.accepts(2));
         assert!(!plan.accepts(1));
+    }
+
+    #[test]
+    fn command_plan_binding_receipt_is_owned_and_validated_by_its_provider() {
+        let mut provider = provider_manifest("display", Path::new("display-provider"), 0);
+        provider.kind = ProviderKind::Display;
+        let plan = parse_plan(
+            &provider,
+            json!({
+                "version": "orc.provider/v1",
+                "command": ["display"],
+                "receipt": {"type": "providerBinding", "provider": "display"},
+            }),
+        )
+        .expect("owned receipt plan")
+        .expect("accepted plan");
+
+        let binding = parse_plan_binding_receipt(
+            std::slice::from_ref(&provider),
+            &plan,
+            r#"{"version":"orc.provider/v1","binding":{"kind":"display","status":"active","ref":"pane-7","label":"pane"}}"#,
+        )
+        .expect("valid binding receipt")
+        .expect("declared receipt");
+        assert_eq!(binding.provider, "display");
+        assert_eq!(binding.r#ref.as_deref(), Some("pane-7"));
+
+        let error = parse_plan_binding_receipt(
+            std::slice::from_ref(&provider),
+            &plan,
+            r#"{"version":"orc.provider/v0","binding":{"kind":"display","status":"active","ref":"pane-7"}}"#,
+        )
+        .expect_err("stale receipt version");
+        assert!(error.to_string().contains("invalid version"));
+
+        let error = parse_plan(
+            &provider,
+            json!({
+                "version": "orc.provider/v1",
+                "command": ["display"],
+                "receipt": {"type": "providerBinding", "provider": "other"},
+            }),
+        )
+        .expect_err("cross-provider receipt");
+        assert!(error.to_string().contains("owned by other"));
     }
 
     #[test]
@@ -4182,6 +4268,7 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
             cwd: None,
             environment: BTreeMap::new(),
             success_codes: vec![0],
+            receipt: None,
         };
         let guard = ProcessTrackerGuard::acquire(&tracker_directory, Duration::from_secs(1))
             .expect("hold tracker boundary");
@@ -4458,6 +4545,7 @@ third line
             cwd: None,
             environment: BTreeMap::new(),
             success_codes: vec![0],
+            receipt: None,
         };
 
         let activity = capture_activity_plan(&plan, Path::new("."), Duration::from_secs(1))
@@ -4480,6 +4568,7 @@ third line
             cwd: None,
             environment: BTreeMap::new(),
             success_codes: vec![0],
+            receipt: None,
         };
 
         let activity = capture_activity_plan(&plan, Path::new("."), Duration::from_secs(2))
@@ -4503,6 +4592,7 @@ third line
             cwd: None,
             environment: BTreeMap::new(),
             success_codes: vec![0],
+            receipt: None,
         };
 
         let output = capture_messages_plan(&plan, Path::new("."), Duration::from_secs(1))
@@ -4526,6 +4616,7 @@ third line
             cwd: None,
             environment: BTreeMap::new(),
             success_codes: vec![0],
+            receipt: None,
         };
 
         let output = capture_messages_plan(&plan, Path::new("."), Duration::from_secs(1))
@@ -4546,6 +4637,7 @@ third line
             cwd: None,
             environment: BTreeMap::new(),
             success_codes: vec![0],
+            receipt: None,
         };
 
         let output = capture_messages_plan(&plan, Path::new("."), Duration::from_secs(1))

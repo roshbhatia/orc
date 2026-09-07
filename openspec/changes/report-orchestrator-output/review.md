@@ -59,3 +59,9 @@ The implementation now sanitizes without panics, uses inspector-specific omissio
 The live-behavior reviewer found that Output inherited Activity's active-session filter. A completed run could show an Output tab but could not read its archived orchestrator. Output now has a separate subject resolver that supports archived sessions while Activity retains its active-only policy.
 
 Both independent reviewers returned CLEAN after the corrections. They verified provider neutrality, exact Traces command compatibility, session and workflow selection, Activity and Checkpoint isolation, loading and error retention, scroll preservation, generated interfaces, and complete OpenSpec artifacts. Native tests ran without an Orc runtime or broker.
+
+### Round 7
+
+A live foundation review found two receipt-boundary defects. The binding parser accepted an old protocol version, and a rejected receipt command could print its reserved stdout. Orc now validates the receipt envelope before the binding and suppresses receipt stdout for every exit status. Focused regressions cover both failures.
+
+The reviewer returned CLEAN after rechecking Output tail following, scrolled-up preservation, error retention, provider ownership, accepted-exit-only persistence, and first-open/second-focus behavior. All checks remained native and isolated from the Orc runtime and broker.
