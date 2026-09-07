@@ -1463,15 +1463,25 @@ pub fn reconcile(config: &Config, scope: &Path) -> Result<WorkspaceState> {
 pub fn bind_current_session(config: &Config, scope: &Path, id: &str) -> Result<WorkspaceState> {
     let scope = state::resolve_scope(scope)?;
     let providers = provider::discover(config)?;
-    let snapshot = state::read(&scope)?;
+    bind_current_session_with(config, &scope, id, |bounded_config, scope, session| {
+        provider::discover_current_bindings(bounded_config, &providers, scope, session)
+    })
+}
+
+fn bind_current_session_with(
+    config: &Config,
+    scope: &Path,
+    id: &str,
+    discover_current: impl FnOnce(&Config, &Path, &Session) -> Vec<ProviderBinding>,
+) -> Result<WorkspaceState> {
+    let snapshot = state::read(scope)?;
     let session = selected_session(&snapshot, id)?.clone();
     let bounded_config = current_bind_config(config);
-    let bindings =
-        provider::discover_current_bindings(&bounded_config, &providers, &scope, &session);
+    let bindings = discover_current(&bounded_config, scope, &session);
     if bindings.is_empty() {
         return Ok(snapshot);
     }
-    state::update(&scope, |workspace| {
+    state::update(scope, |workspace| {
         let selected = workspace
             .sessions
             .iter_mut()
@@ -2726,17 +2736,8 @@ esac
 "#;
 
     const CURRENT_BIND_PROVIDER: &str = r#"#!/bin/sh
-request=$(cat)
-if printf '%s' "$request" | jq -e '.rebindCurrent == true and .currentSessionId == .session.id' >/dev/null; then
-    sleep 1
-    cat <<'JSON'
-{"version":"orc.provider/v1","binding":{"kind":"display","status":"active","ref":"pane-7"}}
-JSON
-else
-    cat <<'JSON'
-{"version":"orc.provider/v1","binding":{"kind":"display","status":"available"}}
-JSON
-fi
+cat > '{{ request }}'
+printf '%s\n' '{"version":"orc.provider/v1","binding":{"kind":"display","status":"active","ref":"pane-7"}}'
 "#;
 
     const CURRENT_BIND_MANIFEST: &str = r#"version: orc.provider/v1
@@ -3306,7 +3307,7 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
 
     #[cfg(unix)]
     #[test]
-    fn current_registration_binding_allows_bounded_cold_start() {
+    fn current_registration_binding_uses_bounded_timeout_once() {
         let directory = tempfile::tempdir().expect("binding fixture");
         let scope_directory = directory.path().join("scope");
         let provider_directory = directory.path().join("providers");
@@ -3314,16 +3315,22 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         fs::create_dir_all(&provider_directory).expect("providers");
         let scope = fs::canonicalize(scope_directory).expect("canonical scope");
         let provider = directory.path().join("provider.sh");
-        fs::write(&provider, CURRENT_BIND_PROVIDER).expect("provider script");
+        let request = directory.path().join("request.json");
+        fs::write(
+            &provider,
+            render_fixture(
+                CURRENT_BIND_PROVIDER,
+                serde_json::json!({"request": request.display().to_string()}),
+            ),
+        )
+        .expect("provider script");
         fs::set_permissions(&provider, fs::Permissions::from_mode(0o755))
             .expect("provider executable");
         fs::write(
             provider_directory.join("provider.yaml"),
             render_fixture(
                 CURRENT_BIND_MANIFEST,
-                serde_json::json!({
-                    "command": provider.display().to_string(),
-                }),
+                serde_json::json!({"command": provider.display().to_string()}),
             ),
         )
         .expect("provider manifest");
@@ -3358,13 +3365,28 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         let mut config = Config::default();
         config.providers.directory = provider_directory;
         config.providers.timeout_ms = 30_000;
-        assert_eq!(
-            current_bind_config(&config).providers.timeout_ms,
-            CURRENT_BIND_PROVIDER_TIMEOUT_MS
-        );
-
-        let state = bind_current_session(&config, &scope, &linked.id)
-            .expect("bind the just-registered session");
+        let providers = provider::discover(&config).expect("display provider");
+        let bindings = provider::discover_current_bindings(&config, &providers, &scope, &linked);
+        let request: serde_json::Value =
+            serde_json::from_slice(&fs::read(request).expect("current binding request"))
+                .expect("current binding request json");
+        assert_eq!(request["rebindCurrent"], true);
+        assert_eq!(request["currentSessionId"], linked.id);
+        assert_eq!(request["session"]["id"], linked.id);
+        let invoked = std::cell::Cell::new(0);
+        let state = bind_current_session_with(
+            &config,
+            &scope,
+            &linked.id,
+            |bounded_config, bound_scope, session| {
+                invoked.set(invoked.get() + 1);
+                assert_eq!(bounded_config.providers.timeout_ms, 1_500);
+                assert_eq!(bound_scope, scope);
+                assert_eq!(session.id, linked.id);
+                bindings
+            },
+        )
+        .expect("bind the just-registered session");
 
         let current = selected_session(&state, &linked.id).expect("bound session");
         assert_eq!(current.providers.len(), 1);
@@ -3372,6 +3394,7 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         assert_eq!(current.providers[0].kind, ProviderKind::Display);
         assert_eq!(current.providers[0].status, BindingStatus::Active);
         assert_eq!(current.providers[0].r#ref.as_deref(), Some("pane-7"));
+        assert_eq!(invoked.get(), 1);
         let unrelated = selected_session(&state, "unrelated").expect("unrelated session");
         assert_eq!(unrelated.title, "Unrelated title");
         assert_eq!(unrelated.goal, "Unrelated goal");
