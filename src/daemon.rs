@@ -1288,6 +1288,7 @@ actions:
             node_id: None,
             provider_ref: None,
             providers: Vec::new(),
+            provider_revisions: Default::default(),
             directory: "/tmp".into(),
             registration: RegistrationSource::Managed,
             status: LifecycleStatus::Working,

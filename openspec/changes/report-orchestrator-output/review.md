@@ -97,3 +97,29 @@ exact RFC 3339 timestamp and body.
 The independent mediator rechecked both revisions and returned
 `NO SURVIVING OBJECTION`. Terminal state: CLEAN. This is model evidence, not
 owner or peer approval.
+
+### Round 11
+
+A live attach regression exposed a stale-write race between terminal-open
+receipts and background provider reconciliation. Three bounded critics then
+found related lifecycle paths. The mediator accepted the concrete objections.
+The implementation now:
+
+- tracks monotonic revisions per provider-and-kind slot, including removals and
+  identical-value remove-and-add sequences;
+- uses the same optimistic merge for reconciliation, termination,
+  managed-launch readiness, and finalization;
+- derives readiness and completion from committed non-synthetic runtime
+  bindings while preserving concurrent terminal states;
+- resolves focus through the active display owner and never opens another
+  display after ambiguous focus resolution; and
+- keeps disconnected sessions focusable in both control and TUI paths.
+
+Direct regressions cover the original first-open/second-focus race at normal
+and fast refresh, unrelated-slot updates, termination against a newer receipt,
+synthetic reservation retirement, committed readiness, terminal-state
+finalization, display ownership, and disconnected TUI focus. The full native
+suite passed 459 unit tests plus every integration and PTY test. Both Nix flakes
+passed on Apple Silicon. The final bounded mediator returned
+`NO SURVIVING OBJECTION`. Cross-platform and packaged-asset evidence remains
+part of release task 4.3.

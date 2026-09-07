@@ -321,14 +321,12 @@ fn provider_binding_ready(
 }
 
 fn attach_readiness(session: &Session, providers: &[Manifest]) -> AttachReadiness {
-    if session.status.active()
-        && provider_binding_ready(
-            session,
-            providers,
-            ProviderKind::Display,
-            Capability::TerminalFocus,
-        )
-    {
+    if provider_binding_ready(
+        session,
+        providers,
+        ProviderKind::Display,
+        Capability::TerminalFocus,
+    ) {
         return AttachReadiness::Focus;
     }
     let attach = providers.iter().any(|provider| {
@@ -6997,6 +6995,7 @@ mod tests {
             node_id: None,
             provider_ref: None,
             providers: Vec::new(),
+            provider_revisions: BTreeMap::new(),
             directory: "/tmp/orc-test".into(),
             registration: crate::domain::RegistrationSource::Managed,
             status: LifecycleStatus::Working,
@@ -7252,6 +7251,30 @@ mod tests {
         assert_eq!(
             attach_readiness(&app.state.sessions[0], &providers),
             AttachReadiness::Reattach
+        );
+    }
+
+    #[test]
+    fn disconnected_session_with_an_active_display_is_focusable() {
+        let mut app = app();
+        app.state.sessions[0].status = LifecycleStatus::Disconnected;
+        app.state.sessions[0].providers = vec![crate::domain::ProviderBinding {
+            provider: "display".into(),
+            kind: ProviderKind::Display,
+            r#ref: Some("pane-7".into()),
+            status: BindingStatus::Active,
+            label: "test pane".into(),
+        }];
+        let providers = [
+            "version: orc.provider/v1\nname: display\nkind: display\ncommand: \"true\"\nactions:\n  terminal.focus: Focus\n",
+        ]
+        .into_iter()
+        .map(|manifest| serde_yaml::from_str(manifest).expect("provider manifest"))
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            attach_readiness(&app.state.sessions[0], &providers),
+            AttachReadiness::Focus
         );
     }
 

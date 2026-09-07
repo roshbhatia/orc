@@ -1,9 +1,9 @@
 version: 2
 change: report-orchestrator-output
 decision: approved
-note: owner-authorized scope; mediated Output review reached CLEAN; release remains pending
-change_hash: 5aed768e43f6919b
-base_commit: 58c52fe5690231363b389009eeb97881a04d30a3
+note: mediated provider-binding race review reached CLEAN; release evidence remains pending
+change_hash: d59b801dec76954d
+base_commit: 0341e8ffb5d4f5542dee8f98512fdabca58ab1d6
 items:
     0c006ee499f5879b:
         hash: 335b6728ae399ca8

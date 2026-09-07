@@ -90,6 +90,24 @@ A command plan may declare that its successful stdout is a provider binding rece
 
 The receipt remains optional. Plans without one keep their current stdout behavior. A display extra can wrap its terminal creation command, convert the returned terminal identifier into an active display binding, and let later attach actions resolve `terminal.focus`. Orc core does not know the terminal program or identifier format.
 
+Provider discovery runs outside the state lock because providers can block. Its
+binding observations are therefore optimistic. When Orc commits an enrichment,
+it compares each provider-and-kind slot's monotonic revision with the snapshot
+used for discovery. An unchanged slot accepts the observation. A changed slot
+preserves its newer binding or removal, including an identical-value
+remove-and-add sequence. Every production binding mutation advances the affected
+slot's revision. Unrelated slots still accept fresh observations. Liveness and
+managed-launch readiness derive from the committed binding set, not from the
+stale observation. Synthetic launch-owner reservations prove cancellation
+authority but never prove runtime liveness. Finalization never replaces a
+concurrent terminal or error state.
+
+An active display receipt also owns `terminal.focus`. Focus resolution selects
+that receipt's provider even when another display provider has higher priority.
+The receipt remains focusable after the session becomes disconnected, so a
+later attach does not create a duplicate terminal target. Ambiguous focus
+ownership fails without falling back to another terminal open.
+
 ### Implement Traces as an optional extra
 
 The Traces manifest advertises `messages.read`. Its adapter runs:

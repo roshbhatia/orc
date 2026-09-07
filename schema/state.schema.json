@@ -359,6 +359,15 @@
             "null"
           ]
         },
+        "providerRevisions": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "default": {},
+          "type": "object"
+        },
         "providers": {
           "default": [],
           "items": {

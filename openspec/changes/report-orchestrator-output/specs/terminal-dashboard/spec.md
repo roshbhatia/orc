@@ -62,7 +62,13 @@ Orc MUST let a provider declare that a successful command returns a binding owne
 
 #### Scenario: The user attaches again
 - **WHEN** the session has the active display binding returned by its prior terminal open
-- **THEN** Orc MUST resolve `terminal.focus` instead of opening a duplicate display target
+- **THEN** Orc MUST resolve `terminal.focus` through that binding's provider instead of opening a duplicate display target
+- **AND** a disconnected session lifecycle MUST NOT suppress this focus attempt
+
+#### Scenario: Reconciliation overlaps terminal open
+- **WHEN** reconciliation observes an older binding and a successful terminal open persists a newer binding before reconciliation commits
+- **THEN** Orc MUST preserve the newer binding with a monotonic binding revision and atomic compare-and-merge update
+- **AND** the next attach MUST resolve `terminal.focus` without opening a duplicate display target
 
 #### Scenario: A binding receipt is invalid
 - **WHEN** a plan names another provider as receipt owner or its successful command returns an invalid binding

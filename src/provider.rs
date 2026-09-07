@@ -2155,12 +2155,12 @@ fn lifecycle_owner(
     capability: Capability,
     request: &Value,
 ) -> Result<Option<String>> {
-    if !matches!(
-        capability,
-        Capability::SessionStop | Capability::ExecutionCancel
-    ) {
-        return Ok(None);
-    }
+    let owner_kind = match capability {
+        Capability::SessionStop => "persistence",
+        Capability::TerminalFocus => "display",
+        Capability::ExecutionCancel => "execution",
+        _ => return Ok(None),
+    };
     let session = request
         .get("session")
         .and_then(Value::as_object)
@@ -2175,6 +2175,7 @@ fn lifecycle_owner(
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
+        .filter(|binding| binding.get("kind").and_then(Value::as_str) == Some(owner_kind))
         .filter(|binding| binding.get("status").and_then(Value::as_str) == Some("active"))
         .filter(|binding| {
             binding
@@ -3963,6 +3964,44 @@ exit 0
         assert_eq!(
             lifecycle_owner(&[higher_priority, owner], Capability::SessionStop, &request,)
                 .expect("active owner"),
+            Some("owner".into())
+        );
+    }
+
+    #[test]
+    fn focus_uses_the_provider_that_owns_the_active_display_binding() {
+        let command = Path::new("provider");
+        let mut higher_priority = provider_manifest("higher-priority", command, 100);
+        higher_priority.actions =
+            BTreeMap::from([(Capability::TerminalFocus, "Focus a terminal".into())]);
+        let mut owner = provider_manifest("owner", command, 0);
+        owner.actions = higher_priority.actions.clone();
+        let request = json!({
+            "session": {
+                "providers": [
+                    {
+                        "provider": "higher-priority",
+                        "kind": "persistence",
+                        "ref": "unrelated-session",
+                        "status": "active"
+                    },
+                    {
+                        "provider": "owner",
+                        "kind": "display",
+                        "ref": "owned-pane",
+                        "status": "active"
+                    }
+                ]
+            }
+        });
+
+        assert_eq!(
+            lifecycle_owner(
+                &[higher_priority, owner],
+                Capability::TerminalFocus,
+                &request,
+            )
+            .expect("active display owner"),
             Some("owner".into())
         );
     }

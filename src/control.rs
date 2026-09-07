@@ -603,6 +603,18 @@ fn register_for_caller(
             .map(|session| session.providers.clone())
             .filter(|bindings| !bindings.is_empty())
             .unwrap_or(initial_bindings);
+        let mut provider_revisions = current
+            .as_ref()
+            .map(|session| session.provider_revisions.clone())
+            .unwrap_or_default();
+        bump_changed_provider_revisions(
+            &mut provider_revisions,
+            current
+                .as_ref()
+                .map(|session| session.providers.as_slice())
+                .unwrap_or_default(),
+            &session_providers,
+        );
         let registration = governed.map_or(link.source, |session| session.registration);
         if registration == RegistrationSource::Managed && session_providers.is_empty() {
             bail!(
@@ -664,6 +676,7 @@ fn register_for_caller(
                         .or_else(|| env::var("ORC_PROVIDER_REF").ok())
                 }),
             providers: session_providers,
+            provider_revisions,
             directory: scope.display().to_string(),
             registration,
             status: governed.map_or(LifecycleStatus::Working, |session| session.status),
@@ -830,6 +843,7 @@ pub fn adopt(scope: &Path, mut contract: Contract, native_id: Option<String>) ->
             node_id: None,
             provider_ref: None,
             providers: Vec::new(),
+            provider_revisions: BTreeMap::new(),
             directory: scope.display().to_string(),
             registration: RegistrationSource::Connected,
             status: LifecycleStatus::Working,
@@ -1018,17 +1032,10 @@ fn terminate_resolved(
                 .iter_mut()
                 .find(|candidate| candidate.id == id)
                 .with_context(|| format!("unknown session: {id}"))?;
-            for binding in &bindings {
-                let existing = selected.providers.iter().position(|candidate| {
-                    candidate.provider == binding.provider && candidate.kind == binding.kind
-                });
-                if binding.status == crate::domain::BindingStatus::Active || existing.is_none() {
-                    if let Some(index) = existing {
-                        selected.providers[index] = binding.clone();
-                    } else {
-                        selected.providers.push(binding.clone());
-                    }
-                }
+            let reconciled = reconcile_termination_bindings(&session.providers, &bindings);
+            let merged = merge_observed_bindings(&session, selected, &reconciled);
+            if replace_provider_bindings(selected, merged) {
+                touch_session(selected);
             }
             Ok(())
         })?;
@@ -1487,7 +1494,7 @@ fn bind_current_session_with(
             .iter_mut()
             .find(|candidate| candidate.id == id)
             .with_context(|| format!("unknown session: {id}"))?;
-        apply_enrichment(selected, &bindings, None, None);
+        apply_observed_enrichment(selected, &session, &bindings, None, None);
         Ok(workspace.clone())
     })
 }
@@ -1547,7 +1554,18 @@ pub fn reconcile_with_current(
                 .iter_mut()
                 .find(|candidate| candidate.id == *id)
                 .context("session disappeared")?;
-            apply_enrichment(selected, bindings, title.as_deref(), goal.as_deref());
+            let observed = snapshot
+                .sessions
+                .iter()
+                .find(|candidate| candidate.id == *id)
+                .context("observed session disappeared")?;
+            apply_observed_enrichment(
+                selected,
+                observed,
+                bindings,
+                title.as_deref(),
+                goal.as_deref(),
+            );
         }
         Ok(workspace.clone())
     })
@@ -1595,35 +1613,165 @@ fn current_rebind_selection(
         })
 }
 
+#[cfg(test)]
 fn apply_enrichment(
     session: &mut Session,
     bindings: &[crate::domain::ProviderBinding],
     title: Option<&str>,
     goal: Option<&str>,
 ) {
-    let liveness = reconciled_liveness(&session.providers, bindings);
-    let mut reconciled_bindings = bindings.to_vec();
-    for previous in session
-        .providers
+    let reconciled_bindings = reconcile_provider_bindings(&session.providers, bindings);
+    apply_enrichment_fields(session, reconciled_bindings, title, goal);
+}
+
+fn apply_observed_enrichment(
+    session: &mut Session,
+    observed: &Session,
+    bindings: &[crate::domain::ProviderBinding],
+    title: Option<&str>,
+    goal: Option<&str>,
+) {
+    let reconciled = reconcile_provider_bindings(&observed.providers, bindings);
+    let merged = merge_observed_bindings(observed, session, &reconciled);
+    apply_enrichment_fields(session, merged, title, goal);
+}
+
+fn reconcile_provider_bindings(
+    previous: &[ProviderBinding],
+    bindings: &[ProviderBinding],
+) -> Vec<ProviderBinding> {
+    let mut reconciled = bindings.to_vec();
+    for previous in previous
         .iter()
         .filter(|binding| provider::is_launch_ownership(binding))
     {
         let conclusive = bindings.iter().any(|binding| {
-            binding.provider == previous.provider
-                && binding.kind == previous.kind
+            same_binding_slot(binding, previous)
                 && matches!(
                     binding.status,
                     BindingStatus::Active | BindingStatus::Unavailable
                 )
         });
         if !conclusive {
-            reconciled_bindings.retain(|binding| {
-                binding.provider != previous.provider || binding.kind != previous.kind
-            });
-            reconciled_bindings.push(previous.clone());
+            reconciled.retain(|binding| !same_binding_slot(binding, previous));
+            reconciled.push(previous.clone());
         }
     }
-    session.providers = reconciled_bindings;
+    reconciled
+}
+
+fn reconcile_termination_bindings(
+    previous: &[ProviderBinding],
+    bindings: &[ProviderBinding],
+) -> Vec<ProviderBinding> {
+    let mut reconciled = previous.to_vec();
+    for binding in bindings {
+        let existing = reconciled
+            .iter()
+            .position(|candidate| same_binding_slot(candidate, binding));
+        if binding.status == BindingStatus::Active || existing.is_none() {
+            if let Some(index) = existing {
+                reconciled[index] = binding.clone();
+            } else {
+                reconciled.push(binding.clone());
+            }
+        }
+    }
+    reconciled
+}
+
+fn merge_observed_bindings(
+    observed: &Session,
+    current: &Session,
+    reconciled: &[ProviderBinding],
+) -> Vec<ProviderBinding> {
+    let mut merged = Vec::with_capacity(current.providers.len().max(reconciled.len()));
+    for candidate in reconciled {
+        let latest = current
+            .providers
+            .iter()
+            .find(|binding| same_binding_slot(binding, candidate));
+        if binding_revision(current, candidate) == binding_revision(observed, candidate) {
+            merged.push(candidate.clone());
+        } else if let Some(latest) = latest {
+            merged.push(latest.clone());
+        }
+    }
+    for latest in &current.providers {
+        if merged
+            .iter()
+            .any(|binding| same_binding_slot(binding, latest))
+        {
+            continue;
+        }
+        if binding_revision(current, latest) != binding_revision(observed, latest) {
+            merged.push(latest.clone());
+        }
+    }
+    merged
+}
+
+fn same_binding_slot(left: &ProviderBinding, right: &ProviderBinding) -> bool {
+    left.provider == right.provider && left.kind == right.kind
+}
+
+fn binding_revision_key(provider: &str, kind: ProviderKind) -> String {
+    format!("{kind}:{provider}")
+}
+
+fn binding_revision(session: &Session, binding: &ProviderBinding) -> u64 {
+    session
+        .provider_revisions
+        .get(&binding_revision_key(&binding.provider, binding.kind))
+        .copied()
+        .unwrap_or_default()
+}
+
+fn bump_changed_provider_revisions(
+    revisions: &mut BTreeMap<String, u64>,
+    previous: &[ProviderBinding],
+    current: &[ProviderBinding],
+) {
+    let slots = previous
+        .iter()
+        .chain(current)
+        .map(|binding| binding_revision_key(&binding.provider, binding.kind))
+        .collect::<BTreeSet<_>>();
+    for slot in slots {
+        let before = previous
+            .iter()
+            .find(|binding| binding_revision_key(&binding.provider, binding.kind) == slot);
+        let after = current
+            .iter()
+            .find(|binding| binding_revision_key(&binding.provider, binding.kind) == slot);
+        if before != after {
+            let revision = revisions.entry(slot).or_default();
+            *revision = revision.saturating_add(1);
+        }
+    }
+}
+
+fn replace_provider_bindings(session: &mut Session, bindings: Vec<ProviderBinding>) -> bool {
+    let previous = std::mem::replace(&mut session.providers, bindings);
+    if session.providers == previous {
+        return false;
+    }
+    bump_changed_provider_revisions(
+        &mut session.provider_revisions,
+        &previous,
+        &session.providers,
+    );
+    true
+}
+
+fn apply_enrichment_fields(
+    session: &mut Session,
+    reconciled_bindings: Vec<ProviderBinding>,
+    title: Option<&str>,
+    goal: Option<&str>,
+) {
+    let liveness = reconciled_liveness(&session.providers, &reconciled_bindings);
+    replace_provider_bindings(session, reconciled_bindings);
     if let Some(is_live) = liveness
         && session.status != LifecycleStatus::Terminating
     {
@@ -1632,7 +1780,7 @@ fn apply_enrichment(
         } else if !is_live && session.status.active() {
             session.status = LifecycleStatus::Disconnected;
         }
-        session.updated_at = Utc::now();
+        touch_session(session);
     }
     if let Some(title) = title
         && (session.title == "Agent session" || session.title == session.id)
@@ -1644,6 +1792,15 @@ fn apply_enrichment(
     {
         session.goal = goal.to_owned();
     }
+}
+
+fn touch_session(session: &mut Session) {
+    let now = Utc::now();
+    session.updated_at = if now > session.updated_at {
+        now
+    } else {
+        session.updated_at + chrono::TimeDelta::nanoseconds(1)
+    };
 }
 
 fn reconciled_liveness(
@@ -2284,7 +2441,6 @@ fn attach_with_output(
     let session = selected_session(&workspace, id)?.clone();
     let providers = provider::discover(config)?;
     let prefer_focus = action == provider::Action::Attach
-        && session.status.active()
         && session.providers.iter().any(|binding| {
             binding.kind == crate::domain::ProviderKind::Display
                 && binding.status == crate::domain::BindingStatus::Active
@@ -2336,6 +2492,7 @@ fn persist_provider_binding(
             .iter_mut()
             .find(|session| session.id == session_id)
             .with_context(|| format!("session disappeared while attaching: {session_id}"))?;
+        let previous = session.providers.clone();
         if let Some(existing) = session
             .providers
             .iter_mut()
@@ -2345,7 +2502,12 @@ fn persist_provider_binding(
         } else {
             session.providers.push(binding);
         }
-        session.updated_at = Utc::now();
+        bump_changed_provider_revisions(
+            &mut session.provider_revisions,
+            &previous,
+            &session.providers,
+        );
+        touch_session(session);
         Ok(())
     })
 }
@@ -2374,7 +2536,7 @@ fn execute_attach_with(
                 });
             }
             Ok((code, false)) => Some(format!("focus exited with {code}")),
-            Err(error) => Some(format!("focus failed: {error:#}")),
+            Err(error) => return Err(error.context("focus failed without opening a duplicate")),
         }
     } else {
         None
@@ -2549,31 +2711,43 @@ fn finalize_managed_launch(config: &Config, scope: &Path, session_id: &str) -> R
     }
     let providers = provider::discover(config)?;
     let bindings = provider::discover_bindings(config, &providers, scope, &session, false);
-    let still_active = bindings.iter().any(|binding| {
-        binding.status == BindingStatus::Active
-            && matches!(
-                binding.kind,
-                ProviderKind::Persistence | ProviderKind::Execution
-            )
-    });
     state::update(scope, |workspace| {
         let selected = workspace
             .sessions
             .iter_mut()
             .find(|candidate| candidate.id == session_id)
             .with_context(|| format!("unknown session: {session_id}"))?;
-        if selected.status != LifecycleStatus::Terminating {
-            apply_enrichment(selected, &bindings, None, None);
+        if managed_finalization_allowed(selected.status) {
+            apply_observed_enrichment(selected, &session, &bindings, None, None);
+            let still_active = has_active_runtime_binding(&selected.providers);
             if !still_active {
                 selected.status = LifecycleStatus::Done;
+                let previous = selected.providers.clone();
                 selected
                     .providers
                     .retain(|binding| !provider::is_launch_ownership(binding));
+                bump_changed_provider_revisions(
+                    &mut selected.provider_revisions,
+                    &previous,
+                    &selected.providers,
+                );
                 selected.updated_at = Utc::now();
             }
         }
         Ok(())
     })
+}
+
+fn managed_finalization_allowed(status: LifecycleStatus) -> bool {
+    !matches!(
+        status,
+        LifecycleStatus::Terminating
+            | LifecycleStatus::Failed
+            | LifecycleStatus::Done
+            | LifecycleStatus::Cancelled
+            | LifecycleStatus::Archived
+            | LifecycleStatus::Skipped
+    )
 }
 
 fn wait_for_managed_launch(
@@ -2592,23 +2766,20 @@ fn wait_for_managed_launch(
             bail!("managed session was cancelled during launch: {session_id}");
         }
         let bindings = provider::discover_bindings(config, providers, scope, &session, false);
-        if bindings.iter().any(|binding| {
-            binding.status == BindingStatus::Active
-                && matches!(
-                    binding.kind,
-                    ProviderKind::Persistence | ProviderKind::Execution
-                )
-        }) {
-            state::update(scope, |workspace| {
+        if has_active_runtime_binding(&bindings) {
+            let ready = state::update(scope, |workspace| {
                 let selected = workspace
                     .sessions
                     .iter_mut()
                     .find(|candidate| candidate.id == session_id)
                     .with_context(|| format!("unknown session: {session_id}"))?;
-                apply_enrichment(selected, &bindings, None, None);
-                Ok(())
+                Ok(apply_observed_runtime_readiness(
+                    selected, &session, &bindings,
+                ))
             })?;
-            return Ok(());
+            if ready {
+                return Ok(());
+            }
         }
         if let Some(status) = child.try_wait()?
             && !status.success()
@@ -2620,6 +2791,30 @@ fn wait_for_managed_launch(
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
+}
+
+fn has_active_runtime_binding(bindings: &[ProviderBinding]) -> bool {
+    bindings.iter().any(|binding| {
+        !provider::is_launch_ownership(binding)
+            && binding.status == BindingStatus::Active
+            && matches!(
+                binding.kind,
+                ProviderKind::Persistence | ProviderKind::Execution
+            )
+            && binding
+                .r#ref
+                .as_deref()
+                .is_some_and(|reference| !reference.is_empty())
+    })
+}
+
+fn apply_observed_runtime_readiness(
+    session: &mut Session,
+    observed: &Session,
+    bindings: &[ProviderBinding],
+) -> bool {
+    apply_observed_enrichment(session, observed, bindings, None, None);
+    has_active_runtime_binding(&session.providers)
 }
 
 pub fn require_id(id: Option<String>) -> Result<String> {
@@ -2780,6 +2975,35 @@ case "$request" in
 esac
 "#;
 
+    const RACING_DISPLAY_RECEIPT_PROVIDER: &str = r#"#!/bin/sh
+case "${1:-}" in
+  open)
+    printf 'open\n' >> "$2"
+    printf '%s\n' '{"version":"orc.provider/v1","binding":{"kind":"display","status":"active","ref":"pane-7","label":"test pane"}}'
+    exit 0
+    ;;
+  focus)
+    printf 'focus\n' >> "$2"
+    exit 0
+    ;;
+esac
+request=$(cat)
+case "$request" in
+  *session.bind*)
+    : > '{{ resolving }}'
+    while [ ! -e '{{ release }}' ]; do sleep 0.01; done
+    printf '%s\n' '{"version":"orc.provider/v1","binding":{"kind":"display","status":"available","label":"test pane"}}'
+    ;;
+  *terminal.open*)
+    jq -n --arg command "$0" --arg marker '{{ opened }}' '{version:"orc.provider/v1",command:[$command,"open",$marker],receipt:{type:"providerBinding",provider:"display"}}'
+    ;;
+  *terminal.focus*)
+    jq -n --arg command "$0" --arg marker '{{ focused }}' '{version:"orc.provider/v1",command:[$command,"focus",$marker]}'
+    ;;
+  *) printf '%s\n' 'null' ;;
+esac
+"#;
+
     const ATTACH_PROVIDER_MANIFEST: &str = r#"version: orc.provider/v1
 name: harness
 kind: persistence
@@ -2793,6 +3017,16 @@ name: display
 kind: display
 command: {{ command }}
 actions:
+  terminal.open: Open a terminal pane
+  terminal.focus: Focus a terminal pane
+"#;
+
+    const RACING_DISPLAY_RECEIPT_MANIFEST: &str = r#"version: orc.provider/v1
+name: display
+kind: display
+command: {{ command }}
+actions:
+  session.bind: Inspect a terminal binding
   terminal.open: Open a terminal pane
   terminal.focus: Focus a terminal pane
 "#;
@@ -2911,6 +3145,7 @@ actions:
             node_id: None,
             provider_ref: None,
             providers: Vec::new(),
+            provider_revisions: BTreeMap::new(),
             directory: "/tmp".into(),
             registration: RegistrationSource::Connected,
             status,
@@ -6565,6 +6800,321 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
     }
 
     #[test]
+    fn reconciliation_preserves_a_binding_changed_after_observation() {
+        let mut observed = session(
+            "session",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+        );
+        observed.providers = vec![binding(
+            "display",
+            ProviderKind::Display,
+            BindingStatus::Available,
+        )];
+        let mut selected = observed.clone();
+        selected.providers = vec![ProviderBinding {
+            provider: "display".into(),
+            kind: ProviderKind::Display,
+            r#ref: Some("pane-7".into()),
+            status: BindingStatus::Active,
+            label: "test pane".into(),
+        }];
+        bump_changed_provider_revisions(
+            &mut selected.provider_revisions,
+            &observed.providers,
+            &selected.providers,
+        );
+
+        apply_observed_enrichment(&mut selected, &observed, &observed.providers, None, None);
+
+        assert_eq!(selected.providers.len(), 1);
+        assert_eq!(selected.providers[0].status, BindingStatus::Active);
+        assert_eq!(selected.providers[0].r#ref.as_deref(), Some("pane-7"));
+        assert_eq!(selected.status, LifecycleStatus::Working);
+    }
+
+    #[test]
+    fn reconciliation_preserves_a_concurrent_binding_removal() {
+        let mut observed = session(
+            "session",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+        );
+        let available = binding("display", ProviderKind::Display, BindingStatus::Available);
+        observed.providers = vec![available.clone()];
+        let mut selected = observed.clone();
+        selected.providers.clear();
+        bump_changed_provider_revisions(
+            &mut selected.provider_revisions,
+            &observed.providers,
+            &selected.providers,
+        );
+
+        apply_observed_enrichment(&mut selected, &observed, &[available], None, None);
+
+        assert!(selected.providers.is_empty());
+    }
+
+    #[test]
+    fn reconciliation_preserves_a_new_binding_when_observation_returns_nothing() {
+        let observed = session(
+            "session",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+        );
+        let mut selected = observed.clone();
+        selected.providers = vec![ProviderBinding {
+            provider: "display".into(),
+            kind: ProviderKind::Display,
+            r#ref: Some("pane-7".into()),
+            status: BindingStatus::Active,
+            label: "test pane".into(),
+        }];
+        bump_changed_provider_revisions(
+            &mut selected.provider_revisions,
+            &observed.providers,
+            &selected.providers,
+        );
+
+        apply_observed_enrichment(&mut selected, &observed, &[], None, None);
+
+        assert_eq!(selected.providers.len(), 1);
+        assert_eq!(selected.providers[0].r#ref.as_deref(), Some("pane-7"));
+    }
+
+    #[test]
+    fn reconciliation_does_not_revive_a_concurrently_cancelled_session() {
+        let observed = session(
+            "session",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+        );
+        let mut selected = observed.clone();
+        selected.status = LifecycleStatus::Cancelled;
+        let live = ProviderBinding {
+            provider: "display".into(),
+            kind: ProviderKind::Display,
+            r#ref: Some("pane-7".into()),
+            status: BindingStatus::Active,
+            label: "test pane".into(),
+        };
+
+        apply_observed_enrichment(&mut selected, &observed, &[live], None, None);
+
+        assert_eq!(selected.status, LifecycleStatus::Cancelled);
+    }
+
+    #[test]
+    fn reconciliation_revision_guard_closes_identical_value_aba() {
+        let mut observed = session(
+            "session",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+        );
+        observed.providers = vec![ProviderBinding {
+            provider: "display".into(),
+            kind: ProviderKind::Display,
+            r#ref: Some("pane-7".into()),
+            status: BindingStatus::Active,
+            label: "test pane".into(),
+        }];
+        let mut selected = observed.clone();
+        let removed = Vec::new();
+        bump_changed_provider_revisions(
+            &mut selected.provider_revisions,
+            &observed.providers,
+            &removed,
+        );
+        bump_changed_provider_revisions(
+            &mut selected.provider_revisions,
+            &removed,
+            &selected.providers,
+        );
+        let available = binding("display", ProviderKind::Display, BindingStatus::Available);
+
+        apply_observed_enrichment(&mut selected, &observed, &[available], None, None);
+
+        assert_eq!(selected.providers, observed.providers);
+        assert_eq!(binding_revision(&selected, &selected.providers[0]), 2);
+    }
+
+    #[test]
+    fn unrelated_display_change_still_commits_runtime_observation() {
+        let mut observed = session("session", SessionRole::Worker, LifecycleStatus::Working);
+        observed.providers = vec![
+            ProviderBinding {
+                provider: "persistence".into(),
+                kind: ProviderKind::Persistence,
+                r#ref: Some("runtime".into()),
+                status: BindingStatus::Active,
+                label: "runtime".into(),
+            },
+            binding("display", ProviderKind::Display, BindingStatus::Available),
+        ];
+        let mut selected = observed.clone();
+        selected.providers[1] = ProviderBinding {
+            provider: "display".into(),
+            kind: ProviderKind::Display,
+            r#ref: Some("pane-7".into()),
+            status: BindingStatus::Active,
+            label: "test pane".into(),
+        };
+        bump_changed_provider_revisions(
+            &mut selected.provider_revisions,
+            &observed.providers,
+            &selected.providers,
+        );
+        let discovered = vec![
+            ProviderBinding {
+                status: BindingStatus::Unavailable,
+                r#ref: None,
+                ..observed.providers[0].clone()
+            },
+            observed.providers[1].clone(),
+        ];
+
+        apply_observed_enrichment(&mut selected, &observed, &discovered, None, None);
+
+        assert_eq!(selected.providers[0].status, BindingStatus::Unavailable);
+        assert_eq!(selected.providers[0].r#ref, None);
+        assert_eq!(selected.providers[1].r#ref.as_deref(), Some("pane-7"));
+        assert!(!has_active_runtime_binding(&selected.providers));
+    }
+
+    #[test]
+    fn termination_discovery_cannot_replace_a_concurrent_display_receipt() {
+        let mut observed = session(
+            "session",
+            SessionRole::Orchestrator,
+            LifecycleStatus::Working,
+        );
+        observed.providers = vec![ProviderBinding {
+            provider: "display".into(),
+            kind: ProviderKind::Display,
+            r#ref: Some("pane-old".into()),
+            status: BindingStatus::Active,
+            label: "old pane".into(),
+        }];
+        let mut selected = observed.clone();
+        selected.providers[0].r#ref = Some("pane-new".into());
+        selected.providers[0].label = "new pane".into();
+        bump_changed_provider_revisions(
+            &mut selected.provider_revisions,
+            &observed.providers,
+            &selected.providers,
+        );
+        let reconciled = reconcile_termination_bindings(&observed.providers, &observed.providers);
+        let merged = merge_observed_bindings(&observed, &selected, &reconciled);
+
+        replace_provider_bindings(&mut selected, merged);
+
+        assert_eq!(selected.providers[0].r#ref.as_deref(), Some("pane-new"));
+        assert_eq!(selected.providers[0].label, "new pane");
+    }
+
+    #[test]
+    fn readiness_uses_the_binding_state_committed_after_merge() {
+        let mut observed = session("session", SessionRole::Worker, LifecycleStatus::Working);
+        observed.providers = vec![ProviderBinding {
+            provider: "persistence".into(),
+            kind: ProviderKind::Persistence,
+            r#ref: Some("live-session".into()),
+            status: BindingStatus::Active,
+            label: "live session".into(),
+        }];
+        let mut selected = observed.clone();
+        selected.providers[0].status = BindingStatus::Unavailable;
+        selected.providers[0].r#ref = None;
+        bump_changed_provider_revisions(
+            &mut selected.provider_revisions,
+            &observed.providers,
+            &selected.providers,
+        );
+
+        let ready = apply_observed_runtime_readiness(&mut selected, &observed, &observed.providers);
+
+        assert!(!ready);
+        assert_eq!(selected.providers[0].status, BindingStatus::Unavailable);
+        assert_eq!(selected.providers[0].r#ref, None);
+    }
+
+    #[test]
+    fn launch_ownership_reservations_are_not_runtime_readiness() {
+        let mut reservation = binding(
+            "persistence",
+            ProviderKind::Persistence,
+            BindingStatus::Active,
+        );
+        reservation.r#ref = Some("reserved-session".into());
+        reservation.label = "Launch ownership: persistence".into();
+        let mut live = reservation.clone();
+        live.label = "live session".into();
+
+        assert!(!has_active_runtime_binding(&[reservation]));
+        assert!(has_active_runtime_binding(&[live]));
+    }
+
+    #[test]
+    fn managed_finalization_retires_only_synthetic_lifecycle_owners() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let scope_directory = directory.path().join("scope");
+        let provider_directory = directory.path().join("providers");
+        fs::create_dir_all(&scope_directory).expect("scope");
+        fs::create_dir_all(&provider_directory).expect("providers");
+        let scope = fs::canonicalize(scope_directory).expect("canonical scope");
+        let config = Config {
+            providers: crate::config::ProviderConfig {
+                directory: provider_directory,
+                ..crate::config::ProviderConfig::default()
+            },
+            ..Config::default()
+        };
+        let session = register(&scope, Contract::default(), SessionLink::default())
+            .expect("registered session");
+        state::update(&scope, |workspace| {
+            let selected = workspace
+                .sessions
+                .iter_mut()
+                .find(|candidate| candidate.id == session.id)
+                .expect("session remains");
+            selected.registration = RegistrationSource::Managed;
+            selected.providers = [ProviderKind::Persistence, ProviderKind::Execution]
+                .into_iter()
+                .map(|kind| ProviderBinding {
+                    provider: kind.to_string(),
+                    kind,
+                    r#ref: Some(session.id.clone()),
+                    status: BindingStatus::Active,
+                    label: format!("Launch ownership: {kind}"),
+                })
+                .collect();
+            let previous = Vec::new();
+            bump_changed_provider_revisions(
+                &mut selected.provider_revisions,
+                &previous,
+                &selected.providers,
+            );
+            Ok(())
+        })
+        .expect("install lifecycle reservations");
+
+        finalize_managed_launch(&config, &scope, &session.id).expect("finalize managed launch");
+
+        let finalized = selected_session(&state::read(&scope).expect("state"), &session.id)
+            .expect("finalized session")
+            .clone();
+        assert_eq!(finalized.status, LifecycleStatus::Done);
+        assert!(finalized.providers.is_empty());
+    }
+
+    #[test]
+    fn managed_finalization_cannot_overwrite_a_concurrent_failure() {
+        assert!(!managed_finalization_allowed(LifecycleStatus::Failed));
+        assert!(!managed_finalization_allowed(LifecycleStatus::Cancelled));
+        assert!(managed_finalization_allowed(LifecycleStatus::Disconnected));
+    }
+
+    #[test]
     fn reconciliation_preserves_launch_ownership_until_binding_is_conclusive() {
         let mut selected = session("session", SessionRole::Worker, LifecycleStatus::Working);
         let mut reservation = binding(
@@ -6845,9 +7395,27 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         assert!(outcome.accepted);
     }
 
+    #[test]
+    fn attach_does_not_open_after_ambiguous_focus_ownership() {
+        let mut calls = Vec::new();
+
+        let error = execute_attach_with(provider::Action::Attach, true, |action| {
+            calls.push(action);
+            Err(anyhow::anyhow!("ambiguous active display ownership"))
+        })
+        .expect_err("ambiguous focus must not open another display");
+
+        assert_eq!(calls, vec![provider::Action::Focus]);
+        assert!(
+            error
+                .to_string()
+                .contains("focus failed without opening a duplicate")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
-    fn attach_persists_display_receipt_then_focuses_without_opening_again() {
+    fn disconnected_session_with_an_active_display_receipt_focuses_without_opening_again() {
         let directory = tempfile::tempdir().expect("fixture");
         let scope_directory = directory.path().join("scope");
         let provider_directory = directory.path().join("providers");
@@ -6931,6 +7499,126 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         let attached = selected_session(&state::read(&scope).expect("state"), &session.id)
             .expect("attached session")
             .clone();
+        assert!(attached.providers.iter().any(|binding| {
+            binding.provider == "display"
+                && binding.kind == ProviderKind::Display
+                && binding.status == BindingStatus::Active
+                && binding.r#ref.as_deref() == Some("pane-7")
+        }));
+        state::update(&scope, |workspace| {
+            let attached = workspace
+                .sessions
+                .iter_mut()
+                .find(|candidate| candidate.id == session.id)
+                .expect("attached session remains");
+            attached.status = LifecycleStatus::Disconnected;
+            touch_session(attached);
+            Ok(())
+        })
+        .expect("disconnect attached session");
+
+        let second = attach_quiet(
+            &config,
+            &scope,
+            &session.id,
+            provider::Action::Attach,
+            "right",
+        )
+        .expect("second attach");
+        assert_eq!(second.disposition, AttachDisposition::Focused);
+        assert_eq!(fs::read_to_string(&opened).expect("open marker"), "open\n");
+        assert_eq!(
+            fs::read_to_string(&focused).expect("focus marker"),
+            "focus\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_reconciliation_cannot_replace_an_attach_receipt() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let scope_directory = directory.path().join("scope");
+        let provider_directory = directory.path().join("providers");
+        fs::create_dir_all(&scope_directory).expect("scope");
+        fs::create_dir_all(&provider_directory).expect("providers");
+        let scope = fs::canonicalize(scope_directory).expect("canonical scope");
+        let attach_provider = directory.path().join("attach.sh");
+        let display_provider = directory.path().join("display.sh");
+        let resolving = directory.path().join("resolving");
+        let release = directory.path().join("release");
+        let opened = directory.path().join("opened");
+        let focused = directory.path().join("focused");
+        fs::write(&attach_provider, ATTACH_PROVIDER).expect("attach provider");
+        fs::write(
+            &display_provider,
+            render_fixture(
+                RACING_DISPLAY_RECEIPT_PROVIDER,
+                serde_json::json!({
+                    "resolving": resolving.display().to_string(),
+                    "release": release.display().to_string(),
+                    "opened": opened.display().to_string(),
+                    "focused": focused.display().to_string(),
+                }),
+            ),
+        )
+        .expect("display provider");
+        for provider in [&attach_provider, &display_provider] {
+            fs::set_permissions(provider, fs::Permissions::from_mode(0o755))
+                .expect("provider executable");
+        }
+        fs::write(
+            provider_directory.join("harness.yaml"),
+            render_fixture(
+                ATTACH_PROVIDER_MANIFEST,
+                serde_json::json!({ "command": attach_provider.display().to_string() }),
+            ),
+        )
+        .expect("attach manifest");
+        fs::write(
+            provider_directory.join("display.yaml"),
+            render_fixture(
+                RACING_DISPLAY_RECEIPT_MANIFEST,
+                serde_json::json!({ "command": display_provider.display().to_string() }),
+            ),
+        )
+        .expect("display manifest");
+        let config = Config {
+            providers: crate::config::ProviderConfig {
+                directory: provider_directory,
+                ..crate::config::ProviderConfig::default()
+            },
+            ..Config::default()
+        };
+        let session = register(&scope, Contract::default(), SessionLink::default())
+            .expect("registered session");
+
+        let reconcile_config = config.clone();
+        let reconcile_scope = scope.clone();
+        let reconciliation =
+            std::thread::spawn(move || reconcile(&reconcile_config, &reconcile_scope));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !resolving.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reconciliation did not reach the blocked provider"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let first = attach_quiet(
+            &config,
+            &scope,
+            &session.id,
+            provider::Action::Attach,
+            "right",
+        );
+        fs::write(&release, []).expect("release reconciliation");
+        let reconciled = reconciliation
+            .join()
+            .expect("reconciliation thread")
+            .expect("reconciliation succeeds");
+        first.expect("first attach succeeds");
+        let attached = selected_session(&reconciled, &session.id).expect("attached session");
         assert!(attached.providers.iter().any(|binding| {
             binding.provider == "display"
                 && binding.kind == ProviderKind::Display

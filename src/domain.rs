@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -325,6 +327,8 @@ pub struct Session {
     pub provider_ref: Option<String>,
     #[serde(default)]
     pub providers: Vec<ProviderBinding>,
+    #[serde(default)]
+    pub provider_revisions: BTreeMap<String, u64>,
     pub directory: String,
     pub registration: RegistrationSource,
     pub status: LifecycleStatus,
@@ -728,6 +732,7 @@ mod tests {
             node_id: None,
             provider_ref: None,
             providers: Vec::new(),
+            provider_revisions: BTreeMap::new(),
             directory: "/tmp".into(),
             registration: RegistrationSource::Connected,
             status,
