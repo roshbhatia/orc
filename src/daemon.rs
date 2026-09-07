@@ -24,7 +24,7 @@ use crate::{
     config::{self, Config},
     control,
     domain::{LifecycleStatus, RegistrationSource, Session},
-    provider, state, workflow,
+    preferences, provider, state, workflow,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -78,6 +78,8 @@ struct DaemonRuntimeConfig {
 pub struct SweepReport {
     pub monitored: usize,
     pub unreadable: usize,
+    pub recovered: Vec<String>,
+    pub blocked: Vec<String>,
     pub terminated: Vec<String>,
     pub failures: Vec<String>,
 }
@@ -582,7 +584,43 @@ fn sweep_scope_at_mode(
             return report;
         }
     };
-    if !persisted_only {
+    if persisted_only {
+        for run in workspace.runs.iter().filter(|run| {
+            run.status == LifecycleStatus::Working
+                || (run.status == LifecycleStatus::Queued
+                    && run.recovery.proposal.as_ref().is_some_and(|proposal| {
+                        proposal.action == crate::domain::RunRepairAction::RestartExecutor
+                    }))
+        }) {
+            report.monitored += 1;
+            match workflow::recover_persisted_inconsistent_run(scope, &run.id, now) {
+                Ok(workflow::RunRecoveryOutcome::Blocked) => {
+                    report.blocked.push(run.id.clone());
+                }
+                Ok(
+                    workflow::RunRecoveryOutcome::Unchanged
+                    | workflow::RunRecoveryOutcome::Deferred
+                    | workflow::RunRecoveryOutcome::Restarted
+                    | workflow::RunRecoveryOutcome::Reconciled,
+                ) => {}
+                Err(error) => report.failures.push(format!(
+                    "recover persisted workflow {} in {}: {error:#}",
+                    run.id,
+                    scope.display()
+                )),
+            }
+        }
+    } else {
+        let autonomy = match preferences::read(scope) {
+            Ok(preferences) => preferences.autonomy,
+            Err(error) => {
+                report.failures.push(format!(
+                    "read workspace recovery mode for {}: {error:#}",
+                    scope.display()
+                ));
+                crate::preferences::AutonomyMode::Supervised
+            }
+        };
         for run in workspace.runs.iter().filter(|run| {
             (run.status == LifecycleStatus::Terminating
                 && run.parent_run_id.as_ref().is_none_or(|parent_id| {
@@ -593,7 +631,12 @@ fn sweep_scope_at_mode(
                 || (run.resume_requested
                     && run.status.active()
                     && run.status != LifecycleStatus::Terminating)
-                || (run.status == LifecycleStatus::Working && run.process_id.is_some())
+                || run.status == LifecycleStatus::Working
+                || (run.status == LifecycleStatus::Queued
+                    && run.recovery.proposal.as_ref().is_some_and(|proposal| {
+                        proposal.action == crate::domain::RunRepairAction::RestartExecutor
+                            && proposal.authority == crate::domain::GateAuthority::Orchestrator
+                    }))
         }) {
             report.monitored += 1;
             if run.status == LifecycleStatus::Terminating {
@@ -606,7 +649,7 @@ fn sweep_scope_at_mode(
                 }
                 continue;
             }
-            if run.resume_requested {
+            if run.resume_requested && run.status != LifecycleStatus::Working {
                 if let Err(error) = workflow::spawn(config, scope, &run.id) {
                     report.failures.push(format!(
                         "resume workflow {} in {}: {error:#}",
@@ -616,19 +659,22 @@ fn sweep_scope_at_mode(
                 }
                 continue;
             }
-            match workflow::executor_active(scope, run) {
-                Ok(true) => {}
-                Ok(false) => {
-                    if let Err(error) = workflow::spawn(config, scope, &run.id) {
-                        report.failures.push(format!(
-                            "recover workflow {} in {}: {error:#}",
-                            run.id,
-                            scope.display()
-                        ));
-                    }
+            match workflow::recover_inconsistent_run(config, scope, &run.id, autonomy, now) {
+                Ok(
+                    workflow::RunRecoveryOutcome::Restarted
+                    | workflow::RunRecoveryOutcome::Reconciled,
+                ) => {
+                    report.recovered.push(run.id.clone());
                 }
+                Ok(workflow::RunRecoveryOutcome::Blocked) => {
+                    report.blocked.push(run.id.clone());
+                }
+                Ok(
+                    workflow::RunRecoveryOutcome::Unchanged
+                    | workflow::RunRecoveryOutcome::Deferred,
+                ) => {}
                 Err(error) => report.failures.push(format!(
-                    "inspect workflow {} in {}: {error:#}",
+                    "recover workflow {} in {}: {error:#}",
                     run.id,
                     scope.display()
                 )),
@@ -748,6 +794,8 @@ fn failed_termination_reason<'a>(
 fn merge_report(report: &mut SweepReport, addition: SweepReport) {
     report.monitored += addition.monitored;
     report.unreadable += addition.unreadable;
+    report.recovered.extend(addition.recovered);
+    report.blocked.extend(addition.blocked);
     report.terminated.extend(addition.terminated);
     report.failures.extend(addition.failures);
 }
@@ -1159,6 +1207,66 @@ actions:
         let _ = fs::remove_file(state_file);
     }
 
+    #[test]
+    fn deleted_workspace_blocks_working_runs_with_a_repair_proposal() {
+        let directory = tempfile::tempdir().expect("daemon fixture");
+        let scope_directory = directory.path().join("deleted-workspace");
+        fs::create_dir_all(&scope_directory).expect("workspace");
+        let scope = fs::canonicalize(scope_directory).expect("canonical workspace");
+        let run = control::create_run(
+            &scope,
+            "persisted".into(),
+            "finish persisted work".into(),
+            "verified output".into(),
+            None,
+            None,
+            None,
+        )
+        .expect("run");
+        control::upsert_node(
+            &scope,
+            &run.id,
+            control::NodeSpec {
+                id: "work".into(),
+                contract: Contract::default(),
+                session_id: None,
+                status: Some(LifecycleStatus::Working),
+                attempt: Some(2),
+                depends_on: Vec::new(),
+                execution: None,
+                judge_policy: None,
+            },
+        )
+        .expect("working node");
+        control::update_run(&scope, &run.id, LifecycleStatus::Working).expect("working run");
+        let state_file = state::path(&scope);
+        fs::remove_dir_all(&scope).expect("delete workspace");
+
+        let report = sweep_state_file(&Config::default(), &state_file, Utc::now());
+        let recovered = state::read(&scope).expect("persisted state");
+        let recovered = recovered
+            .runs
+            .iter()
+            .find(|candidate| candidate.id == run.id)
+            .expect("run");
+
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.blocked, vec![run.id.clone()]);
+        assert_eq!(recovered.status, LifecycleStatus::Blocked);
+        assert_eq!(recovered.nodes[0].status, LifecycleStatus::Blocked);
+        assert_eq!(recovered.nodes[0].attempt, 2);
+        assert_eq!(
+            recovered
+                .recovery
+                .proposal
+                .as_ref()
+                .expect("repair proposal")
+                .action,
+            crate::domain::RunRepairAction::RestoreDefinition
+        );
+        let _ = fs::remove_file(state_file);
+    }
+
     fn session(at: DateTime<Utc>) -> Session {
         Session {
             id: "worker".into(),
@@ -1393,6 +1501,166 @@ actions:
                 .expect("run")
                 .status,
             LifecycleStatus::Cancelled
+        );
+        let _ = fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn sweep_blocks_manual_work_without_an_executor_or_assignment_once() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = directory.path().join("scope");
+        fs::create_dir_all(&scope).expect("scope directory");
+        let scope = fs::canonicalize(scope).expect("canonical scope");
+        let run = control::create_run(
+            &scope,
+            "orphan work".into(),
+            "recover inconsistent state".into(),
+            "blocked repair proposal".into(),
+            None,
+            None,
+            None,
+        )
+        .expect("run");
+        control::upsert_node(
+            &scope,
+            &run.id,
+            control::NodeSpec {
+                id: "work".into(),
+                contract: Contract::default(),
+                session_id: None,
+                status: Some(LifecycleStatus::Working),
+                attempt: Some(2),
+                depends_on: Vec::new(),
+                execution: None,
+                judge_policy: None,
+            },
+        )
+        .expect("working node");
+        control::update_run(&scope, &run.id, LifecycleStatus::Working).expect("working run");
+
+        let first = sweep_scope_at(&Config::default(), &scope, Utc::now());
+        let after_first = state::read(&scope).expect("recovered state");
+        let recovered = after_first
+            .runs
+            .iter()
+            .find(|candidate| candidate.id == run.id)
+            .expect("run");
+        let event_count = recovered.recovery.events.len();
+
+        assert!(first.failures.is_empty(), "{:?}", first.failures);
+        assert_eq!(first.blocked, vec![run.id.clone()]);
+        assert_eq!(recovered.status, LifecycleStatus::Blocked);
+        assert_eq!(recovered.nodes[0].status, LifecycleStatus::Blocked);
+        assert_eq!(recovered.nodes[0].attempt, 2);
+        assert_eq!(
+            recovered
+                .recovery
+                .proposal
+                .as_ref()
+                .expect("proposal")
+                .action,
+            crate::domain::RunRepairAction::ResolveAssignment
+        );
+
+        let second = sweep_scope_at(&Config::default(), &scope, Utc::now());
+        let after_second = state::read(&scope).expect("stable state");
+        assert!(second.blocked.is_empty());
+        assert_eq!(
+            after_second.runs[0].recovery.events.len(),
+            event_count,
+            "repeated sweep must not append duplicate recovery events"
+        );
+        let _ = fs::remove_file(state::path(&scope));
+    }
+
+    #[test]
+    fn sweep_blocks_interrupted_supervised_workflow_without_replaying_it() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope_directory = directory.path().join("scope");
+        let providers = directory.path().join("providers");
+        fs::create_dir_all(&scope_directory).expect("scope directory");
+        fs::create_dir_all(&providers).expect("provider directory");
+        let scope = fs::canonicalize(scope_directory).expect("canonical scope");
+        let mut config = Config::default();
+        config.providers.directory = providers;
+        config.workflows.repository = directory.path().join("workflows");
+        config.workflows.auto_commit = false;
+        control::register(
+            &scope,
+            Contract {
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some("root".into()),
+                native_id: Some("root-native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("orchestrator");
+        let definition = crate::workflow::Definition {
+            name: "recover".into(),
+            goal: "recover without replay".into(),
+            expected_output: "blocked interrupted stage".into(),
+            entry_point: "write".into(),
+            steps: vec![crate::workflow::Step {
+                name: "write".into(),
+                r#type: crate::workflow::StepKind::Set,
+                value: Some(serde_json::json!(true)),
+                ..crate::workflow::Step::default()
+            }],
+            ..crate::workflow::Definition::default()
+        };
+        let definition_path = directory.path().join("workflow.yaml");
+        fs::write(
+            &definition_path,
+            serde_yaml::to_string(&definition).expect("serialize workflow"),
+        )
+        .expect("workflow definition");
+        let run = crate::workflow::materialize(
+            &config,
+            &scope,
+            &definition_path,
+            crate::domain::RunMode::Background,
+        )
+        .expect("materialize workflow");
+        state::update(&scope, |workspace| {
+            let current = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            current.status = LifecycleStatus::Working;
+            current.current_node = Some("write".into());
+            current.nodes[0].status = LifecycleStatus::Working;
+            current.nodes[0].attempt = 2;
+            Ok(())
+        })
+        .expect("interrupted state");
+
+        let report = sweep_scope_at(&config, &scope, Utc::now());
+        let recovered = state::read(&scope).expect("recovered state");
+        let recovered = recovered
+            .runs
+            .iter()
+            .find(|candidate| candidate.id == run.id)
+            .expect("run");
+
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.blocked, vec![run.id.clone()]);
+        assert_eq!(recovered.status, LifecycleStatus::Blocked);
+        assert_eq!(recovered.nodes[0].status, LifecycleStatus::Blocked);
+        assert_eq!(recovered.nodes[0].attempt, 2);
+        assert_eq!(recovered.nodes[0].output, None);
+        assert_eq!(recovered.process_id, None);
+        assert_eq!(
+            recovered
+                .recovery
+                .proposal
+                .as_ref()
+                .expect("proposal")
+                .action,
+            crate::domain::RunRepairAction::RestartExecutor
         );
         let _ = fs::remove_file(state::path(&scope));
     }

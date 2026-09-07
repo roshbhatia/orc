@@ -188,6 +188,109 @@
       ],
       "type": "string"
     },
+    "RunRecovery": {
+      "properties": {
+        "attempts": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "events": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/RunRecoveryEvent"
+          },
+          "type": "array"
+        },
+        "proposal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RunRepairProposal"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "retryAfter": {
+          "default": null,
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "RunRecoveryEvent": {
+      "properties": {
+        "at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/RunRecoveryEventKind"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "at",
+        "kind",
+        "message"
+      ],
+      "type": "object"
+    },
+    "RunRecoveryEventKind": {
+      "enum": [
+        "drift_detected",
+        "repair_proposed",
+        "recovery_scheduled",
+        "recovered",
+        "repair_failed"
+      ],
+      "type": "string"
+    },
+    "RunRepairAction": {
+      "enum": [
+        "restart_executor",
+        "restore_definition",
+        "resolve_assignment"
+      ],
+      "type": "string"
+    },
+    "RunRepairProposal": {
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/RunRepairAction"
+        },
+        "authority": {
+          "$ref": "#/$defs/GateAuthority"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "action",
+        "authority",
+        "reason",
+        "createdAt"
+      ],
+      "type": "object"
+    },
     "Session": {
       "properties": {
         "completion": {
@@ -662,6 +765,15 @@
             "integer",
             "null"
           ]
+        },
+        "recovery": {
+          "$ref": "#/$defs/RunRecovery",
+          "default": {
+            "attempts": 0,
+            "events": [],
+            "proposal": null,
+            "retryAfter": null
+          }
         },
         "resumeRequested": {
           "default": false,

@@ -24,7 +24,7 @@ use crate::{
         Session, SessionOutputReceipt, SessionOutputStatus, SessionRole, WorkflowEdge,
         WorkflowNode, WorkflowRun, WorkspaceState,
     },
-    provider, state,
+    preferences, provider, state, workflow,
 };
 
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -111,6 +111,8 @@ pub struct DoctorReport {
     pub scope: String,
     pub repaired: bool,
     pub duplicates: Vec<DuplicateNativeSession>,
+    pub run_issues: Vec<workflow::RunRecoveryIssue>,
+    pub repaired_runs: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -154,15 +156,59 @@ pub fn read_workspace(scope: &Path) -> Result<WorkspaceState> {
     state::read(&scope)
 }
 
-pub fn doctor(scope: &Path, repair: bool) -> Result<DoctorReport> {
+pub fn doctor(config: &Config, scope: &Path, repair: bool) -> Result<DoctorReport> {
     let scope = state::resolve_scope(scope)?;
-    if repair {
-        return state::update(&scope, |workspace| {
+    let mut duplicates = if repair {
+        state::update(&scope, |workspace| {
             repair_duplicate_native_sessions(workspace, true)
-        });
+        })?
+    } else {
+        let mut workspace = state::read(&scope)?;
+        repair_duplicate_native_sessions(&mut workspace, false)?
+    };
+    let autonomy = preferences::read(&scope)?.autonomy;
+    let workspace = state::read(&scope)?;
+    let initial_issues = run_recovery_issues(&scope, &workspace, autonomy)?;
+    let mut repaired_runs = Vec::new();
+    if repair {
+        for issue in &initial_issues {
+            if matches!(
+                workflow::recover_inconsistent_run(
+                    config,
+                    &scope,
+                    &issue.run_id,
+                    autonomy,
+                    Utc::now(),
+                )?,
+                workflow::RunRecoveryOutcome::Blocked
+                    | workflow::RunRecoveryOutcome::Restarted
+                    | workflow::RunRecoveryOutcome::Reconciled
+            ) {
+                repaired_runs.push(issue.run_id.clone());
+            }
+        }
     }
-    let mut workspace = state::read(&scope)?;
-    repair_duplicate_native_sessions(&mut workspace, false)
+    let workspace = state::read(&scope)?;
+    let run_issues = run_recovery_issues(&scope, &workspace, autonomy)?;
+    duplicates.repaired |= !repaired_runs.is_empty();
+    duplicates.run_issues = run_issues;
+    duplicates.repaired_runs = repaired_runs;
+    Ok(duplicates)
+}
+
+fn run_recovery_issues(
+    scope: &Path,
+    workspace: &WorkspaceState,
+    autonomy: preferences::AutonomyMode,
+) -> Result<Vec<workflow::RunRecoveryIssue>> {
+    Ok(workspace
+        .runs
+        .iter()
+        .map(|run| workflow::inspect_run_recovery(scope, workspace, run, autonomy))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect())
 }
 
 fn repair_duplicate_native_sessions(
@@ -261,6 +307,8 @@ fn repair_duplicate_native_sessions(
         scope: workspace.scope.clone(),
         repaired: repair && !duplicates.is_empty(),
         duplicates,
+        run_issues: Vec::new(),
+        repaired_runs: Vec::new(),
     })
 }
 
@@ -1671,6 +1719,7 @@ pub fn create_run(
             mode: Default::default(),
             process_id: None,
             execution_nonce: None,
+            recovery: Default::default(),
             resume_requested: false,
             log_path: None,
             current_node: None,
@@ -2901,6 +2950,7 @@ actions:
             mode: crate::domain::RunMode::Foreground,
             process_id: None,
             execution_nonce: None,
+            recovery: Default::default(),
             resume_requested: false,
             log_path: None,
             current_node: Some("repair".into()),
@@ -3414,6 +3464,72 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
         let clean = repair_duplicate_native_sessions(&mut workspace, true).expect("idempotent");
         assert!(clean.duplicates.is_empty());
         assert!(!clean.repaired);
+    }
+
+    #[test]
+    fn doctor_reports_and_blocks_orphan_work_without_choosing_a_session() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = std::fs::canonicalize(directory.path()).expect("canonical scope");
+        let run = create_run(
+            &scope,
+            "orphan".into(),
+            "repair orphan work".into(),
+            "explicit assignment proposal".into(),
+            None,
+            None,
+            None,
+        )
+        .expect("run");
+        upsert_node(
+            &scope,
+            &run.id,
+            NodeSpec {
+                id: "work".into(),
+                contract: Contract::default(),
+                session_id: None,
+                status: Some(LifecycleStatus::Working),
+                attempt: Some(1),
+                depends_on: Vec::new(),
+                execution: None,
+                judge_policy: None,
+            },
+        )
+        .expect("node");
+        update_run(&scope, &run.id, LifecycleStatus::Working).expect("working run");
+
+        let audit = doctor(&Config::default(), &scope, false).expect("doctor audit");
+        assert!(!audit.repaired);
+        assert_eq!(audit.run_issues.len(), 1);
+        assert_eq!(
+            audit.run_issues[0].action,
+            crate::domain::RunRepairAction::ResolveAssignment
+        );
+        assert_eq!(
+            read_workspace(&scope).expect("unchanged run").runs[0].status,
+            LifecycleStatus::Working
+        );
+
+        let repaired = doctor(&Config::default(), &scope, true).expect("doctor repair");
+        assert!(repaired.repaired);
+        assert_eq!(repaired.repaired_runs, vec![run.id.clone()]);
+        assert_eq!(repaired.run_issues.len(), 1);
+        assert_eq!(repaired.run_issues[0].status, LifecycleStatus::Blocked);
+        let repaired_state = read_workspace(&scope).expect("repaired state");
+        assert!(repaired_state.sessions.is_empty());
+        assert_eq!(repaired_state.runs[0].nodes[0].session_id, None);
+        let event_count = repaired_state.runs[0].recovery.events.len();
+
+        let repeated = doctor(&Config::default(), &scope, true).expect("repeat repair");
+        assert!(!repeated.repaired);
+        assert!(repeated.repaired_runs.is_empty());
+        assert_eq!(
+            read_workspace(&scope).expect("stable state").runs[0]
+                .recovery
+                .events
+                .len(),
+            event_count
+        );
+        let _ = std::fs::remove_file(state::path(&scope));
     }
 
     #[test]

@@ -26,9 +26,10 @@ use crate::{
     daemon,
     domain::{
         ActivityEvent, CompletionTarget, JudgePolicy, LifecycleStatus, PendingGate,
-        RegistrationSource, RunMode, Session, SessionRole, WorkflowEdge, WorkflowNode, WorkflowRun,
-        WorkspaceState,
+        RegistrationSource, RunMode, RunRecoveryEventKind, RunRepairAction, RunRepairProposal,
+        Session, SessionRole, WorkflowEdge, WorkflowNode, WorkflowRun, WorkspaceState,
     },
+    preferences::AutonomyMode,
     provider::{self, Action, CommandPlan},
     state,
 };
@@ -40,6 +41,8 @@ use crate::preferences;
 
 const MAX_WORKFLOW_LOG_BYTES: u64 = 1024 * 1024;
 const MAX_RETRY_ATTEMPTS: u32 = 100;
+const MAX_RECOVERY_RETRY_SECONDS: u64 = 60;
+const RECOVERY_START_GRACE_SECONDS: i64 = 5;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1383,6 +1386,7 @@ fn materialize_with_parent(
         mode,
         process_id: None,
         execution_nonce: None,
+        recovery: Default::default(),
         resume_requested: false,
         log_path: None,
         current_node: None,
@@ -2047,6 +2051,7 @@ fn run_cancelled(
 
 const EXECUTION_LEASE_ENV: &str = "ORC_EXECUTION_LEASE";
 const EXECUTION_RECOVERY_ENV: &str = "ORC_EXECUTION_RECOVERY";
+const RECOVERY_OPERATION_ENV: &str = "ORC_RECOVERY_OPERATION_ID";
 const DISPLAY_DIRECTION_ENV: &str = "ORC_DISPLAY_DIRECTION";
 const DEFAULT_DISPLAY_DIRECTION: &str = "right";
 
@@ -2894,6 +2899,7 @@ fn execute_owned(config: &Config, scope: &Path, run_id: &str) -> Result<Workflow
     };
     isolate_executor_process()?;
     let recovering = std::env::var_os(EXECUTION_RECOVERY_ENV).is_some();
+    let recovery_operation_id = std::env::var(RECOVERY_OPERATION_ENV).ok();
     let tracker_directory = active_process_directory(&scope, run_id);
     if recovering {
         terminate_tracked_processes(&tracker_directory)?;
@@ -2902,14 +2908,37 @@ fn execute_owned(config: &Config, scope: &Path, run_id: &str) -> Result<Workflow
             provider::ProcessTrackerGuard::acquire(&tracker_directory, Duration::from_secs(5))?;
         clear_process_records(&tracker_directory)?;
     }
-    state::update(&scope, |workspace| {
+    if recovery_operation_id.is_some()
+        && !matches!(
+            recoverable_definition(&scope, &initial),
+            StoredDefinition::Valid
+        )
+    {
+        bail!("run no longer has a valid stored workflow definition");
+    }
+    let recovered_providers = if recovery_operation_id.is_some() {
+        Some(provider::discover(config)?)
+    } else {
+        None
+    };
+    let initialized = state::update(&scope, |workspace| {
         let run = workspace
             .runs
             .iter_mut()
             .find(|run| run.id == run_id)
             .with_context(|| format!("unknown run: {run_id}"))?;
         if !run.status.active() || run.status == LifecycleStatus::Terminating {
-            return Ok(());
+            return Ok(false);
+        }
+        if let Some(operation_id) = recovery_operation_id.as_deref()
+            && (run.status != LifecycleStatus::Queued
+                || run
+                    .recovery
+                    .proposal
+                    .as_ref()
+                    .is_none_or(|proposal| proposal.id != operation_id))
+        {
+            return Ok(false);
         }
         if recovering {
             block_interrupted_nodes(run);
@@ -2918,10 +2947,26 @@ fn execute_owned(config: &Config, scope: &Path, run_id: &str) -> Result<Workflow
         run.execution_nonce = Some(_lease.nonce.clone());
         run.resume_requested = false;
         run.status = LifecycleStatus::Working;
+        if recovery_operation_id.is_some() {
+            run.recovery.retry_after = None;
+            run.recovery.proposal = None;
+            run.recovery.attempts = 0;
+            run.recovery.record(
+                Utc::now(),
+                RunRecoveryEventKind::Recovered,
+                "replacement workflow executor became ready after interrupted nodes were blocked",
+            );
+        }
         run.updated_at = Utc::now();
-        Ok(())
+        Ok(true)
     })?;
-    let providers = provider::discover(config)?;
+    if !initialized {
+        return find_run(&scope, run_id);
+    }
+    let providers = match recovered_providers {
+        Some(providers) => providers,
+        None => provider::discover(config)?,
+    };
     loop {
         let snapshot = state::read(&scope)?;
         let run = snapshot
@@ -3270,20 +3315,650 @@ fn execute_owned(config: &Config, scope: &Path, run_id: &str) -> Result<Workflow
     }
 }
 
-fn block_interrupted_nodes(run: &mut WorkflowRun) {
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunRecoveryIssue {
+    pub run_id: String,
+    pub status: LifecycleStatus,
+    pub reason: String,
+    pub action: RunRepairAction,
+    pub automatic: bool,
+    pub resolved: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunRecoveryOutcome {
+    Unchanged,
+    Deferred,
+    Blocked,
+    Restarted,
+    Reconciled,
+}
+
+pub fn inspect_run_recovery(
+    scope: &Path,
+    workspace: &WorkspaceState,
+    run: &WorkflowRun,
+    autonomy: AutonomyMode,
+) -> Result<Option<RunRecoveryIssue>> {
+    if run.status == LifecycleStatus::Working
+        && let Some(proposal) = run.recovery.proposal.as_ref()
+        && (executor_active(scope, run)? || valid_working_assignment(workspace, run))
+    {
+        return Ok(Some(RunRecoveryIssue {
+            run_id: run.id.clone(),
+            status: run.status,
+            reason: "repair condition is satisfied; proposal awaits reconciliation".into(),
+            action: proposal.action,
+            automatic: false,
+            resolved: true,
+        }));
+    }
+    if run.status == LifecycleStatus::Blocked
+        && let Some(proposal) = run.recovery.proposal.as_ref()
+    {
+        return Ok(Some(RunRecoveryIssue {
+            run_id: run.id.clone(),
+            status: run.status,
+            reason: proposal.reason.clone(),
+            action: proposal.action,
+            automatic: false,
+            resolved: false,
+        }));
+    }
+    if run.status == LifecycleStatus::Queued
+        && run.recovery.proposal.as_ref().is_some_and(|proposal| {
+            proposal.action == RunRepairAction::RestartExecutor
+                && proposal.authority == GateAuthority::Orchestrator
+        })
+    {
+        let (action, reason, automatic) = match recoverable_definition(scope, run) {
+            StoredDefinition::Valid => (
+                RunRepairAction::RestartExecutor,
+                run.recovery
+                    .proposal
+                    .as_ref()
+                    .expect("checked recovery proposal")
+                    .reason
+                    .clone(),
+                autonomy == AutonomyMode::Autonomous,
+            ),
+            StoredDefinition::Invalid(reason) => {
+                (RunRepairAction::RestoreDefinition, reason, false)
+            }
+            StoredDefinition::Manual => (
+                RunRepairAction::ResolveAssignment,
+                "run no longer references a stored workflow definition".into(),
+                false,
+            ),
+        };
+        return Ok(Some(RunRecoveryIssue {
+            run_id: run.id.clone(),
+            status: run.status,
+            reason,
+            action,
+            automatic,
+            resolved: false,
+        }));
+    }
+    if run.status != LifecycleStatus::Working
+        || executor_active(scope, run)?
+        || valid_working_assignment(workspace, run)
+    {
+        return Ok(None);
+    }
+
+    let (action, reason) = match recoverable_definition(scope, run) {
+        StoredDefinition::Manual => (
+            RunRepairAction::ResolveAssignment,
+            "working run has no live executor or valid assigned session".to_owned(),
+        ),
+        StoredDefinition::Valid => (
+            RunRepairAction::RestartExecutor,
+            "stored workflow executor is not live".to_owned(),
+        ),
+        StoredDefinition::Invalid(reason) => (RunRepairAction::RestoreDefinition, reason),
+    };
+    Ok(Some(RunRecoveryIssue {
+        run_id: run.id.clone(),
+        status: run.status,
+        reason,
+        action,
+        automatic: action == RunRepairAction::RestartExecutor
+            && autonomy == AutonomyMode::Autonomous,
+        resolved: false,
+    }))
+}
+
+pub fn recover_inconsistent_run(
+    config: &Config,
+    scope: &Path,
+    run_id: &str,
+    autonomy: AutonomyMode,
+    now: DateTime<Utc>,
+) -> Result<RunRecoveryOutcome> {
+    let scope = state::resolve_scope(scope)?;
+    let workspace = state::read(&scope)?;
+    let Some(run) = workspace.runs.iter().find(|run| run.id == run_id) else {
+        bail!("unknown run: {run_id}");
+    };
+    let Some(issue) = inspect_run_recovery(&scope, &workspace, run, autonomy)? else {
+        return Ok(RunRecoveryOutcome::Unchanged);
+    };
+    if issue.automatic && run.recovery.retry_after.is_some_and(|retry| retry > now) {
+        return Ok(RunRecoveryOutcome::Deferred);
+    }
+
+    if issue.resolved {
+        return if reconcile_satisfied_recovery(&scope, run, now)? {
+            Ok(RunRecoveryOutcome::Reconciled)
+        } else {
+            Ok(RunRecoveryOutcome::Unchanged)
+        };
+    }
+
+    let scheduled = transition_run_recovery(&scope, run, &issue, autonomy, now)?;
+    if !scheduled {
+        return Ok(RunRecoveryOutcome::Unchanged);
+    }
+    if !issue.automatic {
+        return Ok(RunRecoveryOutcome::Blocked);
+    }
+
+    let operation_id = find_run(&scope, run_id)?
+        .recovery
+        .proposal
+        .as_ref()
+        .context("scheduled recovery has no durable proposal")?
+        .id
+        .clone();
+
+    let started = (|| {
+        daemon::ensure_running(config)?;
+        spawn_recovery_executor(&scope, run_id, &operation_id)
+    })();
+    match started {
+        Ok(Some(child)) => wait_for_recovery_start(&scope, run_id, &operation_id, child),
+        Ok(None) => Ok(RunRecoveryOutcome::Deferred),
+        Err(error) => {
+            if !handle_recovery_executor_failure(&scope, run_id, &operation_id, &error)? {
+                record_recovery_failure(&scope, run_id, &operation_id, &error, now)?;
+            }
+            Err(error)
+        }
+    }
+}
+
+pub(crate) fn recover_persisted_inconsistent_run(
+    scope: &Path,
+    run_id: &str,
+    now: DateTime<Utc>,
+) -> Result<RunRecoveryOutcome> {
+    let workspace = state::read(scope)?;
+    let Some(run) = workspace.runs.iter().find(|run| run.id == run_id) else {
+        bail!("unknown run: {run_id}");
+    };
+    if !matches!(
+        run.status,
+        LifecycleStatus::Working | LifecycleStatus::Queued
+    ) {
+        return Ok(RunRecoveryOutcome::Unchanged);
+    }
+    let issue = RunRecoveryIssue {
+        run_id: run.id.clone(),
+        status: run.status,
+        reason: "workspace scope is unavailable; restore it before resuming the run".into(),
+        action: RunRepairAction::RestoreDefinition,
+        automatic: false,
+        resolved: false,
+    };
+    if transition_run_recovery(scope, run, &issue, AutonomyMode::Supervised, now)? {
+        Ok(RunRecoveryOutcome::Blocked)
+    } else {
+        Ok(RunRecoveryOutcome::Unchanged)
+    }
+}
+
+fn reconcile_satisfied_recovery(
+    scope: &Path,
+    observed: &WorkflowRun,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let executor_was_active = executor_active(scope, observed)?;
+    let observed_proposal = observed
+        .recovery
+        .proposal
+        .as_ref()
+        .map(|proposal| &proposal.id);
+    state::update(scope, |workspace| {
+        let valid_assignment = workspace
+            .runs
+            .iter()
+            .find(|run| run.id == observed.id)
+            .is_some_and(|run| valid_working_assignment(workspace, run));
+        let run = workspace
+            .runs
+            .iter_mut()
+            .find(|run| run.id == observed.id)
+            .with_context(|| format!("unknown run: {}", observed.id))?;
+        let same_executor = executor_was_active
+            && run.process_id == observed.process_id
+            && run.execution_nonce == observed.execution_nonce;
+        if run.status != LifecycleStatus::Working
+            || run.recovery.proposal.as_ref().map(|proposal| &proposal.id) != observed_proposal
+            || (!same_executor && !valid_assignment)
+        {
+            return Ok(false);
+        }
+        run.recovery.proposal = None;
+        run.recovery.retry_after = None;
+        run.recovery.attempts = 0;
+        run.recovery.record(
+            now,
+            RunRecoveryEventKind::Recovered,
+            "repair condition was satisfied by an explicit session or executor transition",
+        );
+        run.updated_at = now;
+        Ok(true)
+    })
+}
+
+fn transition_run_recovery(
+    scope: &Path,
+    observed: &WorkflowRun,
+    issue: &RunRecoveryIssue,
+    autonomy: AutonomyMode,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let identity_path = execution_lease_path(scope, &observed.id);
+    if let Some(parent) = execution_identity_path(&identity_path).parent() {
+        fs::create_dir_all(parent).context("create recovery identity directory")?;
+    }
+    let Some(_identity) = try_acquire_execution_identity(&identity_path)? else {
+        return Ok(false);
+    };
+    state::update(scope, |workspace| {
+        let valid_assignment = workspace
+            .runs
+            .iter()
+            .find(|run| run.id == observed.id)
+            .is_some_and(|run| valid_working_assignment(workspace, run));
+        let run = workspace
+            .runs
+            .iter_mut()
+            .find(|run| run.id == observed.id)
+            .with_context(|| format!("unknown run: {}", observed.id))?;
+        let retrying = run.status == LifecycleStatus::Queued
+            && run.recovery.proposal.as_ref().is_some_and(|proposal| {
+                proposal.action == RunRepairAction::RestartExecutor
+                    && proposal.authority == GateAuthority::Orchestrator
+            });
+        if retrying && !issue.automatic {
+            run.status = LifecycleStatus::Blocked;
+            run.recovery.retry_after = None;
+            run.recovery.proposal = Some(RunRepairProposal {
+                id: format!("repair:{}:blocked", run.id),
+                action: issue.action,
+                authority: match autonomy {
+                    AutonomyMode::Supervised => GateAuthority::User,
+                    AutonomyMode::ApprovalGated => GateAuthority::OrchestratorThenUser,
+                    AutonomyMode::Autonomous => GateAuthority::Orchestrator,
+                },
+                reason: issue.reason.clone(),
+                created_at: now,
+            });
+            run.recovery.record(
+                now,
+                RunRecoveryEventKind::DriftDetected,
+                issue.reason.clone(),
+            );
+            run.recovery.record(
+                now,
+                RunRecoveryEventKind::RepairProposed,
+                format!("{} requires explicit approval", issue.action),
+            );
+            run.updated_at = now;
+            return Ok(true);
+        }
+        if retrying {
+            if run.recovery.retry_after.is_some_and(|retry| retry > now) {
+                return Ok(false);
+            }
+            run.recovery.attempts = run.recovery.attempts.saturating_add(1);
+            let attempt = run.recovery.attempts;
+            let proposal = run
+                .recovery
+                .proposal
+                .as_mut()
+                .expect("retrying recovery proposal");
+            proposal.id = format!("repair:{}:{attempt}", run.id);
+            proposal.created_at = now;
+            run.recovery.retry_after =
+                Some(now + chrono::Duration::seconds(RECOVERY_START_GRACE_SECONDS));
+            run.recovery.record(
+                now,
+                RunRecoveryEventKind::RecoveryScheduled,
+                "retrying replacement workflow executor",
+            );
+            run.updated_at = now;
+            return Ok(true);
+        }
+        if run.status != LifecycleStatus::Working
+            || run.process_id != observed.process_id
+            || run.execution_nonce != observed.execution_nonce
+            || valid_assignment
+        {
+            return Ok(false);
+        }
+
+        let authority = match autonomy {
+            AutonomyMode::Supervised => GateAuthority::User,
+            AutonomyMode::ApprovalGated => GateAuthority::OrchestratorThenUser,
+            AutonomyMode::Autonomous => GateAuthority::Orchestrator,
+        };
+        block_interrupted_nodes_at(run, now);
+        run.process_id = None;
+        run.execution_nonce = None;
+        run.recovery.record(
+            now,
+            RunRecoveryEventKind::DriftDetected,
+            issue.reason.clone(),
+        );
+        let next_attempt = run.recovery.attempts.saturating_add(1);
+        run.recovery.proposal = Some(RunRepairProposal {
+            id: if issue.automatic {
+                format!("repair:{}:{next_attempt}", run.id)
+            } else {
+                format!("repair:{}:blocked", run.id)
+            },
+            action: issue.action,
+            authority,
+            reason: issue.reason.clone(),
+            created_at: now,
+        });
+        if issue.automatic {
+            run.status = LifecycleStatus::Queued;
+            run.recovery.attempts = next_attempt;
+            run.recovery.retry_after =
+                Some(now + chrono::Duration::seconds(RECOVERY_START_GRACE_SECONDS));
+            run.recovery.record(
+                now,
+                RunRecoveryEventKind::RecoveryScheduled,
+                "replacement workflow executor scheduled",
+            );
+        } else {
+            run.status = LifecycleStatus::Blocked;
+            run.recovery.retry_after = None;
+            run.recovery.record(
+                now,
+                RunRecoveryEventKind::RepairProposed,
+                format!("{} requires explicit approval", issue.action),
+            );
+        }
+        run.updated_at = now;
+        Ok(true)
+    })
+}
+
+fn record_recovery_failure(
+    scope: &Path,
+    run_id: &str,
+    operation_id: &str,
+    error: &anyhow::Error,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    state::update(scope, |workspace| {
+        let run = workspace
+            .runs
+            .iter_mut()
+            .find(|run| run.id == run_id)
+            .with_context(|| format!("unknown run: {run_id}"))?;
+        if run.status != LifecycleStatus::Queued
+            || run
+                .recovery
+                .proposal
+                .as_ref()
+                .is_none_or(|proposal| proposal.id != operation_id)
+        {
+            return Ok(());
+        }
+        let exponent = run.recovery.attempts.saturating_sub(1).min(6);
+        let seconds = (1_u64 << exponent).min(MAX_RECOVERY_RETRY_SECONDS);
+        run.status = LifecycleStatus::Queued;
+        run.process_id = None;
+        run.execution_nonce = None;
+        run.recovery.retry_after = Some(now + chrono::Duration::seconds(seconds as i64));
+        run.recovery.record(
+            now,
+            RunRecoveryEventKind::RepairFailed,
+            format!("replacement workflow executor failed to start: {error:#}"),
+        );
+        run.updated_at = now;
+        Ok(())
+    })
+}
+
+pub(crate) fn recovery_executor_operation() -> Option<String> {
+    std::env::var(RECOVERY_OPERATION_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+pub(crate) fn handle_recovery_executor_failure(
+    scope: &Path,
+    run_id: &str,
+    operation_id: &str,
+    error: &anyhow::Error,
+) -> Result<bool> {
+    let scope = state::resolve_scope(scope)?;
+    let workspace = state::read(&scope)?;
+    let Some(run) = workspace.runs.iter().find(|run| run.id == run_id) else {
+        return Ok(false);
+    };
+    let startup_pending = run.status == LifecycleStatus::Queued
+        && run
+            .recovery
+            .proposal
+            .as_ref()
+            .is_some_and(|proposal| proposal.id == operation_id);
+    let active_replacement = run.status == LifecycleStatus::Working
+        && run.process_id == Some(std::process::id())
+        && run.recovery.proposal.is_none();
+    if !startup_pending && !active_replacement {
+        return Ok(false);
+    }
+    let now = Utc::now();
+    match recoverable_definition(&scope, run) {
+        StoredDefinition::Valid if startup_pending => {
+            record_recovery_failure(&scope, run_id, operation_id, error, now)?;
+            Ok(true)
+        }
+        StoredDefinition::Valid => Ok(false),
+        StoredDefinition::Invalid(reason) if active_replacement => {
+            block_active_recovery_definition_drift(&scope, run_id, &reason, now)
+        }
+        StoredDefinition::Invalid(reason) => block_failed_recovery(
+            &scope,
+            run_id,
+            operation_id,
+            RunRepairAction::RestoreDefinition,
+            &reason,
+            now,
+        ),
+        StoredDefinition::Manual if startup_pending => block_failed_recovery(
+            &scope,
+            run_id,
+            operation_id,
+            RunRepairAction::ResolveAssignment,
+            "run no longer references a stored workflow definition",
+            now,
+        ),
+        StoredDefinition::Manual => Ok(false),
+    }
+}
+
+fn block_active_recovery_definition_drift(
+    scope: &Path,
+    run_id: &str,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    state::update(scope, |workspace| {
+        let run = workspace
+            .runs
+            .iter_mut()
+            .find(|run| run.id == run_id)
+            .with_context(|| format!("unknown run: {run_id}"))?;
+        if run.status != LifecycleStatus::Working
+            || run.process_id != Some(std::process::id())
+            || run.recovery.proposal.is_some()
+        {
+            return Ok(false);
+        }
+        block_interrupted_nodes_at(run, now);
+        run.status = LifecycleStatus::Blocked;
+        run.process_id = None;
+        run.execution_nonce = None;
+        run.recovery.retry_after = None;
+        run.recovery.proposal = Some(RunRepairProposal {
+            id: format!("repair:{run_id}:blocked"),
+            action: RunRepairAction::RestoreDefinition,
+            authority: GateAuthority::Orchestrator,
+            reason: reason.to_owned(),
+            created_at: now,
+        });
+        run.recovery
+            .record(now, RunRecoveryEventKind::DriftDetected, reason);
+        run.recovery.record(
+            now,
+            RunRecoveryEventKind::RepairProposed,
+            "restore_definition requires explicit approval",
+        );
+        run.updated_at = now;
+        Ok(true)
+    })
+}
+
+fn block_failed_recovery(
+    scope: &Path,
+    run_id: &str,
+    operation_id: &str,
+    action: RunRepairAction,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    state::update(scope, |workspace| {
+        let run = workspace
+            .runs
+            .iter_mut()
+            .find(|run| run.id == run_id)
+            .with_context(|| format!("unknown run: {run_id}"))?;
+        let Some(current) = run.recovery.proposal.as_ref() else {
+            return Ok(false);
+        };
+        if run.status != LifecycleStatus::Queued || current.id != operation_id {
+            return Ok(false);
+        }
+        let authority = current.authority;
+        block_interrupted_nodes_at(run, now);
+        run.status = LifecycleStatus::Blocked;
+        run.process_id = None;
+        run.execution_nonce = None;
+        run.recovery.retry_after = None;
+        run.recovery.proposal = Some(RunRepairProposal {
+            id: format!("repair:{run_id}:blocked"),
+            action,
+            authority,
+            reason: reason.to_owned(),
+            created_at: now,
+        });
+        run.recovery
+            .record(now, RunRecoveryEventKind::DriftDetected, reason);
+        run.recovery.record(
+            now,
+            RunRecoveryEventKind::RepairProposed,
+            format!("{action} requires explicit approval"),
+        );
+        run.updated_at = now;
+        Ok(true)
+    })
+}
+
+fn valid_working_assignment(workspace: &WorkspaceState, run: &WorkflowRun) -> bool {
+    run.nodes.iter().any(|node| {
+        node.status == LifecycleStatus::Working
+            && node.session_id.as_deref().is_some_and(|session_id| {
+                workspace.sessions.iter().any(|session| {
+                    session.id == session_id
+                        && session.status.active()
+                        && session.status != LifecycleStatus::Terminating
+                        && if run.orchestrator_id.as_deref() == Some(session_id) {
+                            session.role == SessionRole::Orchestrator
+                        } else {
+                            session.run_id.as_deref() == Some(run.id.as_str())
+                                && session.node_id.as_deref() == Some(node.id.as_str())
+                        }
+                })
+            })
+    })
+}
+
+enum StoredDefinition {
+    Manual,
+    Valid,
+    Invalid(String),
+}
+
+fn recoverable_definition(scope: &Path, run: &WorkflowRun) -> StoredDefinition {
+    let Some(definition_path) = run.definition.as_deref() else {
+        return StoredDefinition::Manual;
+    };
+    let expected_path = materialized_definition_path(scope, &run.id);
+    if Path::new(definition_path) != expected_path {
+        return StoredDefinition::Invalid(
+            "workflow definition is not the stored materialized snapshot".into(),
+        );
+    }
+    let definition = match load(&expected_path) {
+        Ok(definition) => definition,
+        Err(error) => {
+            return StoredDefinition::Invalid(format!(
+                "stored workflow definition cannot be loaded: {error:#}"
+            ));
+        }
+    };
+    let revision = match definition_revision(&definition) {
+        Ok(revision) => revision,
+        Err(error) => {
+            return StoredDefinition::Invalid(format!(
+                "stored workflow revision cannot be calculated: {error:#}"
+            ));
+        }
+    };
+    if run.revision.as_deref() != Some(revision.as_str()) {
+        return StoredDefinition::Invalid("stored workflow definition revision changed".into());
+    }
+    StoredDefinition::Valid
+}
+
+fn block_interrupted_nodes_at(run: &mut WorkflowRun, now: DateTime<Utc>) {
     for node in run
         .nodes
         .iter_mut()
         .filter(|node| node.status == LifecycleStatus::Working)
     {
         node.status = LifecycleStatus::Blocked;
-        node.updated_at = Utc::now();
+        node.updated_at = now;
         node.record_activity(
             "recovered",
             "executor stopped before it committed the outcome; inspect before retrying",
         );
     }
     run.current_node = None;
+}
+
+fn block_interrupted_nodes(run: &mut WorkflowRun) {
+    block_interrupted_nodes_at(run, Utc::now());
 }
 
 #[cfg(all(unix, not(test)))]
@@ -3601,6 +4276,8 @@ pub fn cancel(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRun
             run.execution_nonce = None;
             run.resume_requested = false;
             run.pending_gates.clear();
+            run.recovery.proposal = None;
+            run.recovery.retry_after = None;
             run.updated_at = now;
         }
         workspace
@@ -3962,6 +4639,88 @@ fn spawn_executor_with_direction(
     run_id: &str,
     direction: &str,
 ) -> Result<(WorkflowRun, Option<std::process::Child>)> {
+    spawn_executor_with_direction_mode(scope, run_id, direction, false, None)
+}
+
+fn spawn_recovery_executor(
+    scope: &Path,
+    run_id: &str,
+    operation_id: &str,
+) -> Result<Option<std::process::Child>> {
+    let current = find_run(scope, run_id)?;
+    if !matches!(
+        recoverable_definition(scope, &current),
+        StoredDefinition::Valid
+    ) {
+        bail!("run no longer has a valid stored workflow definition");
+    }
+    if current
+        .recovery
+        .proposal
+        .as_ref()
+        .is_none_or(|proposal| proposal.id != operation_id)
+    {
+        return Ok(None);
+    }
+    let direction = read_display_direction(scope, run_id)?;
+    let (run, executor) =
+        spawn_executor_with_direction_mode(scope, run_id, &direction, true, Some(operation_id))?;
+    let _ = run;
+    Ok(executor)
+}
+
+fn wait_for_recovery_start(
+    scope: &Path,
+    run_id: &str,
+    operation_id: &str,
+    mut child: std::process::Child,
+) -> Result<RunRecoveryOutcome> {
+    let deadline = Instant::now() + Duration::from_secs(RECOVERY_START_GRACE_SECONDS as u64);
+    loop {
+        let run = find_run(scope, run_id)?;
+        if run.status == LifecycleStatus::Blocked {
+            let _ = child.try_wait();
+            return Ok(RunRecoveryOutcome::Blocked);
+        }
+        if !run.status.active() || run.status == LifecycleStatus::Terminating {
+            let _ = child.try_wait();
+            return Ok(RunRecoveryOutcome::Unchanged);
+        }
+        if run.recovery.proposal.is_none()
+            && run.process_id == Some(child.id())
+            && executor_active(scope, &run)?
+        {
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+            return Ok(RunRecoveryOutcome::Restarted);
+        }
+        if run
+            .recovery
+            .proposal
+            .as_ref()
+            .is_some_and(|proposal| proposal.id != operation_id)
+        {
+            let _ = child.try_wait();
+            return Ok(RunRecoveryOutcome::Deferred);
+        }
+        if child.try_wait()?.is_some() || Instant::now() >= deadline {
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+            return Ok(RunRecoveryOutcome::Deferred);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn spawn_executor_with_direction_mode(
+    scope: &Path,
+    run_id: &str,
+    direction: &str,
+    recovering: bool,
+    recovery_operation_id: Option<&str>,
+) -> Result<(WorkflowRun, Option<std::process::Child>)> {
     let scope = state::resolve_scope(scope)?;
     write_display_direction(&scope, run_id, direction)?;
     let initial = find_run(&scope, run_id)?;
@@ -3996,8 +4755,12 @@ fn spawn_executor_with_direction(
         .stderr(stderr)
         .env(EXECUTION_LEASE_ENV, &lease.nonce)
         .env(DISPLAY_DIRECTION_ENV, direction);
-    if initial.process_id.is_some() {
+    if recovering || initial.process_id.is_some() {
         command.env(EXECUTION_RECOVERY_ENV, "1");
+    }
+    if recovering {
+        let operation_id = recovery_operation_id.context("recovery launch has no operation id")?;
+        command.env(RECOVERY_OPERATION_ENV, operation_id);
     }
     for name in [
         "ORC_SESSION_ID",
@@ -4019,6 +4782,10 @@ fn spawn_executor_with_direction(
         let _ = terminate_executor(child.id());
         let _ = child.wait();
         return Err(error);
+    }
+    if recovering {
+        lease.disarm();
+        return Ok((initial, Some(child)));
     }
     let run = match set_process(&scope, run_id, child.id(), &lease.nonce, Some(&log_path)) {
         Ok(run)
@@ -4144,6 +4911,605 @@ actions:
                 .all(|event| event.message.len() <= 4096)
         );
         assert!(node.activity[0].message.starts_with("44:"));
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn manual_orphan_work_blocks_with_assignment_proposal() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope_directory = directory.path().join("scope");
+        fs::create_dir_all(&scope_directory).expect("scope directory");
+        let scope = fs::canonicalize(scope_directory).expect("canonical scope");
+        let run = control::create_run(
+            &scope,
+            "manual".into(),
+            "complete manual work".into(),
+            "verified result".into(),
+            None,
+            None,
+            None,
+        )
+        .expect("manual run");
+        control::upsert_node(
+            &scope,
+            &run.id,
+            control::NodeSpec {
+                id: "work".into(),
+                contract: Contract::default(),
+                session_id: None,
+                status: Some(LifecycleStatus::Working),
+                attempt: Some(3),
+                depends_on: Vec::new(),
+                execution: None,
+                judge_policy: None,
+            },
+        )
+        .expect("working node");
+        control::update_run(&scope, &run.id, LifecycleStatus::Working).expect("working run");
+
+        let outcome = recover_inconsistent_run(
+            &Config::default(),
+            &scope,
+            &run.id,
+            AutonomyMode::Autonomous,
+            Utc::now(),
+        )
+        .expect("recover manual run");
+        let recovered = find_run(&scope, &run.id).expect("recovered run");
+
+        assert_eq!(outcome, RunRecoveryOutcome::Blocked);
+        assert_eq!(recovered.status, LifecycleStatus::Blocked);
+        assert_eq!(recovered.nodes[0].status, LifecycleStatus::Blocked);
+        assert_eq!(recovered.nodes[0].attempt, 3);
+        assert_eq!(recovered.nodes[0].session_id, None);
+        assert_eq!(recovered.recovery.events.len(), 2);
+        assert_eq!(
+            recovered.recovery.proposal.expect("repair proposal").action,
+            RunRepairAction::ResolveAssignment
+        );
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn active_reciprocal_assignment_keeps_manual_work_running() {
+        let directory = tempfile::tempdir().expect("scope");
+        let scope = fs::canonicalize(directory.path()).expect("canonical scope");
+        let orchestrator = control::register(
+            &scope,
+            Contract {
+                role: SessionRole::Orchestrator,
+                ..Contract::default()
+            },
+            SessionLink {
+                id: Some("root".into()),
+                native_id: Some("root-native".into()),
+                ..SessionLink::default()
+            },
+        )
+        .expect("orchestrator");
+        let run = control::create_run(
+            &scope,
+            "assigned".into(),
+            "complete assigned work".into(),
+            "verified result".into(),
+            Some(orchestrator.id),
+            None,
+            None,
+        )
+        .expect("manual run");
+        let worker = control::register(
+            &scope,
+            Contract::default(),
+            SessionLink {
+                id: Some("worker".into()),
+                native_id: Some("native".into()),
+                source: RegistrationSource::Connected,
+                ..SessionLink::default()
+            },
+        )
+        .expect("worker");
+        control::upsert_node(
+            &scope,
+            &run.id,
+            control::NodeSpec {
+                id: "work".into(),
+                contract: Contract::default(),
+                session_id: None,
+                status: Some(LifecycleStatus::Queued),
+                attempt: Some(1),
+                depends_on: Vec::new(),
+                execution: None,
+                judge_policy: None,
+            },
+        )
+        .expect("working node");
+        control::adopt_node(&scope, &run.id, "work", &worker.id).expect("adopt worker");
+        control::update_node(&scope, &run.id, "work", LifecycleStatus::Working)
+            .expect("working node");
+        control::update_run(&scope, &run.id, LifecycleStatus::Working).expect("working run");
+        let workspace = state::read(&scope).expect("workspace");
+        let current = workspace
+            .runs
+            .iter()
+            .find(|candidate| candidate.id == run.id)
+            .expect("run");
+
+        assert!(
+            inspect_run_recovery(&scope, &workspace, current, AutonomyMode::Autonomous)
+                .expect("inspect")
+                .is_none()
+        );
+        state::update(&scope, |workspace| {
+            let current = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            current.recovery.proposal = Some(RunRepairProposal {
+                id: format!("repair:{}:blocked", run.id),
+                action: RunRepairAction::ResolveAssignment,
+                authority: GateAuthority::User,
+                reason: "assign a live session".into(),
+                created_at: Utc::now(),
+            });
+            Ok(())
+        })
+        .expect("pending assignment repair");
+        assert_eq!(
+            recover_inconsistent_run(
+                &Config::default(),
+                &scope,
+                &run.id,
+                AutonomyMode::Supervised,
+                Utc::now(),
+            )
+            .expect("reconcile assignment"),
+            RunRecoveryOutcome::Reconciled
+        );
+        let reconciled = find_run(&scope, &run.id).expect("reconciled run");
+        assert!(reconciled.recovery.proposal.is_none());
+        assert_eq!(
+            reconciled
+                .recovery
+                .events
+                .last()
+                .expect("recovery event")
+                .kind,
+            RunRecoveryEventKind::Recovered
+        );
+        state::update(&scope, |workspace| {
+            let worker = workspace
+                .sessions
+                .iter_mut()
+                .find(|session| session.id == "worker")
+                .expect("worker");
+            worker.node_id = Some("other".into());
+            Ok(())
+        })
+        .expect("break reciprocal lineage");
+        let workspace = state::read(&scope).expect("mismatched workspace");
+        let current = workspace
+            .runs
+            .iter()
+            .find(|candidate| candidate.id == run.id)
+            .expect("run");
+        assert_eq!(
+            inspect_run_recovery(&scope, &workspace, current, AutonomyMode::Autonomous)
+                .expect("inspect mismatch")
+                .expect("recovery issue")
+                .action,
+            RunRepairAction::ResolveAssignment
+        );
+        state::update(&scope, |workspace| {
+            let current = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            current.orchestrator_id = Some("worker".into());
+            Ok(())
+        })
+        .expect("spoof orchestrator id");
+        let workspace = state::read(&scope).expect("spoofed workspace");
+        let current = workspace
+            .runs
+            .iter()
+            .find(|candidate| candidate.id == run.id)
+            .expect("run");
+        assert_eq!(
+            inspect_run_recovery(&scope, &workspace, current, AutonomyMode::Autonomous)
+                .expect("inspect spoofed root")
+                .expect("recovery issue")
+                .action,
+            RunRepairAction::ResolveAssignment
+        );
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn autonomous_workflow_blocks_interrupted_node_before_restart() {
+        let (_directory, _config, scope, run) = workflow_fixture("1ms");
+        state::update(&scope, |workspace| {
+            let current = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            current.status = LifecycleStatus::Working;
+            current.current_node = Some("wait".into());
+            current.nodes[0].status = LifecycleStatus::Working;
+            current.nodes[0].attempt = 4;
+            Ok(())
+        })
+        .expect("interrupted fixture");
+        let workspace = state::read(&scope).expect("workspace");
+        let current = workspace
+            .runs
+            .iter()
+            .find(|candidate| candidate.id == run.id)
+            .expect("run");
+        let issue = inspect_run_recovery(&scope, &workspace, current, AutonomyMode::Autonomous)
+            .expect("inspect")
+            .expect("recovery issue");
+
+        assert!(
+            transition_run_recovery(
+                &scope,
+                current,
+                &issue,
+                AutonomyMode::Autonomous,
+                Utc::now(),
+            )
+            .expect("schedule recovery")
+        );
+        let scheduled = find_run(&scope, &run.id).expect("scheduled run");
+        assert_eq!(scheduled.status, LifecycleStatus::Queued);
+        assert_eq!(scheduled.nodes[0].status, LifecycleStatus::Blocked);
+        assert_eq!(scheduled.nodes[0].attempt, 4);
+        assert_eq!(scheduled.current_node, None);
+        assert_eq!(scheduled.process_id, None);
+        assert_eq!(scheduled.execution_nonce, None);
+        assert_eq!(scheduled.recovery.attempts, 1);
+        let event_count = scheduled.recovery.events.len();
+        assert_eq!(
+            recover_inconsistent_run(
+                &Config::default(),
+                &scope,
+                &run.id,
+                AutonomyMode::Autonomous,
+                Utc::now(),
+            )
+            .expect("defer duplicate recovery"),
+            RunRecoveryOutcome::Deferred
+        );
+        assert_eq!(
+            find_run(&scope, &run.id)
+                .expect("stable scheduled run")
+                .recovery
+                .events
+                .len(),
+            event_count
+        );
+        assert_eq!(
+            scheduled.recovery.proposal.expect("repair proposal").action,
+            RunRepairAction::RestartExecutor
+        );
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn queued_recovery_respects_an_autonomy_downgrade() {
+        let (_directory, config, scope, run) = workflow_fixture("1ms");
+        let now = Utc::now();
+        state::update(&scope, |workspace| {
+            let current = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            current.status = LifecycleStatus::Queued;
+            current.nodes[0].status = LifecycleStatus::Blocked;
+            current.recovery.attempts = 1;
+            current.recovery.retry_after = Some(now - chrono::Duration::seconds(1));
+            current.recovery.proposal = Some(RunRepairProposal {
+                id: format!("repair:{}:1", run.id),
+                action: RunRepairAction::RestartExecutor,
+                authority: GateAuthority::Orchestrator,
+                reason: "executor stopped".into(),
+                created_at: now,
+            });
+            Ok(())
+        })
+        .expect("queued automatic recovery");
+
+        assert_eq!(
+            recover_inconsistent_run(&config, &scope, &run.id, AutonomyMode::Supervised, now,)
+                .expect("downgrade recovery"),
+            RunRecoveryOutcome::Blocked
+        );
+        let blocked = find_run(&scope, &run.id).expect("blocked run");
+        assert_eq!(blocked.status, LifecycleStatus::Blocked);
+        let proposal = blocked.recovery.proposal.expect("approval proposal");
+        assert_eq!(proposal.action, RunRepairAction::RestartExecutor);
+        assert_eq!(proposal.authority, GateAuthority::User);
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn live_execution_identity_prevents_a_stale_recovery_transition() {
+        let (_directory, _config, scope, run) = workflow_fixture("1ms");
+        state::update(&scope, |workspace| {
+            let current = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            current.status = LifecycleStatus::Working;
+            current.nodes[0].status = LifecycleStatus::Working;
+            Ok(())
+        })
+        .expect("interrupted fixture");
+        let workspace = state::read(&scope).expect("workspace");
+        let current = workspace
+            .runs
+            .iter()
+            .find(|candidate| candidate.id == run.id)
+            .expect("run");
+        let issue = inspect_run_recovery(&scope, &workspace, current, AutonomyMode::Autonomous)
+            .expect("inspect")
+            .expect("recovery issue");
+        let lease_path = execution_lease_path(&scope, &run.id);
+        fs::create_dir_all(
+            execution_identity_path(&lease_path)
+                .parent()
+                .expect("identity parent"),
+        )
+        .expect("identity directory");
+        let _identity = try_acquire_execution_identity(&lease_path)
+            .expect("identity lock")
+            .expect("identity owner");
+
+        assert!(
+            !transition_run_recovery(
+                &scope,
+                current,
+                &issue,
+                AutonomyMode::Autonomous,
+                Utc::now(),
+            )
+            .expect("guarded transition")
+        );
+        assert_eq!(
+            find_run(&scope, &run.id).expect("unchanged run").status,
+            LifecycleStatus::Working
+        );
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn changed_definition_blocks_without_executing() {
+        let (_directory, config, scope, run) = workflow_fixture("1ms");
+        state::update(&scope, |workspace| {
+            let current = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            current.status = LifecycleStatus::Working;
+            current.nodes[0].status = LifecycleStatus::Working;
+            Ok(())
+        })
+        .expect("interrupted fixture");
+        fs::write(
+            run.definition.as_deref().expect("definition path"),
+            "name: changed\ngoal: changed\nexpectedOutput: changed\nentryPoint: changed\nsteps: []\n",
+        )
+        .expect("replace definition");
+
+        let outcome = recover_inconsistent_run(
+            &config,
+            &scope,
+            &run.id,
+            AutonomyMode::Autonomous,
+            Utc::now(),
+        )
+        .expect("block changed workflow");
+        let blocked = find_run(&scope, &run.id).expect("blocked run");
+
+        assert_eq!(outcome, RunRecoveryOutcome::Blocked);
+        assert_eq!(blocked.status, LifecycleStatus::Blocked);
+        assert_eq!(
+            blocked.recovery.proposal.expect("repair proposal").action,
+            RunRepairAction::RestoreDefinition
+        );
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn recovery_failure_uses_separate_bounded_backoff() {
+        let (_directory, config, scope, run) = workflow_fixture("1ms");
+        let now = Utc::now();
+        state::update(&scope, |workspace| {
+            let current = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            current.status = LifecycleStatus::Queued;
+            current.nodes[0].status = LifecycleStatus::Blocked;
+            current.nodes[0].attempt = 5;
+            current.recovery.attempts = 10;
+            current.recovery.proposal = Some(RunRepairProposal {
+                id: format!("repair:{}:10", run.id),
+                action: RunRepairAction::RestartExecutor,
+                authority: GateAuthority::Orchestrator,
+                reason: "executor stopped".into(),
+                created_at: now,
+            });
+            Ok(())
+        })
+        .expect("recovery fixture");
+        record_recovery_failure(
+            &scope,
+            &run.id,
+            &format!("repair:{}:10", run.id),
+            &anyhow::anyhow!("offline"),
+            now,
+        )
+        .expect("record failed recovery");
+        let delayed = find_run(&scope, &run.id).expect("delayed run");
+
+        assert_eq!(delayed.nodes[0].attempt, 5);
+        assert_eq!(
+            delayed.recovery.retry_after,
+            Some(now + chrono::Duration::seconds(MAX_RECOVERY_RETRY_SECONDS as i64))
+        );
+        assert_eq!(
+            recover_inconsistent_run(&config, &scope, &run.id, AutonomyMode::Autonomous, now,)
+                .expect("defer recovery"),
+            RunRecoveryOutcome::Deferred
+        );
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn stale_recovery_failure_cannot_revive_terminal_work() {
+        let (_directory, _config, scope, run) = workflow_fixture("1ms");
+        let now = Utc::now();
+        let operation_id = format!("repair:{}:1", run.id);
+        state::update(&scope, |workspace| {
+            let current = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            current.status = LifecycleStatus::Cancelled;
+            current.recovery.attempts = 1;
+            current.recovery.proposal = Some(RunRepairProposal {
+                id: operation_id.clone(),
+                action: RunRepairAction::RestartExecutor,
+                authority: GateAuthority::Orchestrator,
+                reason: "stale recovery".into(),
+                created_at: now,
+            });
+            Ok(())
+        })
+        .expect("cancelled recovery fixture");
+
+        record_recovery_failure(
+            &scope,
+            &run.id,
+            &operation_id,
+            &anyhow::anyhow!("late startup failure"),
+            now,
+        )
+        .expect("ignore stale failure");
+        let terminal = find_run(&scope, &run.id).expect("terminal run");
+        assert_eq!(terminal.status, LifecycleStatus::Cancelled);
+        assert_eq!(terminal.recovery.attempts, 1);
+        assert_eq!(
+            terminal.recovery.proposal.expect("original proposal").id,
+            operation_id
+        );
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn recovery_start_definition_drift_becomes_a_restore_proposal() {
+        let (_directory, _config, scope, run) = workflow_fixture("1ms");
+        let now = Utc::now();
+        state::update(&scope, |workspace| {
+            let current = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            current.status = LifecycleStatus::Working;
+            current.nodes[0].status = LifecycleStatus::Working;
+            Ok(())
+        })
+        .expect("interrupted fixture");
+        let workspace = state::read(&scope).expect("workspace");
+        let current = workspace
+            .runs
+            .iter()
+            .find(|candidate| candidate.id == run.id)
+            .expect("run");
+        let issue = inspect_run_recovery(&scope, &workspace, current, AutonomyMode::Autonomous)
+            .expect("inspect")
+            .expect("recovery issue");
+        assert!(
+            transition_run_recovery(&scope, current, &issue, AutonomyMode::Autonomous, now,)
+                .expect("schedule recovery")
+        );
+        let operation_id = find_run(&scope, &run.id)
+            .expect("scheduled run")
+            .recovery
+            .proposal
+            .expect("proposal")
+            .id;
+        fs::write(
+            run.definition.as_deref().expect("definition path"),
+            "name: changed\ngoal: changed\nexpectedOutput: changed\nentryPoint: changed\nsteps: []\n",
+        )
+        .expect("change stored definition");
+
+        assert!(
+            handle_recovery_executor_failure(
+                &scope,
+                &run.id,
+                &operation_id,
+                &anyhow::anyhow!("definition changed during startup"),
+            )
+            .expect("handle startup failure")
+        );
+        let blocked = find_run(&scope, &run.id).expect("blocked run");
+        assert_eq!(blocked.status, LifecycleStatus::Blocked);
+        assert_eq!(
+            blocked.recovery.proposal.expect("restore proposal").action,
+            RunRepairAction::RestoreDefinition
+        );
+        remove_fixture_state(&scope, &run.id);
+    }
+
+    #[test]
+    fn ready_recovery_definition_drift_remains_repairable() {
+        let (_directory, _config, scope, run) = workflow_fixture("1ms");
+        state::update(&scope, |workspace| {
+            let current = workspace
+                .runs
+                .iter_mut()
+                .find(|candidate| candidate.id == run.id)
+                .expect("run");
+            current.status = LifecycleStatus::Working;
+            current.process_id = Some(std::process::id());
+            current.execution_nonce = Some("recovery-executor".into());
+            current.recovery.proposal = None;
+            Ok(())
+        })
+        .expect("ready replacement");
+        fs::write(
+            run.definition.as_deref().expect("definition path"),
+            "name: changed\ngoal: changed\nexpectedOutput: changed\nentryPoint: changed\nsteps: []\n",
+        )
+        .expect("change stored definition");
+
+        assert!(
+            handle_recovery_executor_failure(
+                &scope,
+                &run.id,
+                "repair-operation",
+                &anyhow::anyhow!("definition changed after readiness validation"),
+            )
+            .expect("handle definition drift")
+        );
+        let blocked = find_run(&scope, &run.id).expect("blocked run");
+        assert_eq!(blocked.status, LifecycleStatus::Blocked);
+        assert_eq!(blocked.process_id, None);
+        assert_eq!(
+            blocked.recovery.proposal.expect("restore proposal").action,
+            RunRepairAction::RestoreDefinition
+        );
         remove_fixture_state(&scope, &run.id);
     }
 

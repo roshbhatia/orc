@@ -971,12 +971,18 @@ pub fn run() -> Result<u8> {
             if args.json {
                 print_json(&state)?;
             } else {
+                let repairs = state
+                    .runs
+                    .iter()
+                    .filter(|run| run.recovery.proposal.is_some())
+                    .count();
                 println!(
-                    "{} · {} working · {} sessions · {} runs · {}",
+                    "{} · {} working · {} sessions · {} runs · {} repairs · {}",
                     if state.active { "active" } else { "idle" },
                     state.active_sessions().count(),
                     state.sessions.len(),
                     state.runs.len(),
+                    repairs,
                     state.scope
                 );
             }
@@ -985,11 +991,9 @@ pub fn run() -> Result<u8> {
             if args.repair {
                 require_orchestrator_or_operator(&args.scope.scope)?;
             }
-            let report = control::doctor(&args.scope.scope, args.repair)?;
+            let report = control::doctor(&config, &args.scope.scope, args.repair)?;
             if args.json {
                 print_json(&report)?;
-            } else if report.duplicates.is_empty() {
-                println!("healthy · no duplicate active native session IDs");
             } else {
                 for duplicate in &report.duplicates {
                     println!(
@@ -1005,8 +1009,22 @@ pub fn run() -> Result<u8> {
                         duplicate.duplicate_ids.join(", ")
                     );
                 }
-                if !report.repaired {
-                    println!("run `orc doctor --repair` to archive the duplicate records");
+                for issue in &report.run_issues {
+                    println!(
+                        "{} · {} · {} · {}",
+                        issue.run_id, issue.status, issue.action, issue.reason
+                    );
+                }
+                for run_id in &report.repaired_runs {
+                    println!("{run_id} · deterministic recovery applied");
+                }
+                if report.duplicates.is_empty()
+                    && report.run_issues.is_empty()
+                    && report.repaired_runs.is_empty()
+                {
+                    println!("healthy · no duplicate sessions or run recovery issues");
+                } else if !report.repaired {
+                    println!("run `orc doctor --repair` to apply deterministic repairs");
                 }
             }
         }
@@ -1510,6 +1528,16 @@ pub fn run() -> Result<u8> {
                 match workflow::execute(&config, &scope.scope, &id) {
                     Ok(run) => println!("{}\t{}", run.id, run.status),
                     Err(error) => {
+                        if let Some(operation_id) = workflow::recovery_executor_operation()
+                            && workflow::handle_recovery_executor_failure(
+                                &scope.scope,
+                                &id,
+                                &operation_id,
+                                &error,
+                            )?
+                        {
+                            return Err(error);
+                        }
                         let _ = workflow::fail(&config, &scope.scope, &id, &error);
                         return Err(error);
                     }

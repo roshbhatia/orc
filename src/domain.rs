@@ -495,6 +495,91 @@ pub struct WorkflowEdge {
     pub relationship: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunRepairAction {
+    RestartExecutor,
+    RestoreDefinition,
+    ResolveAssignment,
+}
+
+impl std::fmt::Display for RunRepairAction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}",
+            serde_json::to_value(self)
+                .expect("repair action serializes")
+                .as_str()
+                .expect("repair action is a string")
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunRecoveryEventKind {
+    DriftDetected,
+    RepairProposed,
+    RecoveryScheduled,
+    Recovered,
+    RepairFailed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunRecoveryEvent {
+    pub at: DateTime<Utc>,
+    pub kind: RunRecoveryEventKind,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunRepairProposal {
+    pub id: String,
+    pub action: RunRepairAction,
+    pub authority: GateAuthority,
+    pub reason: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RunRecovery {
+    pub attempts: u32,
+    pub retry_after: Option<DateTime<Utc>>,
+    pub proposal: Option<RunRepairProposal>,
+    pub events: Vec<RunRecoveryEvent>,
+}
+
+const MAX_RUN_RECOVERY_EVENTS: usize = 64;
+const MAX_RUN_RECOVERY_MESSAGE_BYTES: usize = 1024;
+
+impl RunRecovery {
+    pub fn record(
+        &mut self,
+        at: DateTime<Utc>,
+        kind: RunRecoveryEventKind,
+        message: impl Into<String>,
+    ) {
+        let mut message = message.into();
+        if message.len() > MAX_RUN_RECOVERY_MESSAGE_BYTES {
+            let mut end = MAX_RUN_RECOVERY_MESSAGE_BYTES - 3;
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+            message.push_str("...");
+        }
+        self.events.push(RunRecoveryEvent { at, kind, message });
+        let excess = self.events.len().saturating_sub(MAX_RUN_RECOVERY_EVENTS);
+        if excess > 0 {
+            self.events.drain(..excess);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowRun {
@@ -518,6 +603,8 @@ pub struct WorkflowRun {
     pub process_id: Option<u32>,
     #[serde(default)]
     pub execution_nonce: Option<String>,
+    #[serde(default)]
+    pub recovery: RunRecovery,
     #[serde(default)]
     pub resume_requested: bool,
     #[serde(default)]
@@ -797,6 +884,51 @@ mod tests {
         let restored: Session = serde_json::from_slice(&encoded).expect("deserialize session");
 
         assert_eq!(restored.reported_output, original.reported_output);
+    }
+
+    #[test]
+    fn recovery_history_is_typed_bounded_and_utf8_safe() {
+        let mut recovery = RunRecovery::default();
+        for index in 0..70 {
+            recovery.record(
+                Utc::now(),
+                RunRecoveryEventKind::DriftDetected,
+                format!("{index}:{}", "é".repeat(800)),
+            );
+        }
+
+        assert_eq!(recovery.events.len(), MAX_RUN_RECOVERY_EVENTS);
+        assert!(recovery.events[0].message.starts_with("6:"));
+        assert!(
+            recovery
+                .events
+                .iter()
+                .all(|event| event.message.len() <= MAX_RUN_RECOVERY_MESSAGE_BYTES)
+        );
+        assert!(
+            recovery
+                .events
+                .iter()
+                .all(|event| event.kind == RunRecoveryEventKind::DriftDetected)
+        );
+    }
+
+    #[test]
+    fn missing_recovery_state_deserializes_to_empty() {
+        let value = serde_json::json!({
+            "id": "run",
+            "name": "legacy",
+            "goal": "legacy",
+            "expectedOutput": "legacy",
+            "status": "working",
+            "orchestratorId": null,
+            "createdAt": "2026-09-06T00:00:00Z",
+            "updatedAt": "2026-09-06T00:00:00Z"
+        });
+
+        let run: WorkflowRun = serde_json::from_value(value).expect("legacy workflow run");
+
+        assert_eq!(run.recovery, RunRecovery::default());
     }
 
     #[test]

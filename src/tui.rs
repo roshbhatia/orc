@@ -6615,6 +6615,7 @@ mod tests {
             mode: crate::domain::RunMode::default(),
             process_id: None,
             execution_nonce: None,
+            recovery: Default::default(),
             resume_requested: false,
             log_path: None,
             current_node: None,
