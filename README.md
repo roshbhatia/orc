@@ -90,12 +90,20 @@ direction before opening or launching an agent.
 Use `hjkl` inside the focused pane. Click `tree`, `graph`, or `integrations` in
 the header to change the main view. Use `Ctrl-h/j/k/l` to move between work and
 the inspector. `Tab` and `Shift-Tab` cycle the selected run, stage, agent, or
-provider's contextual inspector tabs. The mouse wheel zooms the graph within
-its safe range. Drag the blank canvas to pan; Orc keeps the graph inside its
-viewport. Changes load when you open the Changes inspector. They refresh only
-when you request changes or refresh that view. Orc temporarily hides the
-inspector when the terminal is too small to keep both panes usable. Press `?`
-for generated key help.
+provider's contextual inspector tabs. Press `Ctrl-n` to rotate the inspector.
+Use `<space> i h/j/k/l` to dock it directly, or `<space> i i` to hide and
+restore it. When the inspector has focus, `-` and `=` resize it. You can also
+drag its divider. The `:split`, `:vsplit`, `:rotate`, `:dock`, and `:resize`
+commands expose the same layout controls.
+
+The mouse wheel zooms the graph within its safe range. Drag the blank canvas to
+pan; Orc keeps the graph inside its viewport. Manual zoom and pan survive
+terminal resizes. Changes load when you open the Changes inspector. They
+refresh only when you request changes or refresh that view. Orc temporarily
+hides the inspector when the terminal is too small to keep both panes usable,
+without replacing the saved layout. Each repository restores its own inspector
+dock, size, visibility, tab, and graph viewport. Press `?` for generated key
+help.
 
 Register an orchestrator session:
 

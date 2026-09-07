@@ -94,6 +94,44 @@ enum Dock {
     Hidden,
 }
 
+impl Dock {
+    fn parse(value: &str) -> Self {
+        match value {
+            "top" => Self::Top,
+            "left" => Self::Left,
+            "right" => Self::Right,
+            "hidden" => Self::Hidden,
+            _ => Self::Bottom,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Bottom => "bottom",
+            Self::Top => "top",
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Hidden => "hidden",
+        }
+    }
+
+    fn clockwise(self) -> Self {
+        match self {
+            Self::Bottom => Self::Right,
+            Self::Right => Self::Top,
+            Self::Top => Self::Left,
+            Self::Left | Self::Hidden => Self::Bottom,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum GraphViewportMode {
+    #[default]
+    Fit,
+    Manual,
+}
+
 #[derive(Clone, Debug)]
 enum Confirmation {
     Approve {
@@ -558,7 +596,14 @@ const AGENT_CARD_WIDTH: f64 = 42.0;
 const AGENT_CARD_HEIGHT: f64 = 6.0;
 const CONTROL_LANE_PADDING: f64 = 4.0;
 const GRAPH_FIT_PADDING: f64 = 6.0;
+const GRAPH_MIN_ZOOM: f64 = 0.2;
 const GRAPH_MAX_ZOOM: f64 = 2.0;
+const MIN_INSPECTOR_PERCENT: u16 = 20;
+const MAX_INSPECTOR_PERCENT: u16 = 80;
+const MIN_STACKED_MAIN: u16 = 8;
+const MIN_STACKED_INSPECTOR: u16 = 8;
+const MIN_SIDE_MAIN: u16 = 40;
+const MIN_SIDE_INSPECTOR: u16 = 32;
 const MAX_COMMAND_BYTES: usize = 4 * 1024;
 const MAX_COMMAND_HISTORY: usize = 100;
 const DISPLAY_ATTACH_WAIT: Duration = Duration::from_secs(5);
@@ -605,12 +650,15 @@ fn compact_condition(condition: &str) -> String {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct HitAreas {
+    screen: Rect,
     tree_tab: Rect,
     graph_tab: Rect,
     integrations_tab: Rect,
     main: Rect,
     graph: Rect,
+    body: Rect,
     inspector: Option<Rect>,
+    divider: Option<Rect>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -635,6 +683,9 @@ enum CommandAction {
     Activity,
     Changes,
     Mode,
+    Rotate,
+    Dock,
+    Resize,
     Split,
     VSplit,
     Close,
@@ -727,6 +778,24 @@ const COMMANDS: &[CommandSpec] = &[
         action: CommandAction::Mode,
     },
     CommandSpec {
+        name: "rotate",
+        args: "",
+        description: "rotate the inspector clockwise",
+        action: CommandAction::Rotate,
+    },
+    CommandSpec {
+        name: "dock",
+        args: "<bottom|right|top|left|hidden>",
+        description: "place or hide the inspector",
+        action: CommandAction::Dock,
+    },
+    CommandSpec {
+        name: "resize",
+        args: "<20-80|+n|-n>",
+        description: "set or adjust the inspector size",
+        action: CommandAction::Resize,
+    },
+    CommandSpec {
         name: "split",
         args: "",
         description: "dock the inspector below",
@@ -807,9 +876,13 @@ struct App {
     inspector_scroll: u16,
     output_follow_tail: bool,
     dock: Dock,
+    last_visible_dock: Dock,
+    graph_viewport_mode: GraphViewportMode,
+    divider_drag: bool,
     leader: bool,
     pending: Option<char>,
     help: bool,
+    help_scroll: u16,
     confirmation: Option<Confirmation>,
     status: String,
     status_at: Option<Instant>,
@@ -911,9 +984,13 @@ impl App {
             inspector_scroll: 0,
             output_follow_tail: false,
             dock: Dock::Bottom,
+            last_visible_dock: Dock::Bottom,
+            graph_viewport_mode: GraphViewportMode::Fit,
+            divider_drag: false,
             leader: false,
             pending: None,
             help: false,
+            help_scroll: 0,
             confirmation: None,
             status: String::new(),
             status_at: None,
@@ -974,14 +1051,27 @@ impl App {
             "changes" => OutputTab::Changes,
             _ => OutputTab::Summary,
         };
-        self.dock = match preferences.inspector_dock.as_str() {
-            "top" => Dock::Top,
-            "left" => Dock::Left,
-            "right" => Dock::Right,
-            "hidden" => Dock::Hidden,
-            _ => Dock::Bottom,
+        let saved_dock = Dock::parse(&preferences.inspector_dock);
+        self.last_visible_dock = match Dock::parse(&preferences.inspector_last_dock) {
+            Dock::Hidden => Dock::Bottom,
+            dock => dock,
         };
-        self.config.ui.inspector_percent = preferences.inspector_percent;
+        if saved_dock != Dock::Hidden {
+            self.last_visible_dock = saved_dock;
+        }
+        self.dock = if preferences.inspector_visible && saved_dock != Dock::Hidden {
+            saved_dock
+        } else {
+            Dock::Hidden
+        };
+        self.graph_viewport_mode = if preferences.graph_viewport_mode == "manual" {
+            GraphViewportMode::Manual
+        } else {
+            GraphViewportMode::Fit
+        };
+        self.config.ui.inspector_percent = preferences
+            .inspector_percent
+            .clamp(MIN_INSPECTOR_PERCENT, MAX_INSPECTOR_PERCENT);
         self.preferences = preferences;
         self.reset_inspector_scroll();
     }
@@ -994,7 +1084,10 @@ impl App {
         }
         .into();
         self.preferences.inspector_tab = format!("{:?}", self.output_tab).to_lowercase();
-        self.preferences.inspector_dock = format!("{:?}", self.dock).to_lowercase();
+        self.preferences.version = "orc.preferences/v2".into();
+        self.preferences.inspector_dock = self.dock.name().into();
+        self.preferences.inspector_visible = self.dock != Dock::Hidden;
+        self.preferences.inspector_last_dock = self.last_visible_dock.name().into();
         self.preferences.inspector_percent = self.config.ui.inspector_percent;
         self.preferences.active_run.clone_from(&self.active_run);
         self.preferences.selected_item = self.tree.get(self.tree_at).map(|row| row.id.clone());
@@ -1003,6 +1096,11 @@ impl App {
         self.preferences.graph_pan_x = viewport.x;
         self.preferences.graph_pan_y = viewport.y;
         self.preferences.graph_zoom = viewport.zoom;
+        self.preferences.graph_viewport_mode = match self.graph_viewport_mode {
+            GraphViewportMode::Fit => "fit",
+            GraphViewportMode::Manual => "manual",
+        }
+        .into();
         if let Err(error) = preferences::write(&self.scope, &self.preferences) {
             self.set_status(format!("could not save workspace view: {error:#}"));
         }
@@ -1016,6 +1114,145 @@ impl App {
     fn clear_status(&mut self) {
         self.status.clear();
         self.status_at = None;
+    }
+
+    fn dock_inspector(&mut self, dock: Dock) {
+        if dock == Dock::Hidden {
+            self.hide_inspector();
+            return;
+        }
+        self.dock = dock;
+        self.last_visible_dock = dock;
+        self.set_status(format!("inspector docked {}", dock.name()));
+    }
+
+    fn hide_inspector(&mut self) {
+        if self.dock != Dock::Hidden {
+            self.last_visible_dock = self.dock;
+        }
+        self.dock = Dock::Hidden;
+        self.focus = Focus::Main;
+        self.set_status("inspector hidden");
+    }
+
+    fn toggle_inspector(&mut self) {
+        if self.dock == Dock::Hidden {
+            self.dock = self.last_visible_dock;
+            self.set_status(format!("inspector docked {}", self.dock.name()));
+        } else {
+            self.hide_inspector();
+        }
+    }
+
+    fn rotate_inspector(&mut self) {
+        if self.dock == Dock::Hidden {
+            self.set_status("restore the inspector before rotating it");
+            return;
+        }
+        self.dock_inspector(self.dock.clockwise());
+    }
+
+    fn resize_inspector(&mut self, by: i16) {
+        let percent = i16::try_from(self.config.ui.inspector_percent).unwrap_or(80) + by;
+        self.config.ui.inspector_percent = percent.clamp(20, 80) as u16;
+        self.set_status(format!(
+            "inspector {}% of the frame",
+            self.config.ui.inspector_percent
+        ));
+    }
+
+    fn resize_inspector_to(&mut self, x: u16, y: u16) {
+        let body = self.hit.body;
+        let (size, total) = match self.dock {
+            Dock::Bottom => (
+                body.bottom().saturating_sub(y.saturating_add(1)),
+                body.height,
+            ),
+            Dock::Top => (y.saturating_sub(body.y), body.height),
+            Dock::Left => (x.saturating_sub(body.x), body.width),
+            Dock::Right => (body.right().saturating_sub(x.saturating_add(1)), body.width),
+            Dock::Hidden => return,
+        };
+        if total == 0 {
+            return;
+        }
+        let percent = (u32::from(size) * 100).div_ceil(u32::from(total));
+        self.config.ui.inspector_percent = u16::try_from(percent)
+            .unwrap_or(u16::MAX)
+            .clamp(MIN_INSPECTOR_PERCENT, MAX_INSPECTOR_PERCENT);
+        self.set_status(format!(
+            "inspector {}% of the frame",
+            self.config.ui.inspector_percent
+        ));
+    }
+
+    fn set_inspector_percent(&mut self, value: &str) -> std::result::Result<(), String> {
+        let current = i64::from(self.config.ui.inspector_percent);
+        let percent = if let Some(delta) = value.strip_prefix('+') {
+            current + parse_inspector_percent(delta)?
+        } else if let Some(delta) = value.strip_prefix('-') {
+            current - parse_inspector_percent(delta)?
+        } else {
+            parse_inspector_percent(value)?
+        };
+        if !(20..=80).contains(&percent) {
+            return Err("inspector size must be between 20 and 80".into());
+        }
+        self.config.ui.inspector_percent = percent as u16;
+        self.set_status(format!("inspector {percent}% of the frame"));
+        Ok(())
+    }
+
+    fn fit_graph(&mut self) {
+        self.graph_viewport_mode = GraphViewportMode::Fit;
+        request_flow_fit(&mut self.flow);
+    }
+
+    fn mark_graph_viewport_manual(&mut self) {
+        self.graph_viewport_mode = GraphViewportMode::Manual;
+    }
+
+    fn handle_terminal_resize(&mut self) {
+        if self.graph_viewport_mode == GraphViewportMode::Fit {
+            request_flow_fit(&mut self.flow);
+        }
+        self.resize_at = Some(Instant::now());
+    }
+
+    fn finish_terminal_resize(&mut self) {
+        let clamped = clamp_flow_viewport(&mut self.flow);
+        if clamped && self.graph_viewport_mode == GraphViewportMode::Manual {
+            self.persist_preferences();
+        }
+        self.resize_at = None;
+    }
+
+    fn open_help(&mut self) {
+        self.help = true;
+        self.help_scroll = 0;
+    }
+
+    fn move_focus(&mut self, direction: Direction) -> bool {
+        let next = match (self.focus, self.dock, direction) {
+            (Focus::Main, Dock::Bottom, Direction::Down)
+            | (Focus::Main, Dock::Top, Direction::Up)
+            | (Focus::Main, Dock::Left, Direction::Left)
+            | (Focus::Main, Dock::Right, Direction::Right) => Some(Focus::Inspector),
+            (Focus::Inspector, Dock::Bottom, Direction::Up)
+            | (Focus::Inspector, Dock::Top, Direction::Down)
+            | (Focus::Inspector, Dock::Left, Direction::Right)
+            | (Focus::Inspector, Dock::Right, Direction::Left) => Some(Focus::Main),
+            _ => None,
+        };
+        if let Some(next) = next {
+            if next == Focus::Inspector && self.hit.inspector.is_none() {
+                return false;
+            }
+            self.focus = next;
+            true
+        } else {
+            false
+        }
     }
 
     fn switch_main_tab(&mut self, tab: MainTab) {
@@ -1116,7 +1353,10 @@ impl App {
                 snapshot
                     .viewport
                     .set_offset(self.preferences.graph_pan_x, self.preferences.graph_pan_y);
-                snapshot.viewport.zoom = self.preferences.graph_zoom.clamp(0.5, 2.0);
+                snapshot.viewport.zoom = self
+                    .preferences
+                    .graph_zoom
+                    .clamp(GRAPH_MIN_ZOOM, GRAPH_MAX_ZOOM);
                 if let Ok(restored) = AgentFlow::from_snapshot(snapshot) {
                     flow = configure_flow(restored);
                 }
@@ -2215,7 +2455,7 @@ impl App {
         self.focus = Focus::Main;
         self.rebuild(true);
         self.reset_inspector_scroll();
-        request_flow_fit(&mut self.flow);
+        self.fit_graph();
         self.set_status("opened workflow graph");
         self.persist_preferences();
     }
@@ -2229,14 +2469,14 @@ impl App {
                 }
                 self.output_tab = OutputTab::Activity;
                 if self.dock == Dock::Hidden {
-                    self.dock = Dock::Bottom;
+                    self.dock_inspector(self.last_visible_dock);
                 }
                 self.request_activity(tx, true);
             }
             Action::Changes => {
                 self.output_tab = OutputTab::Changes;
                 if self.dock == Dock::Hidden {
-                    self.dock = Dock::Bottom;
+                    self.dock_inspector(self.last_visible_dock);
                 }
                 self.request_changes(tx, true);
             }
@@ -2493,19 +2733,23 @@ impl App {
                 return false;
             }
         };
-        if action != CommandAction::Mode && !args.is_empty() {
+        let takes_arguments = COMMANDS
+            .iter()
+            .find(|command| command.action == action)
+            .is_some_and(|command| !command.args.is_empty());
+        if !takes_arguments && !args.is_empty() {
             self.set_status(format!("{head} takes no arguments"));
             return false;
         }
         match action {
             CommandAction::Quit => return true,
-            CommandAction::Help => self.help = true,
+            CommandAction::Help => self.open_help(),
             CommandAction::Open => self.open_selected(tx),
             CommandAction::Inspect => {
                 if self.selected().is_none() {
                     self.set_status("nothing selected to inspect");
                 } else {
-                    self.dock = Dock::Bottom;
+                    self.dock_inspector(self.last_visible_dock);
                     self.output_tab = OutputTab::Summary;
                     self.focus = Focus::Inspector;
                     self.reset_inspector_scroll();
@@ -2525,6 +2769,7 @@ impl App {
                 self.switch_main_tab(MainTab::Work);
                 self.explorer_view = ExplorerView::Graph;
                 self.rebuild(true);
+                self.graph_viewport_mode = GraphViewportMode::Fit;
                 self.set_status("opened workflow graph");
             }
             CommandAction::Integrations => {
@@ -2533,7 +2778,7 @@ impl App {
             }
             CommandAction::Fit => {
                 if self.main_tab == MainTab::Work && self.explorer_view == ExplorerView::Graph {
-                    request_flow_fit(&mut self.flow);
+                    self.fit_graph();
                     self.set_status("fit workflow graph");
                 } else {
                     self.set_status("fit is available in the graph view");
@@ -2560,21 +2805,19 @@ impl App {
                 }
                 Err(error) => self.set_status(error),
             },
-            CommandAction::Split => {
-                self.dock = Dock::Bottom;
-                self.focus = Focus::Inspector;
-                self.set_status("inspector docked below");
+            CommandAction::Rotate => self.rotate_inspector(),
+            CommandAction::Dock => match parse_dock(args) {
+                Ok(dock) => self.dock_inspector(dock),
+                Err(error) => self.set_status(error),
+            },
+            CommandAction::Resize => {
+                if let Err(error) = self.set_inspector_percent(args) {
+                    self.set_status(error);
+                }
             }
-            CommandAction::VSplit => {
-                self.dock = Dock::Right;
-                self.focus = Focus::Inspector;
-                self.set_status("inspector docked right");
-            }
-            CommandAction::Close => {
-                self.dock = Dock::Hidden;
-                self.focus = Focus::Main;
-                self.set_status("inspector hidden");
-            }
+            CommandAction::Split => self.dock_inspector(Dock::Bottom),
+            CommandAction::VSplit => self.dock_inspector(Dock::Right),
+            CommandAction::Close => self.hide_inspector(),
         }
         self.persist_preferences();
         false
@@ -2648,8 +2891,21 @@ impl App {
             if key.code == KeyCode::Char('q') {
                 return true;
             }
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
-                self.help = false;
+            let help_scroll_max = help_scroll_max(self.hit.screen);
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') => self.help = false,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.help_scroll = self.help_scroll.saturating_add(1).min(help_scroll_max)
+                }
+                KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(10),
+                KeyCode::PageDown => {
+                    self.help_scroll = self.help_scroll.saturating_add(10).min(help_scroll_max)
+                }
+                KeyCode::Home | KeyCode::Char('g') => self.help_scroll = 0,
+                _ => {}
             }
             return false;
         }
@@ -2658,9 +2914,15 @@ impl App {
             match key.code {
                 KeyCode::Char('i') => {
                     self.pending = Some('i');
-                    self.set_status("inspector: i toggle, h/j/k/l dock");
+                    self.set_status(binding_hints(&[
+                        "dock-toggle",
+                        "dock-left",
+                        "dock-bottom",
+                        "dock-top",
+                        "dock-right",
+                    ]));
                 }
-                KeyCode::Char('?') => self.help = true,
+                KeyCode::Char('?') => self.open_help(),
                 _ => self.set_status("unknown leader action"),
             }
             return false;
@@ -2668,27 +2930,24 @@ impl App {
         if let Some(prefix) = self.pending.take() {
             match (prefix, key.code) {
                 ('i', KeyCode::Char('i')) => {
-                    self.dock = if self.dock == Dock::Hidden {
-                        Dock::Bottom
-                    } else {
-                        Dock::Hidden
-                    };
-                    if self.dock == Dock::Hidden {
-                        self.focus = Focus::Main;
-                    }
+                    self.toggle_inspector();
                 }
-                ('i', KeyCode::Char('h')) => self.dock = Dock::Left,
-                ('i', KeyCode::Char('j')) => self.dock = Dock::Bottom,
-                ('i', KeyCode::Char('k')) => self.dock = Dock::Top,
-                ('i', KeyCode::Char('l')) => self.dock = Dock::Right,
-                ('w', KeyCode::Char('j')) if self.dock != Dock::Hidden => {
-                    self.focus = Focus::Inspector
+                ('i', KeyCode::Char('h')) => self.dock_inspector(Dock::Left),
+                ('i', KeyCode::Char('j')) => self.dock_inspector(Dock::Bottom),
+                ('i', KeyCode::Char('k')) => self.dock_inspector(Dock::Top),
+                ('i', KeyCode::Char('l')) => self.dock_inspector(Dock::Right),
+                ('w', KeyCode::Char('j')) => {
+                    self.move_focus(Direction::Down);
                 }
-                ('w', KeyCode::Char('k')) => self.focus = Focus::Main,
-                ('w', KeyCode::Char('l')) if self.dock != Dock::Hidden => {
-                    self.focus = Focus::Inspector
+                ('w', KeyCode::Char('k')) => {
+                    self.move_focus(Direction::Up);
                 }
-                ('w', KeyCode::Char('h')) => self.focus = Focus::Main,
+                ('w', KeyCode::Char('l')) => {
+                    self.move_focus(Direction::Right);
+                }
+                ('w', KeyCode::Char('h')) => {
+                    self.move_focus(Direction::Left);
+                }
                 _ => self.set_status("unknown key sequence"),
             }
             self.persist_preferences();
@@ -2696,24 +2955,28 @@ impl App {
         }
         match (key.code, ctrl) {
             (KeyCode::Char('q'), _) => return true,
-            (KeyCode::Char('?'), _) => self.help = true,
+            (KeyCode::Char('?'), _) => self.open_help(),
             (KeyCode::Char(':'), _) => {
                 self.command = Some(CommandLine::default());
                 self.clear_status();
             }
             (KeyCode::Char(' '), _) => self.leader = true,
             (KeyCode::Char('w'), true) => self.pending = Some('w'),
-            (KeyCode::Char('j'), true) if binding_enabled(self, "focus-inspector") => {
-                self.focus = Focus::Inspector
+            (KeyCode::Char('j'), true) => {
+                self.move_focus(Direction::Down);
             }
-            (KeyCode::Char('k'), true) if binding_enabled(self, "focus-main") => {
-                self.focus = Focus::Main
+            (KeyCode::Char('k'), true) => {
+                self.move_focus(Direction::Up);
             }
-            (KeyCode::Char('l'), true) if binding_enabled(self, "focus-inspector") => {
-                self.focus = Focus::Inspector
+            (KeyCode::Char('l'), true) => {
+                self.move_focus(Direction::Right);
             }
-            (KeyCode::Char('h'), true) if binding_enabled(self, "focus-main") => {
-                self.focus = Focus::Main
+            (KeyCode::Char('h'), true) => {
+                self.move_focus(Direction::Left);
+            }
+            (KeyCode::Char('n'), true) if binding_enabled(self, "rotate") => {
+                self.rotate_inspector();
+                self.persist_preferences();
             }
             (KeyCode::Char('d'), true) if binding_enabled(self, "page") => self.page(1),
             (KeyCode::Char('u'), true) if binding_enabled(self, "page") => self.page(-1),
@@ -2732,6 +2995,9 @@ impl App {
                 } else {
                     ExplorerView::Tree
                 };
+                if self.explorer_view == ExplorerView::Graph {
+                    self.graph_viewport_mode = GraphViewportMode::Fit;
+                }
                 self.focus = Focus::Main;
                 self.rebuild(true);
                 self.reset_inspector_scroll();
@@ -2791,23 +3057,25 @@ impl App {
             }
             (KeyCode::Char('R'), _) if binding_enabled(self, "relayout") => {
                 self.rebuild(true);
-                request_flow_fit(&mut self.flow);
+                self.fit_graph();
+                self.persist_preferences();
             }
             (KeyCode::Char('o'), _) if binding_enabled(self, "viewport") => {
-                request_flow_fit(&mut self.flow);
+                self.fit_graph();
+                self.persist_preferences();
             }
             (KeyCode::Char('+' | '=' | '-' | '_'), _) if binding_enabled(self, "viewport") => {
                 let _ = self.flow.handle_controls_key_event(key);
+                self.mark_graph_viewport_manual();
                 clamp_flow_viewport(&mut self.flow);
                 self.persist_preferences();
             }
             (KeyCode::Char('='), _) if binding_enabled(self, "resize") => {
-                self.config.ui.inspector_percent = (self.config.ui.inspector_percent + 5).min(80);
+                self.resize_inspector(5);
                 self.persist_preferences();
             }
             (KeyCode::Char('-'), _) if binding_enabled(self, "resize") => {
-                self.config.ui.inspector_percent =
-                    self.config.ui.inspector_percent.saturating_sub(5).max(20);
+                self.resize_inspector(-5);
                 self.persist_preferences();
             }
             (KeyCode::Char('i'), _) if binding_enabled(self, "activity") => {
@@ -2836,6 +3104,35 @@ impl App {
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         let x = mouse.column;
         let y = mouse.row;
+        if self.help {
+            let help_scroll_max = help_scroll_max(self.hit.screen);
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.help_scroll = self.help_scroll.saturating_sub(3),
+                MouseEventKind::ScrollDown => {
+                    self.help_scroll = self.help_scroll.saturating_add(3).min(help_scroll_max)
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.divider_drag {
+            match mouse.kind {
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.divider_drag = false;
+                    self.persist_preferences();
+                }
+                MouseEventKind::Drag(MouseButton::Left) => self.resize_inspector_to(x, y),
+                _ => {}
+            }
+            return;
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.hit.divider.is_some_and(|area| contains(area, x, y))
+        {
+            self.divider_drag = true;
+            self.set_status("drag the divider to resize");
+            return;
+        }
         if self.main_tab == MainTab::Work
             && self.explorer_view == ExplorerView::Graph
             && matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
@@ -2862,6 +3159,7 @@ impl App {
                     self.active_run = self.selected_tree_run_id();
                 }
                 self.explorer_view = ExplorerView::Graph;
+                self.graph_viewport_mode = GraphViewportMode::Fit;
                 self.rebuild(true);
                 self.reset_inspector_scroll();
                 request_flow_fit(&mut self.flow);
@@ -2913,6 +3211,14 @@ impl App {
                         | MouseEventKind::ScrollDown
                 );
                 let _ = self.flow.handle_mouse_event(mouse);
+                if matches!(
+                    mouse.kind,
+                    MouseEventKind::Drag(MouseButton::Left)
+                        | MouseEventKind::ScrollUp
+                        | MouseEventKind::ScrollDown
+                ) {
+                    self.mark_graph_viewport_manual();
+                }
                 if clamp_after {
                     clamp_flow_viewport(&mut self.flow);
                     self.persist_preferences();
@@ -3035,6 +3341,23 @@ impl App {
 
 fn non_empty(value: String) -> Option<String> {
     (!value.trim().is_empty()).then_some(value)
+}
+
+fn parse_inspector_percent(value: &str) -> std::result::Result<i64, String> {
+    value
+        .parse::<i64>()
+        .map_err(|_| "inspector size must be between 20 and 80".into())
+}
+
+fn parse_dock(value: &str) -> std::result::Result<Dock, String> {
+    match value {
+        "bottom" => Ok(Dock::Bottom),
+        "right" => Ok(Dock::Right),
+        "top" => Ok(Dock::Top),
+        "left" => Ok(Dock::Left),
+        "hidden" => Ok(Dock::Hidden),
+        _ => Err("dock must be bottom, right, top, left, or hidden".into()),
+    }
 }
 
 fn command_candidates(head: &str) -> Vec<String> {
@@ -3357,7 +3680,7 @@ fn configure_flow(flow: AgentFlow) -> AgentFlow {
     palette.accent = Color::Cyan;
     palette.text = Color::Reset;
     flow.with_theme(Theme::Custom(palette))
-        .with_min_zoom(0.2)
+        .with_min_zoom(GRAPH_MIN_ZOOM)
         .with_max_zoom(GRAPH_MAX_ZOOM)
         .with_deselect_on_pane_click(false)
         .with_selection_reveal(rataflow::SelectionReveal::EnsureVisible)
@@ -3367,7 +3690,11 @@ fn request_flow_fit(flow: &mut AgentFlow) {
     flow.request_fit_view_with_options(
         FitViewOptions::default()
             .with_padding(graph_visual_padding(flow, GRAPH_MAX_ZOOM))
-            .with_min_zoom(if flow.nodes().count() > 3 { 0.2 } else { 0.5 }),
+            .with_min_zoom(if flow.nodes().count() > 3 {
+                GRAPH_MIN_ZOOM
+            } else {
+                0.5
+            }),
     );
 }
 
@@ -4230,6 +4557,7 @@ fn push_run_rows(
 fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     app.hit = HitAreas::default();
+    app.hit.screen = area;
     match &app.boot {
         BootState::Loading { started_at } => {
             render_loading(
@@ -4255,23 +4583,21 @@ fn render(frame: &mut Frame, app: &mut App) {
     ])
     .areas(area);
     render_header(frame, header, app);
-    let (mut main, mut inspector) = split_body(body, app.dock, app.config.ui.inspector_percent);
-    if graph_needs_full_body(app, main) {
-        main = body;
-        inspector = None;
-    }
+    app.hit.body = body;
+    let (main, inspector) = split_body(body, app.dock, app.config.ui.inspector_percent);
     if inspector.is_none() && app.focus == Focus::Inspector {
         app.focus = Focus::Main;
     }
     app.hit.main = main;
     app.hit.inspector = inspector;
+    app.hit.divider = inspector.and_then(|_| divider_rect(main, app.dock));
     render_main(frame, main, app);
     if let Some(inspector) = inspector {
         render_inspector(frame, inspector, app);
     }
     render_footer(frame, footer, app);
     if app.help {
-        render_help(frame, area);
+        render_help(frame, area, app.help_scroll);
     }
     if let Some(confirmation) = &app.confirmation {
         render_confirmation(frame, area, confirmation);
@@ -4372,52 +4698,89 @@ fn render_startup_error(frame: &mut Frame, area: Rect, error: &str) {
     );
 }
 
-fn split_body(area: Rect, dock: Dock, percent: u16) -> (Rect, Option<Rect>) {
-    let too_small_for_dock = match dock {
-        Dock::Bottom | Dock::Top => area.height < 18,
-        Dock::Left | Dock::Right => area.width < 76,
-        Dock::Hidden => true,
-    };
-    if too_small_for_dock {
-        return (area, None);
+fn inspector_size(total: u16, percent: u16, inspector_min: u16, main_min: u16) -> Option<u16> {
+    if total < inspector_min.saturating_add(main_min) {
+        return None;
     }
+    Some(
+        u16::try_from(
+            u32::from(total)
+                * u32::from(percent.clamp(MIN_INSPECTOR_PERCENT, MAX_INSPECTOR_PERCENT))
+                / 100,
+        )
+        .unwrap_or(u16::MAX)
+        .clamp(inspector_min, total.saturating_sub(main_min)),
+    )
+}
+
+fn split_body(area: Rect, dock: Dock, percent: u16) -> (Rect, Option<Rect>) {
     match dock {
         Dock::Bottom => {
-            let size = (area.height.saturating_mul(percent) / 100).clamp(8, 18);
+            let Some(size) = inspector_size(
+                area.height,
+                percent,
+                MIN_STACKED_INSPECTOR,
+                MIN_STACKED_MAIN,
+            ) else {
+                return (area, None);
+            };
             let [a, b] =
-                Layout::vertical([Constraint::Min(8), Constraint::Length(size)]).areas(area);
+                Layout::vertical([Constraint::Fill(1), Constraint::Length(size)]).areas(area);
             (a, Some(b))
         }
         Dock::Top => {
-            let size = (area.height.saturating_mul(percent) / 100).clamp(8, 18);
+            let Some(size) = inspector_size(
+                area.height,
+                percent,
+                MIN_STACKED_INSPECTOR,
+                MIN_STACKED_MAIN,
+            ) else {
+                return (area, None);
+            };
             let [b, a] =
-                Layout::vertical([Constraint::Length(size), Constraint::Min(8)]).areas(area);
+                Layout::vertical([Constraint::Length(size), Constraint::Fill(1)]).areas(area);
             (a, Some(b))
         }
         Dock::Left => {
-            let size = (area.width.saturating_mul(percent) / 100).clamp(32, 60);
+            let Some(size) = inspector_size(area.width, percent, MIN_SIDE_INSPECTOR, MIN_SIDE_MAIN)
+            else {
+                return (area, None);
+            };
             let [b, a] =
-                Layout::horizontal([Constraint::Length(size), Constraint::Min(40)]).areas(area);
+                Layout::horizontal([Constraint::Length(size), Constraint::Fill(1)]).areas(area);
             (a, Some(b))
         }
         Dock::Right => {
-            let size = (area.width.saturating_mul(percent) / 100).clamp(32, 60);
+            let Some(size) = inspector_size(area.width, percent, MIN_SIDE_INSPECTOR, MIN_SIDE_MAIN)
+            else {
+                return (area, None);
+            };
             let [a, b] =
-                Layout::horizontal([Constraint::Min(40), Constraint::Length(size)]).areas(area);
+                Layout::horizontal([Constraint::Fill(1), Constraint::Length(size)]).areas(area);
             (a, Some(b))
         }
         Dock::Hidden => (area, None),
     }
 }
 
-fn graph_needs_full_body(app: &App, graph_area: Rect) -> bool {
-    if app.main_tab != MainTab::Work || app.explorer_view != ExplorerView::Graph {
-        return false;
+fn divider_rect(main: Rect, dock: Dock) -> Option<Rect> {
+    match dock {
+        Dock::Bottom if main.height > 0 => Some(Rect::new(
+            main.x,
+            main.bottom().saturating_sub(1),
+            main.width,
+            1,
+        )),
+        Dock::Top if main.height > 0 => Some(Rect::new(main.x, main.y, main.width, 1)),
+        Dock::Left if main.width > 0 => Some(Rect::new(main.x, main.y, 1, main.height)),
+        Dock::Right if main.width > 0 => Some(Rect::new(
+            main.right().saturating_sub(1),
+            main.y,
+            1,
+            main.height,
+        )),
+        _ => None,
     }
-    let minimum_width = (AGENT_CARD_WIDTH * 0.75).ceil() as u16 + 4;
-    let minimum_height =
-        ((AGENT_CARD_HEIGHT * 2.0 + CONTROL_LANE_PADDING + 4.0) * 0.75).ceil() as u16 + 4;
-    graph_area.width < minimum_width || graph_area.height < minimum_height
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -5704,6 +6067,10 @@ fn inspector_available(app: &App) -> bool {
     app.focus == Focus::Main && app.hit.inspector.is_some()
 }
 
+fn inspector_visible(app: &App) -> bool {
+    app.dock != Dock::Hidden
+}
+
 fn open_available(app: &App) -> bool {
     work_main(app)
         && matches!(
@@ -5843,17 +6210,17 @@ const BINDINGS: &[Binding] = &[
     ),
     binding!(
         "focus-inspector",
-        "ctrl+j/l",
+        "ctrl+h/j/k/l",
         "inspector",
-        "focus the inspector",
+        "focus the inspector in its direction",
         true,
         inspector_available
     ),
     binding!(
         "focus-main",
-        "ctrl+k/h",
+        "ctrl+h/j/k/l",
         "main",
-        "focus the main pane",
+        "focus the main pane in its direction",
         true,
         inspector
     ),
@@ -5915,11 +6282,19 @@ const BINDINGS: &[Binding] = &[
     ),
     binding!(
         "resize",
-        "+/-",
+        "-/=",
         "resize",
         "resize the inspector",
         false,
         inspector
+    ),
+    binding!(
+        "rotate",
+        "ctrl+n",
+        "rotate",
+        "rotate the inspector clockwise",
+        false,
+        inspector_visible
     ),
     binding!(
         "activity",
@@ -5954,10 +6329,42 @@ const BINDINGS: &[Binding] = &[
         anywhere
     ),
     binding!(
-        "dock",
-        "space i h/j/k/l",
-        "dock",
-        "move or hide the inspector",
+        "dock-toggle",
+        "<space> i i",
+        "toggle",
+        "toggle the inspector",
+        false,
+        anywhere
+    ),
+    binding!(
+        "dock-left",
+        "<space> i h",
+        "left",
+        "dock the inspector left",
+        false,
+        anywhere
+    ),
+    binding!(
+        "dock-bottom",
+        "<space> i j",
+        "bottom",
+        "dock the inspector bottom",
+        false,
+        anywhere
+    ),
+    binding!(
+        "dock-top",
+        "<space> i k",
+        "top",
+        "dock the inspector top",
+        false,
+        anywhere
+    ),
+    binding!(
+        "dock-right",
+        "<space> i l",
+        "right",
+        "dock the inspector right",
         false,
         anywhere
     ),
@@ -5974,13 +6381,32 @@ const BINDINGS: &[Binding] = &[
 ];
 
 fn binding_enabled(app: &App, id: &str) -> bool {
-    BINDINGS
-        .iter()
-        .find(|binding| binding.id == id)
-        .is_some_and(|binding| (binding.available)(app))
+    binding_by_id(id).is_some_and(|binding| (binding.available)(app))
 }
 
-fn render_help(frame: &mut Frame, area: Rect) {
+fn binding_by_id(id: &str) -> Option<&'static Binding> {
+    BINDINGS.iter().find(|binding| binding.id == id)
+}
+
+fn binding_hints(ids: &[&str]) -> String {
+    ids.iter()
+        .filter_map(|id| binding_by_id(id))
+        .map(|binding| format!("{} {}", binding.keys, binding.short))
+        .collect::<Vec<_>>()
+        .join("   ")
+}
+
+fn help_scroll_max(area: Rect) -> u16 {
+    let row_count = BINDINGS.len().max(COMMANDS.len());
+    let popup_height = area.height.min((row_count + 4) as u16);
+    if area.width.min(110) < 30 || popup_height < 8 {
+        return 0;
+    }
+    let visible_rows = usize::from(popup_height.saturating_sub(3));
+    u16::try_from(row_count.saturating_sub(visible_rows)).unwrap_or(u16::MAX)
+}
+
+fn render_help(frame: &mut Frame, area: Rect, scroll: u16) {
     let width = area.width.min(110);
     let height = area
         .height
@@ -6003,7 +6429,10 @@ fn render_help(frame: &mut Frame, area: Rect) {
         ),
         Span::styled("commands", title()),
     ])];
-    lines.extend((0..BINDINGS.len().max(COMMANDS.len())).map(|index| {
+    let row_count = BINDINGS.len().max(COMMANDS.len());
+    let visible_rows = usize::from(popup.height.saturating_sub(3));
+    let scroll = usize::from(scroll.min(help_scroll_max(area)));
+    lines.extend((scroll..row_count).take(visible_rows).map(|index| {
         let left = BINDINGS.get(index).map_or_else(String::new, |binding| {
             truncate(
                 &format!("{}  {}", binding.keys, binding.description),
@@ -6039,7 +6468,9 @@ fn render_help(frame: &mut Frame, area: Rect) {
                 .border_type(BorderType::Rounded)
                 .border_style(accent())
                 .title(" keys · commands ")
-                .title_bottom(Line::from(" ? / esc to close ").alignment(Alignment::Center)),
+                .title_bottom(
+                    Line::from(" up/down scroll · ? / esc close ").alignment(Alignment::Center),
+                ),
         ),
         popup,
     );
@@ -6450,8 +6881,7 @@ pub fn run(config: Config, scope: &Path) -> Result<()> {
             .resize_at
             .is_some_and(|at| at.elapsed() >= Duration::from_millis(120))
         {
-            clamp_flow_viewport(&mut app.flow);
-            app.resize_at = None;
+            app.finish_terminal_resize();
             dirty = true;
         }
         let animate = app.needs_animation();
@@ -6485,10 +6915,7 @@ pub fn run(config: Config, scope: &Path) -> Result<()> {
                 match event::read()? {
                     Event::Key(key) if app.handle_key(key, &tx) => quit = true,
                     Event::Mouse(mouse) => app.handle_mouse(mouse),
-                    Event::Resize(_, _) => {
-                        request_flow_fit(&mut app.flow);
-                        app.resize_at = Some(Instant::now());
-                    }
+                    Event::Resize(_, _) => app.handle_terminal_resize(),
                     _ => {}
                 }
                 dirty = true;
@@ -6740,6 +7167,47 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains(":mode"));
         assert!(rendered.contains(":close"));
+    }
+
+    #[test]
+    fn compact_help_scrolls_to_every_layout_binding() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = app();
+        let (tx, _rx) = mpsc::channel();
+        app.open_help();
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("initial help renders");
+        for _ in 0..BINDINGS.len() + 5 {
+            app.handle_key(key(KeyCode::Char('j'), KeyModifiers::NONE), &tx);
+        }
+        let bottom = help_scroll_max(Rect::new(0, 0, 80, 24));
+        assert_eq!(app.help_scroll, bottom);
+        app.handle_key(key(KeyCode::Char('k'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.help_scroll, bottom.saturating_sub(1));
+
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("help renders after scrolling");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        for keys in [
+            "ctrl+n",
+            "<space> i i",
+            "<space> i h",
+            "<space> i j",
+            "<space> i k",
+            "<space> i l",
+        ] {
+            assert!(rendered.contains(keys), "missing {keys} from compact help");
+        }
     }
 
     #[test]
@@ -7602,6 +8070,387 @@ mod tests {
                 assert!(app.hit.inspector.is_some_and(|area| area.height >= 8));
             }
         }
+    }
+
+    #[test]
+    fn inspector_rotates_without_losing_context() {
+        let mut app = app();
+        let (tx, _rx) = mpsc::channel();
+        app.focus = Focus::Inspector;
+        app.output_tab = OutputTab::Activity;
+        app.inspector_scroll = 7;
+
+        for expected in [Dock::Right, Dock::Top, Dock::Left, Dock::Bottom] {
+            app.handle_key(key(KeyCode::Char('n'), KeyModifiers::CONTROL), &tx);
+            assert_eq!(app.dock, expected);
+            assert_eq!(app.focus, Focus::Inspector);
+            assert_eq!(app.output_tab, OutputTab::Activity);
+            assert_eq!(app.inspector_scroll, 7);
+        }
+    }
+
+    #[test]
+    fn direct_docks_and_hidden_restore_preserve_the_last_layout() {
+        let mut app = app();
+        let (tx, _rx) = mpsc::channel();
+        app.output_tab = OutputTab::Output;
+        app.inspector_scroll = 9;
+
+        for (key_code, expected) in [
+            ('h', Dock::Left),
+            ('j', Dock::Bottom),
+            ('k', Dock::Top),
+            ('l', Dock::Right),
+        ] {
+            app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+            app.handle_key(key(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
+            app.handle_key(key(KeyCode::Char(key_code), KeyModifiers::NONE), &tx);
+            assert_eq!(app.dock, expected);
+            assert_eq!(app.last_visible_dock, expected);
+            assert_eq!(app.output_tab, OutputTab::Output);
+            assert_eq!(app.inspector_scroll, 9);
+        }
+
+        app.focus = Focus::Inspector;
+        for _ in 0..2 {
+            app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+            app.handle_key(key(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
+            app.handle_key(key(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
+        }
+        assert_eq!(app.dock, Dock::Right);
+        assert_eq!(app.last_visible_dock, Dock::Right);
+        assert_eq!(app.output_tab, OutputTab::Output);
+        assert_eq!(app.inspector_scroll, 9);
+    }
+
+    #[test]
+    fn inspector_commands_rotate_split_dock_and_resize() {
+        let mut app = app();
+        let (tx, _rx) = mpsc::channel();
+
+        app.run_command("vsplit", &tx);
+        assert_eq!(app.dock, Dock::Right);
+        app.run_command("rotate", &tx);
+        assert_eq!(app.dock, Dock::Top);
+        app.run_command("split", &tx);
+        assert_eq!(app.dock, Dock::Bottom);
+        app.run_command("dock left", &tx);
+        assert_eq!(app.dock, Dock::Left);
+        app.run_command("resize 55", &tx);
+        app.run_command("resize +5", &tx);
+        app.run_command("resize -10", &tx);
+        assert_eq!(app.config.ui.inspector_percent, 50);
+        app.run_command("close", &tx);
+        assert_eq!(app.dock, Dock::Hidden);
+        assert_eq!(app.last_visible_dock, Dock::Left);
+    }
+
+    #[test]
+    fn inspector_resize_command_rejects_overflowing_adjustments() {
+        let mut app = app();
+        let (tx, _rx) = mpsc::channel();
+        let original = app.config.ui.inspector_percent;
+
+        app.run_command("resize +32767", &tx);
+
+        assert_eq!(app.config.ui.inspector_percent, original);
+        assert_eq!(app.status, "inspector size must be between 20 and 80");
+    }
+
+    #[test]
+    fn inspector_resize_keys_are_bounded() {
+        let mut app = app();
+        let (tx, _rx) = mpsc::channel();
+        app.focus = Focus::Inspector;
+        app.config.ui.inspector_percent = MAX_INSPECTOR_PERCENT;
+
+        app.handle_key(key(KeyCode::Char('='), KeyModifiers::NONE), &tx);
+        assert_eq!(app.config.ui.inspector_percent, MAX_INSPECTOR_PERCENT);
+        app.config.ui.inspector_percent = MIN_INSPECTOR_PERCENT;
+        app.handle_key(key(KeyCode::Char('-'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.config.ui.inspector_percent, MIN_INSPECTOR_PERCENT);
+    }
+
+    #[test]
+    fn spatial_focus_follows_each_dock() {
+        for (dock, toward_inspector, toward_main) in [
+            (Dock::Bottom, Direction::Down, Direction::Up),
+            (Dock::Right, Direction::Right, Direction::Left),
+            (Dock::Top, Direction::Up, Direction::Down),
+            (Dock::Left, Direction::Left, Direction::Right),
+        ] {
+            let mut app = app();
+            app.dock_inspector(dock);
+            app.hit.inspector = Some(Rect::new(0, 0, 20, 10));
+            assert!(app.move_focus(toward_inspector));
+            assert_eq!(app.focus, Focus::Inspector);
+            assert!(app.move_focus(toward_main));
+            assert_eq!(app.focus, Focus::Main);
+        }
+    }
+
+    #[test]
+    fn compact_layout_cannot_focus_an_effectively_hidden_inspector() {
+        let mut app = app();
+        app.dock_inspector(Dock::Right);
+        let backend = TestBackend::new(40, 14);
+        let mut terminal = Terminal::new(backend).expect("small terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("small layout renders");
+
+        assert!(app.hit.inspector.is_none());
+        assert!(!app.move_focus(Direction::Right));
+        assert_eq!(app.focus, Focus::Main);
+        assert_eq!(app.dock, Dock::Right);
+    }
+
+    #[test]
+    fn layout_uses_percentages_without_overwriting_hidden_preferences() {
+        let mut app = app();
+        app.config.ui.inspector_percent = 50;
+        for dock in [Dock::Bottom, Dock::Top, Dock::Left, Dock::Right] {
+            app.dock_inspector(dock);
+            let backend = TestBackend::new(160, 50);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            terminal
+                .draw(|frame| render(frame, &mut app))
+                .expect("layout renders");
+            let inspector = app.hit.inspector.expect("inspector remains visible");
+            match dock {
+                Dock::Bottom | Dock::Top => assert!(inspector.height > 18),
+                Dock::Left | Dock::Right => assert!(inspector.width > 60),
+                Dock::Hidden => unreachable!(),
+            }
+        }
+
+        app.dock_inspector(Dock::Left);
+        let backend = TestBackend::new(40, 14);
+        let mut terminal = Terminal::new(backend).expect("small terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("small layout renders");
+        assert!(app.hit.inspector.is_none());
+        assert_eq!(app.dock, Dock::Left);
+        assert_eq!(app.last_visible_dock, Dock::Left);
+    }
+
+    #[test]
+    fn mouse_drag_resizes_the_docked_inspector() {
+        for dock in [Dock::Bottom, Dock::Right, Dock::Top, Dock::Left] {
+            let mut app = app();
+            app.dock_inspector(dock);
+            let backend = TestBackend::new(160, 50);
+            let mut terminal = Terminal::new(backend).expect("test terminal");
+            terminal
+                .draw(|frame| render(frame, &mut app))
+                .expect("layout renders");
+            let divider = app.hit.divider.expect("divider hit area");
+            let (x, y) = match dock {
+                Dock::Bottom => (divider.x, app.hit.body.y + app.hit.body.height / 2),
+                Dock::Right => (app.hit.body.x + app.hit.body.width / 2, divider.y),
+                Dock::Top => (divider.x, app.hit.body.y + app.hit.body.height / 2),
+                Dock::Left => (app.hit.body.x + app.hit.body.width / 2, divider.y),
+                Dock::Hidden => unreachable!(),
+            };
+
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: divider.x,
+                row: divider.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert!(app.divider_drag);
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            });
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            });
+
+            assert!(!app.divider_drag);
+            assert!(
+                (48..=52).contains(&app.config.ui.inspector_percent),
+                "{dock:?} produced {}%",
+                app.config.ui.inspector_percent
+            );
+        }
+    }
+
+    #[test]
+    fn large_terminal_divider_math_does_not_saturate() {
+        let mut app = app();
+        app.dock_inspector(Dock::Left);
+        app.hit.body = Rect::new(0, 0, 1_000, 40);
+
+        app.resize_inspector_to(800, 0);
+
+        assert_eq!(app.config.ui.inspector_percent, 80);
+        let (_, inspector) = split_body(app.hit.body, app.dock, 80);
+        assert_eq!(inspector.expect("large inspector").width, 800);
+    }
+
+    #[test]
+    fn compact_rotation_keeps_an_accepted_split_and_inspector_focus() {
+        let mut app = app();
+        app.state.runs.push(workflow_run());
+        app.active_run = Some("run".into());
+        app.explorer_view = ExplorerView::Graph;
+        app.dock_inspector(Dock::Right);
+        app.rebuild(true);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("compact terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("right split renders");
+        app.focus = Focus::Inspector;
+        let (tx, _rx) = mpsc::channel();
+
+        app.handle_key(key(KeyCode::Char('n'), KeyModifiers::CONTROL), &tx);
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("top split renders");
+
+        assert_eq!(app.dock, Dock::Top);
+        assert_eq!(app.focus, Focus::Inspector);
+        assert!(app.hit.inspector.is_some());
+    }
+
+    #[test]
+    fn saved_layout_restores_visibility_dock_tab_size_and_viewport_mode() {
+        let mut app = app();
+        app.apply_preferences(WorkspacePreferences {
+            inspector_tab: "output".into(),
+            inspector_dock: "hidden".into(),
+            inspector_visible: false,
+            inspector_last_dock: "left".into(),
+            inspector_percent: 55,
+            graph_viewport_mode: "manual".into(),
+            ..WorkspacePreferences::default()
+        });
+
+        assert_eq!(app.dock, Dock::Hidden);
+        assert_eq!(app.last_visible_dock, Dock::Left);
+        assert_eq!(app.output_tab, OutputTab::Output);
+        assert_eq!(app.config.ui.inspector_percent, 55);
+        assert_eq!(app.graph_viewport_mode, GraphViewportMode::Manual);
+        app.toggle_inspector();
+        assert_eq!(app.dock, Dock::Left);
+    }
+
+    #[test]
+    fn saved_manual_viewport_restores_zoom_below_fit_floor() {
+        let mut app = app();
+        let mut run = workflow_run();
+        run.nodes = (0..5)
+            .map(|index| workflow_node(&format!("stage-{index}"), LifecycleStatus::Queued, 0))
+            .collect();
+        app.state.runs.push(run);
+        app.apply_preferences(WorkspacePreferences {
+            view: "graph".into(),
+            active_run: Some("run".into()),
+            graph_selected_item: Some("session:root".into()),
+            graph_pan_x: 13.0,
+            graph_pan_y: -7.0,
+            graph_zoom: 0.3,
+            graph_viewport_mode: "manual".into(),
+            ..WorkspacePreferences::default()
+        });
+
+        app.rebuild(false);
+
+        let viewport = app.flow.to_snapshot().viewport;
+        assert_eq!((viewport.x, viewport.y, viewport.zoom), (13.0, -7.0, 0.3));
+        assert_eq!(app.graph_viewport_mode, GraphViewportMode::Manual);
+    }
+
+    #[test]
+    fn resize_clamp_persists_manual_offsets_before_topology_rebuild() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let mut app = app();
+        app.scope = temporary.path().to_path_buf();
+        let mut run = workflow_run();
+        run.nodes = (0..5)
+            .map(|index| workflow_node(&format!("stage-{index}"), LifecycleStatus::Queued, 0))
+            .collect();
+        app.state.runs.push(run);
+        app.active_run = Some("run".into());
+        app.explorer_view = ExplorerView::Graph;
+        app.dock = Dock::Hidden;
+        app.rebuild(true);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("graph renders");
+        let mut snapshot = app.flow.to_snapshot();
+        snapshot.viewport.zoom = 0.3;
+        snapshot.viewport.set_offset(10_000.0, -10_000.0);
+        app.flow = configure_flow(AgentFlow::from_snapshot(snapshot).expect("restore viewport"));
+        app.mark_graph_viewport_manual();
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("manual viewport renders");
+
+        app.handle_terminal_resize();
+        app.finish_terminal_resize();
+
+        let clamped = app.flow.to_snapshot().viewport;
+        assert_eq!(app.preferences.graph_pan_x, clamped.x);
+        assert_eq!(app.preferences.graph_pan_y, clamped.y);
+        assert_eq!(app.preferences.graph_zoom, 0.3);
+        app.state.runs[0]
+            .nodes
+            .push(workflow_node("added", LifecycleStatus::Queued, 0));
+        app.rebuild(false);
+        let restored = app.flow.to_snapshot().viewport;
+        assert_eq!(
+            (restored.x, restored.y, restored.zoom),
+            (clamped.x, clamped.y, 0.3)
+        );
+    }
+
+    #[test]
+    fn terminal_resize_preserves_a_manual_graph_viewport() {
+        let mut app = app();
+        let mut run = workflow_run();
+        run.nodes = (0..4)
+            .map(|index| workflow_node(&format!("stage-{index}"), LifecycleStatus::Queued, 0))
+            .collect();
+        app.state.runs.push(run);
+        app.active_run = Some("run".into());
+        app.explorer_view = ExplorerView::Graph;
+        app.dock = Dock::Hidden;
+        app.rebuild(true);
+        let backend = TestBackend::new(120, 32);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("graph renders");
+        let _ = app
+            .flow
+            .handle_controls_key_event(key(KeyCode::Char('+'), KeyModifiers::NONE));
+        app.mark_graph_viewport_manual();
+        let before = app.flow.to_snapshot().viewport;
+
+        terminal
+            .resize(Rect::new(0, 0, 150, 40))
+            .expect("terminal resizes");
+        app.handle_terminal_resize();
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("resized graph renders");
+        let after = app.flow.to_snapshot().viewport;
+
+        assert_eq!(app.graph_viewport_mode, GraphViewportMode::Manual);
+        assert_eq!(after.zoom, before.zoom);
+        assert_eq!((after.x, after.y), (before.x, before.y));
     }
 
     #[test]
@@ -9563,9 +10412,10 @@ actions:
         app.state.runs.push(run);
         app.active_run = Some("run".into());
         app.explorer_view = ExplorerView::Graph;
+        app.dock_inspector(Dock::Right);
         app.rebuild(true);
         app.flow.select_node("session:root");
-        let backend = TestBackend::new(80, 24);
+        let backend = TestBackend::new(71, 24);
         let mut terminal = Terminal::new(backend).expect("compact terminal");
         terminal
             .draw(|frame| render(frame, &mut app))
@@ -9593,8 +10443,9 @@ actions:
         app.active_run = Some("run".into());
         app.explorer_view = ExplorerView::Graph;
         app.output_tab = OutputTab::Activity;
+        app.dock_inspector(Dock::Right);
         app.rebuild(true);
-        let backend = TestBackend::new(80, 24);
+        let backend = TestBackend::new(71, 24);
         let mut terminal = Terminal::new(backend).expect("compact terminal");
 
         terminal
@@ -9625,7 +10476,7 @@ actions:
         app.active_run = Some("run".into());
         app.explorer_view = ExplorerView::Graph;
         app.rebuild(true);
-        let backend = TestBackend::new(80, 24);
+        let backend = TestBackend::new(120, 32);
         let mut terminal = Terminal::new(backend).expect("normal terminal");
         let (tx, _rx) = mpsc::channel();
 

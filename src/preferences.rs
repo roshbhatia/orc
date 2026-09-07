@@ -60,6 +60,8 @@ pub struct WorkspacePreferences {
     pub view: String,
     pub inspector_tab: String,
     pub inspector_dock: String,
+    pub inspector_visible: bool,
+    pub inspector_last_dock: String,
     pub inspector_percent: u16,
     pub active_run: Option<String>,
     pub selected_item: Option<String>,
@@ -67,6 +69,7 @@ pub struct WorkspacePreferences {
     pub graph_pan_x: f64,
     pub graph_pan_y: f64,
     pub graph_zoom: f64,
+    pub graph_viewport_mode: String,
     pub display_direction: String,
     pub reduced_motion: Option<bool>,
 }
@@ -74,11 +77,13 @@ pub struct WorkspacePreferences {
 impl Default for WorkspacePreferences {
     fn default() -> Self {
         Self {
-            version: "orc.preferences/v1".into(),
+            version: "orc.preferences/v2".into(),
             autonomy: AutonomyMode::Supervised,
             view: "tree".into(),
             inspector_tab: "summary".into(),
             inspector_dock: "bottom".into(),
+            inspector_visible: true,
+            inspector_last_dock: "bottom".into(),
             inspector_percent: 28,
             active_run: None,
             selected_item: None,
@@ -86,6 +91,7 @@ impl Default for WorkspacePreferences {
             graph_pan_x: 0.0,
             graph_pan_y: 0.0,
             graph_zoom: 1.0,
+            graph_viewport_mode: "fit".into(),
             display_direction: "right".into(),
             reduced_motion: None,
         }
@@ -135,5 +141,40 @@ mod tests {
         let scope = Path::new("/tmp/orc-preferences");
         assert_ne!(path(scope), state::path(scope));
         assert!(path(scope).ends_with("preferences.json"));
+    }
+
+    #[test]
+    fn preferences_are_scoped_per_directory() {
+        assert_ne!(
+            path(Path::new("/tmp/orc-project-a")),
+            path(Path::new("/tmp/orc-project-b"))
+        );
+    }
+
+    #[test]
+    fn layout_preferences_round_trip() {
+        let preferences = WorkspacePreferences {
+            inspector_tab: "output".into(),
+            inspector_dock: "hidden".into(),
+            inspector_visible: false,
+            inspector_last_dock: "left".into(),
+            inspector_percent: 55,
+            graph_pan_x: 12.0,
+            graph_pan_y: -8.0,
+            graph_zoom: 1.4,
+            graph_viewport_mode: "manual".into(),
+            ..WorkspacePreferences::default()
+        };
+
+        let encoded = serde_json::to_string(&preferences).expect("preferences serialize");
+        let restored: WorkspacePreferences =
+            serde_json::from_str(&encoded).expect("preferences deserialize");
+
+        assert_eq!(restored.inspector_tab, "output");
+        assert_eq!(restored.inspector_dock, "hidden");
+        assert!(!restored.inspector_visible);
+        assert_eq!(restored.inspector_last_dock, "left");
+        assert_eq!(restored.inspector_percent, 55);
+        assert_eq!(restored.graph_viewport_mode, "manual");
     }
 }
