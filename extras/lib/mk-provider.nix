@@ -38,6 +38,7 @@ let
       ${lib.concatMapStringsSep "\n" (test: ''
         PATH=${lib.makeBinPath providerRuntimeInputs}:$PATH \
           ORC_PROVIDER_LIB=${./provider.sh} \
+          ORC_TEST_BASH=${lib.getExe bash} \
           ${lib.getExe bash} ${test} "$check_provider"
       '') checkScripts}
     '';

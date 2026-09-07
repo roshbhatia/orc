@@ -6,7 +6,12 @@ fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
 
 fake_traces="$fixture/traces"
-printf '#!%s\n' "${BASH:?}" > "$fake_traces"
+write_fake_traces() {
+  printf '#!%s\n' "${ORC_TEST_BASH:?}" >"$fake_traces"
+  [[ $(head -n 1 "$fake_traces") == "#!$ORC_TEST_BASH" ]]
+}
+
+write_fake_traces
 cat >> "$fake_traces" << 'EOF'
 for number in $(seq 1 200); do
   printf 'activity-%03d\n' "$number"
@@ -19,7 +24,7 @@ output=$("$provider" __activity "$fake_traces" session harness 128 3)
 [[ $output == *'activity-200'* ]]
 [[ $output != *'activity-001'* ]]
 
-printf '#!%s\n' "${BASH:?}" > "$fake_traces"
+write_fake_traces
 cat >> "$fake_traces" << 'EOF'
 printf '%0200d' 1
 EOF
@@ -38,8 +43,8 @@ provider_path=$(cd -- "$(dirname -- "$provider")" && pwd)/$(basename -- "$provid
 [[ $(jq -r '.command[0]' <<< "$response") == "$provider_path" ]]
 [[ $(jq -c '.command[1:]' <<< "$response") == "[\"__messages\",\"$fake_traces\",\"native-session\",\"codex\"]" ]]
 
-cat > "$fake_traces" << 'EOF'
-#!/usr/bin/env bash
+write_fake_traces
+cat >> "$fake_traces" << 'EOF'
 set -euo pipefail
 [[ " $* " == *' --view output '* ]]
 [[ " $* " == *' --format jsonl '* ]]
@@ -57,8 +62,8 @@ output=$("$provider" __messages "$fake_traces" native-session codex)
 [[ $(jq -r '.body' <<< "$output") == finished ]]
 
 validation_request='{"version":"orc.provider/v1","capability":"provider.validate","scope":"/tmp/orc","manifest":{"requires":{"commands":["jq","tail","traces"]}}}'
-cat > "$fake_traces" << 'EOF'
-#!/usr/bin/env bash
+write_fake_traces
+cat >> "$fake_traces" << 'EOF'
 printf '%s\n' 'Usage: traces [-view tree]'
 EOF
 chmod +x "$fake_traces"
@@ -66,8 +71,8 @@ validation=$(PATH="$fixture:$PATH" "$provider" <<< "$validation_request")
 [[ $(jq -r '.status' <<< "$validation") == failed ]]
 [[ $(jq -r '.checks[] | select(.name == "contract:messages-jsonl") | .status' <<< "$validation") == failed ]]
 
-cat > "$fake_traces" << 'EOF'
-#!/usr/bin/env bash
+write_fake_traces
+cat >> "$fake_traces" << 'EOF'
 set -euo pipefail
 printf '%s\n' '{"version":"traces.message/v1","id":"validation-message","session":"orc-validation","timestamp":"not-rfc3339","body":"validation message"}'
 EOF
@@ -76,8 +81,8 @@ validation=$(PATH="$fixture:$PATH" "$provider" <<< "$validation_request")
 [[ $(jq -r '.status' <<< "$validation") == failed ]]
 [[ $(jq -r '.checks[] | select(.name == "contract:messages-jsonl") | .status' <<< "$validation") == failed ]]
 
-cat > "$fake_traces" << 'EOF'
-#!/usr/bin/env bash
+write_fake_traces
+cat >> "$fake_traces" << 'EOF'
 set -euo pipefail
 if [[ ${1:-} == --help ]]; then
   printf '%s\n' 'Usage: traces [-format string]'
@@ -90,8 +95,8 @@ validation=$(PATH="$fixture:$PATH" "$provider" <<< "$validation_request")
 [[ $(jq -r '.status' <<< "$validation") == failed ]]
 [[ $(jq -r '.checks[] | select(.name == "contract:messages-jsonl") | .status' <<< "$validation") == failed ]]
 
-cat > "$fake_traces" << 'EOF'
-#!/usr/bin/env bash
+write_fake_traces
+cat >> "$fake_traces" << 'EOF'
 set -euo pipefail
 [[ -n ${XDG_CONFIG_HOME:-} ]]
 [[ " $* " == *' --file '* ]]
