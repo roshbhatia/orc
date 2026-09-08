@@ -1,4 +1,0 @@
-schema: spec-driven
-created: 2026-09-06
-goal: Make the Orc inspector rotatable, resizable, mouse-adjustable, and stable
-  across terminal and workspace restarts
