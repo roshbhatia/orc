@@ -47,8 +47,8 @@ jobs:
         env:
           NIX_CONFIG: "access-tokens = github.com=${{ github.token }}"
         run: |
-          python3 -m unittest discover -s hack -p "test_update_flakes.py"
-          python3 "$GITHUB_WORKSPACE/hack/update-flakes.py"
+          nix shell --inputs-from . nixpkgs#uv nixpkgs#python3 -c uv run --offline --no-python-downloads --script hack/test_update_flakes.py
+          nix shell --inputs-from . nixpkgs#uv nixpkgs#python3 -c uv run --offline --no-python-downloads --script hack/update-flakes.py
 
       - name: Regenerate derived interfaces
         run: nix develop --accept-flake-config --command ./hack/generate.sh
