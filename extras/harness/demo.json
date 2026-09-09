@@ -1,0 +1,21 @@
+{
+  "name": "harness",
+  "summary": "Prepare the token parser review session",
+  "replay": false,
+  "core": "orc",
+  "nix": "github:roshbhatia/orc?dir=extras#provider-harness",
+  "brew": "orc-provider-harness",
+  "binary": "orc-provider-harness",
+  "dependencies": [
+    "bash",
+    "coreutils",
+    "jq"
+  ],
+  "libexec_assets": [
+    "lib/provider.sh"
+  ],
+  "script_environment": {
+    "ORC_PROVIDER_LIB": "lib/provider.sh"
+  },
+  "manifest_path": "share/orc/providers/harness.yaml"
+}

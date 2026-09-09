@@ -11,6 +11,9 @@ concurrency:
   group: update-sources
   cancel-in-progress: false
 
+env:
+  GH_TOKEN: ${{ github.token }}
+
 jobs:
   update:
     name: Update locks and open a pull request
@@ -44,14 +47,8 @@ jobs:
         env:
           NIX_CONFIG: "access-tokens = github.com=${{ github.token }}"
         run: |
-          while IFS= read -r flake_file; do
-            nix flake update --flake "${flake_file%/flake.nix}"
-          done < <(
-            find . \
-              \( -path './.git' -o -path './target' \) -prune -o \
-              -type f -name flake.nix -print \
-              | LC_ALL=C sort
-          )
+          python3 -m unittest discover -s hack -p "test_update_flakes.py"
+          python3 "$GITHUB_WORKSPACE/hack/update-flakes.py"
 
       - name: Regenerate derived interfaces
         run: nix develop --accept-flake-config --command ./hack/generate.sh
@@ -65,6 +62,13 @@ jobs:
           nix develop --accept-flake-config --command actionlint
           nix flake check --accept-flake-config --print-build-logs
           nix flake check --accept-flake-config --print-build-logs ./extras
+
+      - name: Refresh extra documentation
+        run: |
+          python3 hack/extra-docs.py
+          if ! python3 hack/extra-demos.py --check; then
+            nix develop --accept-flake-config -c python3 hack/extra-demos.py
+          fi
 
       - name: Create pull request
         id: cpr

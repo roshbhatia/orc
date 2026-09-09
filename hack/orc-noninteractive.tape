@@ -7,7 +7,7 @@ Set Padding 18
 Set Framerate 20
 Set TypingSpeed 25ms
 
-Type "cd examples/provider-migration"
+Type "cd $ORC_SCREENSHOT_SCOPE"
 Enter
 Sleep 500ms
 Type "orc status"
@@ -16,6 +16,6 @@ Sleep 1s
 Type "orc run list"
 Enter
 Sleep 1s
-Type "orc provider list"
+Type "go test -v ./internal/auth"
 Enter
 Sleep 2s

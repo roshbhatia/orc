@@ -1,0 +1,22 @@
+{
+  "name": "traces",
+  "summary": "Read the repair session activity",
+  "replay": false,
+  "core": "orc",
+  "nix": "github:roshbhatia/orc?dir=extras#provider-traces",
+  "brew": "orc-provider-traces",
+  "binary": "orc-provider-traces",
+  "dependencies": [
+    "bash",
+    "coreutils",
+    "jq",
+    "roshbhatia/tap/traces"
+  ],
+  "libexec_assets": [
+    "lib/provider.sh"
+  ],
+  "script_environment": {
+    "ORC_PROVIDER_LIB": "lib/provider.sh"
+  },
+  "manifest_path": "share/orc/providers/traces.yaml"
+}

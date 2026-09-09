@@ -1,0 +1,14 @@
+name: Generated documentation
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@v22
+      - run: python3 hack/extra-docs.py --check
+      - run: python3 hack/extra-demos.py --check
+      - run: python3 hack/test_update_flakes.py
+      - run: python3 -m py_compile hack/release-scripts.py

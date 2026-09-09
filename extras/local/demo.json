@@ -1,0 +1,21 @@
+{
+  "name": "local",
+  "summary": "Prepare the token parser test command",
+  "replay": false,
+  "core": "orc",
+  "nix": "github:roshbhatia/orc?dir=extras#provider-local",
+  "brew": "orc-provider-local",
+  "binary": "orc-provider-local",
+  "dependencies": [
+    "bash",
+    "coreutils",
+    "jq"
+  ],
+  "libexec_assets": [
+    "lib/provider.sh"
+  ],
+  "script_environment": {
+    "ORC_PROVIDER_LIB": "lib/provider.sh"
+  },
+  "manifest_path": "share/orc/providers/local.yaml"
+}

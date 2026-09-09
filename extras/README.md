@@ -36,3 +36,16 @@ An adapter can advertise `provider.validate` and return one or more checks for
 its own configuration and dependencies. Orc only sends this request when the
 manifest advertises it. See the root README for the request and response
 contract.
+
+<!-- BEGIN GENERATED CATALOG -->
+
+| Extra | Task | Demo |
+|---|---|---|
+| [changes](changes/README.md) | Prepare a diff inspection for the token parser repair | [Tape](changes/demo.tape) |
+| [harness](harness/README.md) | Prepare the token parser review session | [Tape](harness/demo.tape) |
+| [local](local/README.md) | Prepare the token parser test command | [Tape](local/demo.tape) |
+| [traces](traces/README.md) | Read the repair session activity | [Tape](traces/demo.tape) |
+| [wezterm](wezterm/README.md) | Preview a terminal launch for the repair task | [Tape](wezterm/demo.tape) |
+| [zmx](zmx/README.md) | Prepare a persistent repair session | [Tape](zmx/demo.tape) |
+
+<!-- END GENERATED CATALOG -->

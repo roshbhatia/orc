@@ -1,0 +1,22 @@
+{
+  "name": "changes",
+  "summary": "Prepare a diff inspection for the token parser repair",
+  "replay": false,
+  "core": "orc",
+  "nix": "github:roshbhatia/orc?dir=extras#provider-changes",
+  "brew": "orc-provider-changes",
+  "binary": "orc-provider-changes",
+  "dependencies": [
+    "bash",
+    "coreutils",
+    "jq",
+    "roshbhatia/tap/changes"
+  ],
+  "libexec_assets": [
+    "lib/provider.sh"
+  ],
+  "script_environment": {
+    "ORC_PROVIDER_LIB": "lib/provider.sh"
+  },
+  "manifest_path": "share/orc/providers/changes.yaml"
+}

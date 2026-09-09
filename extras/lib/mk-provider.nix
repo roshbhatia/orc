@@ -23,7 +23,7 @@ let
   ++ runtimeInputs;
   adapter = stdenvNoCC.mkDerivation {
     pname = "orc-provider-${name}-adapter";
-    version = "0.12.1";
+    version = (builtins.fromTOML (builtins.readFile ../../Cargo.toml)).package.version;
     dontUnpack = true;
     strictDeps = true;
 

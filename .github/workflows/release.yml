@@ -84,6 +84,8 @@ jobs:
           install -m 0644 assets/animations.yaml "$archive/share/orc/animations.yaml"
           tar -czf "dist/$archive.tar.gz" "$archive"
           (cd dist && shasum -a 256 "$archive.tar.gz" > "$archive.tar.gz.sha256")
+      - name: Package providers
+        run: python3 hack/release-scripts.py --version "${GITHUB_REF_NAME#v}" --os "${{ matrix.release_os }}" --arch "${{ matrix.release_arch }}"
       - uses: actions/upload-artifact@v7
         with:
           name: orc-${{ matrix.release_os }}-${{ matrix.release_arch }}

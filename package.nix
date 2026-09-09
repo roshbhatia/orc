@@ -11,7 +11,7 @@
 }:
 rustPlatform.buildRustPackage {
   pname = "orc";
-  version = "0.12.1";
+  version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
   src = lib.fileset.toSource {
     root = ./.;
     fileset = lib.fileset.unions [

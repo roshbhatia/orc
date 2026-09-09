@@ -49,28 +49,30 @@ export ORC_PROVIDER_DIR="$provider_dir"
 export ORC_SCREENSHOT_BIN="$screenshot_bin"
 screenshot_bin_dir=$(dirname "$ORC_SCREENSHOT_BIN")
 export PATH="$screenshot_bin_dir:$PATH"
-export ORC_SCREENSHOT_SCOPE="$repo_dir/examples/provider-migration"
+python3 "$repo_dir/hack/token-fixture.py" "$fixture/checkout-service"
+export ORC_SCREENSHOT_SCOPE="$fixture/checkout-service"
+(cd "$ORC_SCREENSHOT_SCOPE" && rg -n ValidToken internal/auth && go test -v ./internal/auth) > "$fixture/research-evidence.txt"
 
 orchestrator=$(
   "$ORC_SCREENSHOT_BIN" connect \
     --scope "$ORC_SCREENSHOT_SCOPE" \
-    --id demo-orchestrator \
-    --native-id demo-root \
+    --id token-review-owner \
+    --native-id token-review-root \
     --harness codex \
     --role orchestrator \
-    --title "Modernize the renderer" \
+    --title "Repair authorization headers" \
     --purpose "Own the workflow and verify each stage" \
-    --goal "Move the rendering pipeline behind provider contracts" \
-    --expected-output "A tested provider API and migrated renderer"
+    --goal "Reject malformed Bearer tokens before session lookup" \
+    --expected-output "A token parser repair with regression tests"
 )
 
-workflow="$fixture/provider-migration.yaml"
+workflow="$fixture/token-review.yaml"
 cat > "$workflow" << 'YAML'
 version: orc.workflow/v1
-name: renderer-provider-migration
-description: Move rendering behind provider contracts
-goal: Replace direct rendering calls with provider contracts
-expected_output: A passing migration with review evidence
+name: token-parser-repair
+description: Offline workflow fixture for a tested token parser repair
+goal: Reject empty tokens and misplaced Bearer prefixes
+expected_output: A parser repair with local test evidence
 entry_point: research
 approval:
   mode: autonomous
@@ -81,25 +83,25 @@ steps:
   - name: research
     type: set
     role: researcher
-    purpose: Find direct renderer dependencies
-    goal: List every call site and its owner
-    expected_output: A verified dependency map
+    purpose: Inspect token parsing and session lookup
+    goal: Identify the token prefix boundary
+    expected_output: Parser paths and focused test output
     value:
       mapped: true
   - name: implement
     type: agent
     role: implementer
-    purpose: Implement the provider interface
-    goal: Migrate call sites without behavior changes
-    expected_output: Passing tests and typed providers
+    purpose: Validate the Bearer prefix
+    goal: Reject malformed headers before session lookup
+    expected_output: Passing token boundary regression tests
     depends_on: [research]
     review_by: review
     completion: judge
   - name: review
     type: agent
     role: critic
-    purpose: Check behavior and contracts
-    goal: Reject incomplete provider boundaries
+    purpose: Check prefix and empty-token behavior
+    goal: Reject token parsing regressions
     expected_output: Findings or approval evidence
     routes:
       - to: implement
@@ -116,15 +118,15 @@ export ORC_SCREENSHOT_RUN=$run
 implementer=$(
   "$ORC_SCREENSHOT_BIN" connect \
     --scope "$ORC_SCREENSHOT_SCOPE" \
-    --id demo-implementer \
-    --native-id demo-implementer-native \
+    --id token-repair \
+    --native-id token-repair-native \
     --harness codex \
     --role implementer \
-    --title "Build provider boundary" \
-    --purpose "Replace direct renderer dependencies" \
-    --goal "Migrate each renderer call without changing behavior" \
-    --expected-output "Typed provider adapters and passing tests" \
-    --success "No direct renderer imports remain" \
+    --title "Repair token validation" \
+    --purpose "Replace substring matching with prefix validation" \
+    --goal "Reject misplaced prefixes and empty tokens" \
+    --expected-output "Token parser changes and regression tests" \
+    --success "Misplaced prefixes fail validation" \
     --parent "$orchestrator" \
     --run "$run" \
     --node implement \
@@ -134,15 +136,15 @@ implementer=$(
 critic=$(
   "$ORC_SCREENSHOT_BIN" connect \
     --scope "$ORC_SCREENSHOT_SCOPE" \
-    --id demo-critic \
-    --native-id demo-critic-native \
+    --id token-reviewer \
+    --native-id token-reviewer-native \
     --harness claude \
     --role critic \
-    --title "Review provider migration" \
-    --purpose "Challenge the implementation contract" \
+    --title "Review token validation" \
+    --purpose "Challenge the parser boundary" \
     --goal "Find coupling, regressions, and missing evidence" \
     --expected-output "Actionable findings or approval" \
-    --success "Every provider boundary has test evidence" \
+    --success "Every rejected header has a regression test" \
     --parent "$orchestrator" \
     --run "$run" \
     --node review \
@@ -154,11 +156,11 @@ critic=$(
   --run "$run" \
   --role researcher \
   --harness codex \
-  --title "Map rendering calls" \
-  --purpose "Find direct renderer dependencies" \
-  --goal "List every call site and its owner" \
-  --expected-output "A verified dependency map" \
-  --success "Every renderer import is classified" \
+  --title "Inspect token parser" \
+  --purpose "Inspect token parsing and session lookup" \
+  --goal "Identify the token prefix boundary" \
+  --expected-output "Parser paths and focused test output" \
+  --success "The parser and its regression tests are located" \
   --status "done" > /dev/null
 
 "$ORC_SCREENSHOT_BIN" node upsert implement \
@@ -166,11 +168,11 @@ critic=$(
   --run "$run" \
   --role implementer \
   --harness codex \
-  --title "Add provider boundary" \
-  --purpose "Implement the provider interface" \
-  --goal "Migrate call sites without behavior changes" \
-  --expected-output "Passing tests and typed providers" \
-  --success "All direct imports are removed" \
+  --title "Validate token boundary" \
+  --purpose "Validate the Bearer prefix" \
+  --goal "Reject malformed headers before session lookup" \
+  --expected-output "Passing token boundary regression tests" \
+  --success "Malformed tokens fail validation" \
   --session "$implementer" \
   --review-by review \
   --completion judge \
@@ -182,16 +184,17 @@ critic=$(
   --run "$run" \
   --role critic \
   --harness claude \
-  --title "Review migration" \
-  --purpose "Check behavior and contracts" \
-  --goal "Reject incomplete provider boundaries" \
+  --title "Review parser repair" \
+  --purpose "Check prefix and empty-token behavior" \
+  --goal "Reject token parsing regressions" \
   --expected-output "Findings or approval evidence" \
-  --success "No renderer coupling remains" \
+  --success "No malformed token reaches session lookup" \
   --session "$critic" \
   --depends-on implement \
   --status queued > /dev/null
 
-vhs hack/orc.tape --output "$repo_dir/docs/orc.gif"
+vhs examples/token-review/demo.tape --output "$repo_dir/docs/orc.gif"
+cp "$repo_dir/docs/orc.gif" "$repo_dir/examples/token-review/demo.gif"
 vhs hack/orc-noninteractive.tape --output "$repo_dir/docs/orc-noninteractive.gif"
 vhs hack/orc-loading.tape --output "$fixture/orc-loading.gif"
 ffmpeg -y \

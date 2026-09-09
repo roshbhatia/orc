@@ -1,0 +1,22 @@
+{
+  "name": "wezterm",
+  "summary": "Preview a terminal launch for the repair task",
+  "replay": false,
+  "core": "orc",
+  "nix": "github:roshbhatia/orc?dir=extras#provider-wezterm",
+  "brew": "orc-provider-wezterm",
+  "binary": "orc-provider-wezterm",
+  "dependencies": [
+    "bash",
+    "coreutils",
+    "jq"
+  ],
+  "libexec_assets": [
+    "lib/provider.sh"
+  ],
+  "script_environment": {
+    "ORC_PROVIDER_LIB": "lib/provider.sh"
+  },
+  "runtime_note": "Install WezTerm separately and start its GUI before selecting this adapter. On macOS, use `brew install --cask wezterm`.",
+  "manifest_path": "share/orc/providers/wezterm.yaml"
+}

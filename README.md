@@ -258,11 +258,11 @@ timeout. The maximum timeout is one hour. See
 Create a starter definition in the current workspace's workflow catalog:
 
 ```bash
-orc workflow init provider-migration
-orc workflow edit provider-migration
-orc workflow validate provider-migration
-orc workflow plan provider-migration
-orc workflow start provider-migration --background
+orc workflow init token-review
+orc workflow edit token-review
+orc workflow validate token-review
+orc workflow plan token-review
+orc workflow start token-review --background
 ```
 
 `validate`, `plan`, and `start` accept either a catalog name or a workflow

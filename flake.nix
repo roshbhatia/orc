@@ -85,12 +85,14 @@
       devShells = eachSystem (system: {
         default = pkgsFor.${system}.mkShellNoCC {
           packages = with pkgsFor.${system}; [
+            python3
             actionlint
             cargo
             clippy
             ffmpeg
             fish
             git
+            go
             jq
             ripgrep
             rustc
