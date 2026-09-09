@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["psutil>=7,<8"]
+# ///
 """Stop one Zmx-owned process tree without signalling reused PIDs."""
 
 from __future__ import annotations

@@ -386,6 +386,7 @@
           zmxProcessTree =
             let
               python = pkgs.python3.withPackages (packages: [ packages.psutil ]);
+              runner = pkgs.callPackage ./zmx/python.nix { };
             in
             pkgs.runCommand "orc-zmx-process-tree"
               {
@@ -403,7 +404,21 @@
                 export ORC_TEST_PYTHON=${python}/bin/python
                 export ORC_TEST_TREE_FIXTURE=${./zmx/tree_fixture.py}
                 export ORC_ZMX_PROCESS_TREE_MODULE=${./zmx/process_tree.py}
-                "$ORC_TEST_PYTHON" ${./zmx/process_tree_test.py}
+                export UV_CACHE_DIR="$TMPDIR/empty-uv-cache"
+                test ! -e "$UV_CACHE_DIR"
+                ${runner}/bin/orc-zmx-python ${./zmx/process_tree_test.py}
+                cat > rejected.py <<'PY'
+                # /// script
+                # requires-python = ">=3.10"
+                # dependencies = ["psutil==999.0.0"]
+                # ///
+                print("inline dependencies were ignored")
+                PY
+                if UV_CACHE_DIR="$TMPDIR/rejected-uv-cache" ${runner}/bin/orc-zmx-python rejected.py > rejected.log 2>&1; then
+                  echo "uv ignored an unavailable inline dependency" >&2
+                  exit 1
+                fi
+                grep -F 'psutil==999.0.0' rejected.log
                 bash ${./zmx/real_test.sh}
                 touch "$out"
               '';
