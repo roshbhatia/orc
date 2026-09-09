@@ -60,7 +60,7 @@ def main():
             'share': shared,
             'python_script': (directory / 'provider.py').is_file(),
             'checksum': 'sidecar',
-            **{key: data[key] for key in ('dependencies', 'npm_runtime', 'libexec_assets', 'script_environment', 'python_resources') if key in data},
+            **{key: data[key] for key in ('dependencies', 'npm_runtime', 'libexec_assets', 'script_environment', 'python_resources', 'python_wheels') if key in data},
         })
     write(ROOT / "package-index.json", json.dumps({"version": 1, "providers": entries, "packages": packages}, indent=2) + "\n")
     index = "| Extra | Task | Demo |\n|---|---|---|\n"
