@@ -18,5 +18,6 @@
     "ORC_PROVIDER_LIB": "lib/provider.sh"
   },
   "runtime_note": "Install WezTerm separately and start its GUI before selecting this adapter. On macOS, use `brew install --cask wezterm`.",
-  "manifest_path": "share/orc/providers/wezterm.yaml"
+  "manifest_path": "share/orc/providers/wezterm.yaml",
+  "status": "pending"
 }

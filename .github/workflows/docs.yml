@@ -8,7 +8,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: DeterminateSystems/nix-installer-action@v22
-      - run: python3 hack/extra-docs.py --check
-      - run: python3 hack/extra-demos.py --check
+      - run: nix develop -c uv run --script hack/extra-docs.py --check
+      - run: nix develop -c uv run --script hack/extra-demos.py --check
       - run: nix shell --inputs-from . nixpkgs#uv nixpkgs#python3 -c uv run --offline --no-python-downloads --script hack/test_update_flakes.py
-      - run: python3 -m py_compile hack/release-scripts.py
+      - run: nix develop -c uv run --script hack/release-scripts.py --help

@@ -86,13 +86,13 @@
         default = pkgsFor.${system}.mkShellNoCC {
           packages = with pkgsFor.${system}; [
             python3
+            uv
             actionlint
             cargo
             clippy
             ffmpeg
             fish
             git
-            go
             jq
             ripgrep
             rustc

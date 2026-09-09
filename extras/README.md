@@ -41,11 +41,11 @@ contract.
 
 | Extra | Task | Demo |
 |---|---|---|
-| [changes](changes/README.md) | Prepare a diff inspection for the token parser repair | [Tape](changes/demo.tape) |
-| [harness](harness/README.md) | Prepare the token parser review session | [Tape](harness/demo.tape) |
-| [local](local/README.md) | Prepare the token parser test command | [Tape](local/demo.tape) |
-| [traces](traces/README.md) | Read the repair session activity | [Tape](traces/demo.tape) |
-| [wezterm](wezterm/README.md) | Preview a terminal launch for the repair task | [Tape](wezterm/demo.tape) |
-| [zmx](zmx/README.md) | Prepare a persistent repair session | [Tape](zmx/demo.tape) |
+| [changes](changes/README.md) | Prepare a diff inspection for the token parser repair | Pending |
+| [harness](harness/README.md) | Prepare the token parser review session | Pending |
+| [local](local/README.md) | Prepare the token parser test command | Pending |
+| [traces](traces/README.md) | Read the repair session activity | Pending |
+| [wezterm](wezterm/README.md) | Preview a terminal launch for the repair task | Pending |
+| [zmx](zmx/README.md) | Prepare a persistent repair session | Pending |
 
 <!-- END GENERATED CATALOG -->

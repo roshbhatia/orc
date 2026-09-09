@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
-root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-cd "$root"
-exec python3 hack/demo-extra.py changes
+printf 'Live recording pending; the previous runtime simulation was withdrawn.\n' >&2
+exit 1

@@ -1,8 +1,7 @@
 # Orc
 
-![Orc workflow graph](docs/orc.png)
-
-![Orc animated workflow graph](docs/orc.gif)
+Live recording pending. The previous recording used manually populated session
+states and did not demonstrate the complete runtime workflow. It has been withdrawn.
 
 Orc is a local control plane for agent harnesses. It records agent sessions and
 executes versioned workflow graphs. External providers add harness, execution,
@@ -150,8 +149,6 @@ orc attach <orc-session-id> --direction right
 orc inspect <orc-session-id> --direction right
 orc disconnect <orc-session-id>
 ```
-
-![Orc non-interactive commands](docs/orc-noninteractive.gif)
 
 Use `orc session adopt` inside a pre-existing harness session to make it the
 new orchestrator for the current directory. Orc archives the previous active

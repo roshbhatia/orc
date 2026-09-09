@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
 import hashlib
 import json
 import pathlib
@@ -38,9 +42,12 @@ def main():
         text += "Install the core utility separately, or select its all-provider bundle. Runtime tools still need their own credentials.\n\n"
         if data.get("runtime_note"):
             text += data["runtime_note"] + "\n\n"
-        text += "## Demo\n\n![" + data["summary"] + "](demo.gif)\n\n[Tape source](demo.tape) · [Task script](demo.sh)\n\n"
-        text += "Run `nix develop -c bash extras/" + extra + "/demo.sh` to run the task without recording.\n"
-        text += "Run `nix develop -c python3 hack/extra-demos.py " + extra + "` to record it.\n"
+        if data.get("status") == "pending":
+            text += "## Demo\n\nLive recording pending. The previous recording did not demonstrate the complete runtime workflow and has been withdrawn.\n"
+        else:
+            text += "## Demo\n\n![" + data["summary"] + "](demo.gif)\n\n[Tape source](demo.tape) · [Task script](demo.sh)\n\n"
+            text += "Run `nix develop -c bash extras/" + extra + "/demo.sh` to run the task without recording.\n"
+            text += "Run `nix develop -c uv run --script hack/extra-demos.py " + extra + "` to record it.\n"
         write(directory / "README.md", text)
         entries.append(data)
         manifest = next((directory / name for name in ('provider.yaml', 'provider.json') if (directory / name).is_file()), None)
@@ -59,7 +66,8 @@ def main():
     index = "| Extra | Task | Demo |\n|---|---|---|\n"
     for entry in entries:
         name = entry["name"]
-        index += f"| [{name}]({name}/README.md) | {entry['summary']} | [Tape]({name}/demo.tape) |\n"
+        recording = "Pending" if entry.get("status") == "pending" else f"[Tape]({name}/demo.tape)"
+        index += f"| [{name}]({name}/README.md) | {entry['summary']} | {recording} |\n"
     path = ROOT / "extras/README.md"
     start = "<!-- BEGIN GENERATED CATALOG -->"
     end = "<!-- END GENERATED CATALOG -->"

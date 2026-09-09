@@ -21,7 +21,8 @@
       "script_environment": {
         "ORC_PROVIDER_LIB": "lib/provider.sh"
       },
-      "manifest_path": "share/orc/providers/changes.yaml"
+      "manifest_path": "share/orc/providers/changes.yaml",
+      "status": "pending"
     },
     {
       "name": "harness",
@@ -42,7 +43,8 @@
       "script_environment": {
         "ORC_PROVIDER_LIB": "lib/provider.sh"
       },
-      "manifest_path": "share/orc/providers/harness.yaml"
+      "manifest_path": "share/orc/providers/harness.yaml",
+      "status": "pending"
     },
     {
       "name": "local",
@@ -63,7 +65,8 @@
       "script_environment": {
         "ORC_PROVIDER_LIB": "lib/provider.sh"
       },
-      "manifest_path": "share/orc/providers/local.yaml"
+      "manifest_path": "share/orc/providers/local.yaml",
+      "status": "pending"
     },
     {
       "name": "traces",
@@ -85,7 +88,8 @@
       "script_environment": {
         "ORC_PROVIDER_LIB": "lib/provider.sh"
       },
-      "manifest_path": "share/orc/providers/traces.yaml"
+      "manifest_path": "share/orc/providers/traces.yaml",
+      "status": "pending"
     },
     {
       "name": "wezterm",
@@ -107,7 +111,8 @@
         "ORC_PROVIDER_LIB": "lib/provider.sh"
       },
       "runtime_note": "Install WezTerm separately and start its GUI before selecting this adapter. On macOS, use `brew install --cask wezterm`.",
-      "manifest_path": "share/orc/providers/wezterm.yaml"
+      "manifest_path": "share/orc/providers/wezterm.yaml",
+      "status": "pending"
     },
     {
       "name": "zmx",
@@ -138,7 +143,8 @@
           "sha256": "7be9c3eba38beccb6495ea33afd982a44074b78f28c434a1f51cc07fd315c456"
         }
       ],
-      "manifest_path": "share/orc/providers/zmx.yaml"
+      "manifest_path": "share/orc/providers/zmx.yaml",
+      "status": "pending"
     }
   ],
   "packages": [

@@ -15,9 +15,4 @@ Install WezTerm separately and start its GUI before selecting this adapter. On m
 
 ## Demo
 
-![Preview a terminal launch for the repair task](demo.gif)
-
-[Tape source](demo.tape) · [Task script](demo.sh)
-
-Run `nix develop -c bash extras/wezterm/demo.sh` to run the task without recording.
-Run `nix develop -c python3 hack/extra-demos.py wezterm` to record it.
+Live recording pending. The previous recording did not demonstrate the complete runtime workflow and has been withdrawn.

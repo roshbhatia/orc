@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
 """Build portable adapter archives from the generated package index."""
 import argparse
 import hashlib
@@ -35,7 +39,10 @@ for entry, metadata in zip(index['packages'], index['providers'], strict=True):
     files = {}
     executable = directory / 'provider.py'
     if executable.is_file():
-        files[entry['binary']] = (b'#!/usr/bin/env python3\n' + executable.read_bytes(), 0o755)
+        content = executable.read_bytes()
+        if not content.startswith(b'#!/usr/bin/env -S uv run --script\n'):
+            raise SystemExit('Python adapters must declare their uv script runtime: ' + str(executable))
+        files[entry['binary']] = (content, 0o755)
     else:
         files[entry['binary']] = ((directory / 'provider.sh').read_bytes(), 0o755)
         files['lib/provider.sh'] = ((ROOT / 'extras/lib/provider.sh').read_bytes(), 0o644)

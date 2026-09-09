@@ -18,5 +18,6 @@
   "script_environment": {
     "ORC_PROVIDER_LIB": "lib/provider.sh"
   },
-  "manifest_path": "share/orc/providers/changes.yaml"
+  "manifest_path": "share/orc/providers/changes.yaml",
+  "status": "pending"
 }

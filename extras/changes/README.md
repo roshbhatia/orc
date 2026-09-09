@@ -13,9 +13,4 @@ Install the core utility separately, or select its all-provider bundle. Runtime 
 
 ## Demo
 
-![Prepare a diff inspection for the token parser repair](demo.gif)
-
-[Tape source](demo.tape) · [Task script](demo.sh)
-
-Run `nix develop -c bash extras/changes/demo.sh` to run the task without recording.
-Run `nix develop -c python3 hack/extra-demos.py changes` to record it.
+Live recording pending. The previous recording did not demonstrate the complete runtime workflow and has been withdrawn.
