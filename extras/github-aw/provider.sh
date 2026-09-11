@@ -96,7 +96,12 @@ fi
 
 if [[ $capability == execution.logs ]]; then
   logs=$(gh run view "$run_id" --repo "$repository" --log)
-  jq -n --arg url "$run_url" --arg logs "$logs" '{version: "orc.provider/v1", status: "ok", externalRef: $url, logs: $logs}'
+  printf '%s' "$logs" | jq -Rs --arg url "$run_url" --arg repo "$repository" --arg run "$run_id" '
+    (length > 100000) as $truncated |
+    {version: "orc.provider/v1", status: "ok", externalRef: $url, truncated: $truncated,
+     logs: (if $truncated then
+       "[Earlier output omitted. Showing the last 100000 characters. Full logs: gh run view " + $run + " --repo " + $repo + " --log]\n" + .[-100000:]
+       else . end)}'
   exit 0
 fi
 

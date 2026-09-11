@@ -59,3 +59,7 @@ The recording shows these existing resources. It does not submit or approve a ne
 The agent checked the workflow source and ran `git diff --check`.
 Its runner lacked Nix and the `gh aw` extension, so it could not perform those checks.
 A successful Execution proves the remote run completed. Review the PR and its verification limits before merging.
+
+Orc returns the last 100,000 characters when a workflow log is larger.
+The response marks truncation and gives the `gh run view ... --log` command for the complete log.
+This keeps the JSON response within Orc's provider output limit.

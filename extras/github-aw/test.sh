@@ -17,7 +17,13 @@ case "$1 $2" in
   'api repos/owner/repo/actions/runs/42') jq '.workflow_runs[0]' "$AW_TEST_ROOT/runs" ;;
   'workflow run') cat > "$AW_TEST_ROOT/inputs"; echo dispatch >> "$AW_TEST_ROOT/dispatches"; exit "${AW_TEST_DISPATCH_EXIT:-0}" ;;
   'run cancel') echo cancel >> "$AW_TEST_ROOT/cancels" ;;
-  'run view') echo 'acceptance checks passed' ;;
+  'run view')
+    if [[ ${AW_TEST_LOG_BYTES:-0} -gt 0 ]]; then
+      head -c "$AW_TEST_LOG_BYTES" /dev/zero | tr '\0' x
+    else
+      echo 'acceptance checks passed'
+    fi
+    ;;
   *) exit 2 ;;
 esac
 SH
@@ -44,6 +50,9 @@ jq '.workflow_runs[0] += {status: "completed", conclusion: "cancelled"}' "$test_
 mv "$test_root/next" "$test_root/runs"
 invoke execution.observe | jq -e '.status == "Cancelled"' > /dev/null
 invoke execution.logs | jq -e '.logs == "acceptance checks passed"' > /dev/null
+export AW_TEST_LOG_BYTES=2000000
+invoke execution.logs | jq -e '.truncated and (.logs | startswith("[Earlier output omitted.")) and (.logs | endswith("xxxxx")) and (.logs | length < 101000)' > /dev/null
+unset AW_TEST_LOG_BYTES
 jq '.workflow_runs[0].conclusion = "success"' "$test_root/runs" > "$test_root/next"
 mv "$test_root/next" "$test_root/runs"
 invoke execution.observe | jq -e '.status == "Succeeded"' > /dev/null
