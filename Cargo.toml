@@ -1,6 +1,6 @@
 [package]
 name = "orc"
-version = "0.12.3"
+version = "0.12.4"
 edition = "2024"
 rust-version = "1.88"
 description = "Local control plane for agent harnesses"

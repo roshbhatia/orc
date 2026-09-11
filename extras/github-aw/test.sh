@@ -9,8 +9,8 @@ export AW_TEST_ROOT="$test_root"
 export PATH="$test_root/bin:$PATH"
 mkdir -p "$test_root/bin"
 printf '{"workflow_runs": []}\n' > "$test_root/runs"
-cat > "$test_root/bin/gh" << 'SH'
-#!/usr/bin/env bash
+printf '#!%s\n' "${ORC_TEST_BASH:-$(command -v bash)}" > "$test_root/bin/gh"
+cat >> "$test_root/bin/gh" << 'SH'
 set -euo pipefail
 case "$1 $2" in
   'api --paginate') cat "$AW_TEST_ROOT/runs" ;;
