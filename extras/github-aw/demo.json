@@ -5,6 +5,7 @@
   "core": "orc",
   "nix": "github:roshbhatia/orc?dir=extras#provider-github-aw",
   "brew": "orc-provider-github-aw",
+  "brew_pending": true,
   "binary": "orc-provider-github-aw",
   "dependencies": [
     "bash",

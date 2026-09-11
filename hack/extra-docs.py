@@ -38,7 +38,12 @@ def main():
         text = "# " + extra + "\n\n" + data["summary"] + ".\n\n"
         if data["replay"]:
             text += "The demo replays an offline response fixture. It does not contact a model or claim a new agent run.\n\n"
-        text += "## Install\n\n```sh\n" + "brew install roshbhatia/tap/" + data["brew"] + "\nnix profile add '" + data["nix"] + "'\n```\n\n"
+        text += "## Install\n\n"
+        if data.get("brew_pending"):
+            text += "Homebrew installation awaits the next release and tap update. Nix installation is available from the repository.\n\n```sh\n"
+        else:
+            text += "```sh\nbrew install roshbhatia/tap/" + data["brew"] + "\n"
+        text += "nix profile add '" + data["nix"] + "'\n```\n\n"
         text += "Install the core utility separately, or select its all-provider bundle. Runtime tools still need their own credentials.\n\n"
         if data.get("runtime_note"):
             text += data["runtime_note"] + "\n\n"

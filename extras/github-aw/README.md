@@ -4,8 +4,9 @@ Track a real factory task through GitHub Actions.
 
 ## Install
 
+Homebrew installation awaits the next release and tap update. Nix installation is available from the repository.
+
 ```sh
-brew install roshbhatia/tap/orc-provider-github-aw
 nix profile add 'github:roshbhatia/orc?dir=extras#provider-github-aw'
 ```
 
