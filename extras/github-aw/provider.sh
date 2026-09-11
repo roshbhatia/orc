@@ -96,7 +96,7 @@ fi
 
 if [[ $capability == execution.logs ]]; then
   logs=$(gh run view "$run_id" --repo "$repository" --log)
-  jq -n --arg url "$run_url" --arg logs "$logs" '{version: "orc.provider/v1", externalRef: $url, outputs: {logs: $logs}}'
+  jq -n --arg url "$run_url" --arg logs "$logs" '{version: "orc.provider/v1", status: "ok", externalRef: $url, logs: $logs}'
   exit 0
 fi
 

@@ -26,7 +26,7 @@ request='{"version":"orc.provider/v1","scope":"/tmp","resource":{"metadata":{"ui
 
 invoke() {
   jq --arg capability "$1" '. + {capability: $capability}' <<< "$request" | "$provider" |
-    jq -e 'if .version == "orc.provider/v1" then . else error("missing protocol version") end'
+    jq -e 'if .version == "orc.provider/v1" and (.status | type == "string") then . else error("invalid observation envelope") end'
 }
 
 invoke execution.ensure | jq -e '.status == "Pending"' > /dev/null
@@ -43,7 +43,7 @@ test "$(wc -l < "$test_root/cancels" | tr -d ' ')" = 1
 jq '.workflow_runs[0] += {status: "completed", conclusion: "cancelled"}' "$test_root/runs" > "$test_root/next"
 mv "$test_root/next" "$test_root/runs"
 invoke execution.observe | jq -e '.status == "Cancelled"' > /dev/null
-invoke execution.logs | jq -e '.outputs.logs == "acceptance checks passed"' > /dev/null
+invoke execution.logs | jq -e '.logs == "acceptance checks passed"' > /dev/null
 jq '.workflow_runs[0].conclusion = "success"' "$test_root/runs" > "$test_root/next"
 mv "$test_root/next" "$test_root/runs"
 invoke execution.observe | jq -e '.status == "Succeeded"' > /dev/null
