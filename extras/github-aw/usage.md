@@ -49,3 +49,13 @@ Changing a resource generation creates a new correlation identifier.
 The tape reads an existing factory Execution and its real GitHub run. Create the
 Execution first and set `ORC_FACTORY_RUN_URL` to its `externalRef`. Recording is
 pending an authenticated factory run; tests use explicit protocol fixtures.
+
+## Verified factory run
+
+On September 11, 2026, Orc observed the [factory run](https://github.com/roshbhatia/sysinit.laurel/actions/runs/34635766023) as `Succeeded`.
+GitHub created [draft PR #4](https://github.com/roshbhatia/sysinit.laurel/pull/4), changing only `docs/factory.md`.
+The recording shows these existing resources. It does not submit or approve a new task.
+
+The agent checked the workflow source and ran `git diff --check`.
+Its runner lacked Nix and the `gh aw` extension, so it could not perform those checks.
+A successful Execution proves the remote run completed. Review the PR and its verification limits before merging.
