@@ -140,6 +140,13 @@ enum Commands {
         check: bool,
     },
     #[command(hide = true)]
+    WorkerReceipt {
+        #[arg(long)]
+        receipt: PathBuf,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    #[command(hide = true)]
     ProcessMonitor {
         #[arg(long)]
         tracker_fd: i32,
@@ -948,6 +955,7 @@ pub fn run() -> Result<u8> {
                 command: DaemonCommand::Stop | DaemonCommand::Status { .. }
             }
             | Commands::ProcessMonitor { .. }
+            | Commands::WorkerReceipt { .. }
     ) {
         Config::default()
     } else {
@@ -961,6 +969,9 @@ pub fn run() -> Result<u8> {
                 require_orchestrator_or_operator(&args.scope.scope)?;
                 tui::run(config, &args.scope.scope)?;
             }
+        }
+        Commands::WorkerReceipt { receipt, command } => {
+            return provider::worker_receipt(&receipt, &command);
         }
         Commands::ProcessMonitor {
             tracker_fd,
@@ -1103,7 +1114,8 @@ pub fn run() -> Result<u8> {
         Commands::Apply(args) => {
             require_orchestrator_or_operator(&args.source.scope.scope)?;
             let resources = control_plane::load_documents(&args.source.file)?;
-            let result = control_plane::apply(
+            let result = control_plane::apply_validated(
+                &config,
                 &args.source.scope.scope,
                 resources,
                 &args.field_manager,
@@ -1116,6 +1128,9 @@ pub fn run() -> Result<u8> {
             if should_reconcile {
                 let reconciled =
                     control_plane::reconcile(&config, &args.source.scope.scope, 16, false)?;
+                if !control_plane::pending_scopes()?.is_empty() {
+                    daemon::ensure_running(&config)?;
+                }
                 if reconciled
                     .actions
                     .iter()

@@ -85,7 +85,8 @@
       devShells = eachSystem (system: {
         default = pkgsFor.${system}.mkShellNoCC {
           packages = with pkgsFor.${system}; [
-            python3
+            (python3.withPackages (packages: [ packages.psutil ]))
+            zmx
             uv
             actionlint
             cargo

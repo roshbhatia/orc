@@ -447,6 +447,13 @@ pub fn update<T>(
     Ok(result)
 }
 
+pub(crate) fn try_action_lock(target: &Path) -> Result<Option<impl Drop>> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    ClaimGuard::try_acquire(target)
+}
+
 pub(crate) fn with_path_lock<T>(target: &Path, operation: impl FnOnce() -> Result<T>) -> Result<T> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).context("create state directory")?;

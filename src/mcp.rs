@@ -151,8 +151,47 @@ fn session_report_properties() -> Value {
     json!({ "output": {} })
 }
 
+fn resource_properties() -> Value {
+    json!({"kind": {"type": "string"}, "name": {"type": "string"}})
+}
+
+fn resource_apply_properties() -> Value {
+    json!({"resources": {"type": "array", "items": {"type": "object"}},
+        "dryRun": {"type": "boolean"}})
+}
+
 fn tools() -> Value {
     const TOOLS: &[ToolDefinition] = &[
+        ToolDefinition {
+            name: "orc_resource_list",
+            description: "Read declarative resources in this scope.",
+            properties: resource_properties,
+            required: &[],
+        },
+        ToolDefinition {
+            name: "orc_resource_apply",
+            description: "Validate and apply declarative resources, then reconcile them.",
+            properties: resource_apply_properties,
+            required: &["resources"],
+        },
+        ToolDefinition {
+            name: "orc_resource_delete",
+            description: "Request cancellation and deletion of a declarative resource.",
+            properties: resource_properties,
+            required: &["kind", "name"],
+        },
+        ToolDefinition {
+            name: "orc_resource_reconcile",
+            description: "Reconcile declarative desired state with providers.",
+            properties: no_properties,
+            required: &[],
+        },
+        ToolDefinition {
+            name: "orc_resource_logs",
+            description: "Read provider logs for a declarative execution.",
+            properties: id_property,
+            required: &["id"],
+        },
         ToolDefinition {
             name: "orc_current_session",
             description: "Return this harness process' Orc session.",
@@ -380,10 +419,53 @@ fn call(name: &str, input: &Value, config: &Config) -> Result<Value> {
     let scope = state::resolve_scope(scope)?;
     let session_id = std::env::var("ORC_SESSION_ID").ok();
     let (workspace, current) = active_context(&scope, session_id.as_deref())?;
+    let workspace = crate::control_plane::project_workspace(workspace)?;
     if orchestrator_only(name) && current.role != SessionRole::Orchestrator {
         bail!("only the orchestrator can call {name}");
     }
     let value = match name {
+        "orc_resource_list" => {
+            let kind = optional(input, "kind")
+                .map(|kind| {
+                    kind.parse::<crate::control_plane::ResourceKind>()
+                        .map_err(anyhow::Error::msg)
+                })
+                .transpose()?;
+            serde_json::to_value(crate::control_plane::list(
+                &scope,
+                kind,
+                input.get("name").and_then(Value::as_str),
+            )?)?
+        }
+        "orc_resource_apply" => {
+            let resources = serde_json::from_value(input["resources"].clone())?;
+            let dry_run = input["dryRun"].as_bool().unwrap_or(false);
+            let applied = crate::control_plane::apply_validated(
+                config, &scope, resources, "orc-mcp", false, dry_run,
+            )?;
+            if dry_run {
+                serde_json::to_value(applied)?
+            } else {
+                let reconciled = crate::control_plane::reconcile(config, &scope, 16, false)?;
+                if !crate::control_plane::pending_scopes()?.is_empty() {
+                    daemon::ensure_running(config)?;
+                }
+                json!({"apply": applied, "reconcile": reconciled})
+            }
+        }
+        "orc_resource_delete" => {
+            let kind = string(input, "kind").parse().map_err(anyhow::Error::msg)?;
+            crate::control_plane::delete(&scope, kind, &string(input, "name"), false)?;
+            serde_json::to_value(crate::control_plane::reconcile(config, &scope, 16, false)?)?
+        }
+        "orc_resource_reconcile" => {
+            serde_json::to_value(crate::control_plane::reconcile(config, &scope, 16, false)?)?
+        }
+        "orc_resource_logs" => json!(crate::control_plane::logs(
+            config,
+            &scope,
+            &string(input, "id")
+        )?),
         "orc_current_session" => serde_json::to_value(current)?,
         "orc_session_list" => serde_json::to_value(workspace.sessions)?,
         "orc_run_list" => serde_json::to_value(workspace.runs)?,
@@ -580,7 +662,10 @@ fn call(name: &str, input: &Value, config: &Config) -> Result<Value> {
 fn orchestrator_only(name: &str) -> bool {
     matches!(
         name,
-        "orc_session_register"
+        "orc_resource_apply"
+            | "orc_resource_delete"
+            | "orc_resource_reconcile"
+            | "orc_session_register"
             | "orc_session_update"
             | "orc_session_keepalive"
             | "orc_session_prune"
@@ -661,7 +746,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert_eq!(catalog.len(), names.len());
-        assert_eq!(names.len(), 19);
+        assert_eq!(names.len(), 24);
         assert!(catalog.iter().all(|tool| {
             tool.pointer("/inputSchema/additionalProperties") == Some(&Value::Bool(false))
         }));
@@ -751,7 +836,7 @@ mod tests {
 
         let available = tools_for_context(Some(&scope), Some(root.id.as_str()));
 
-        assert_eq!(available.as_array().map(Vec::len), Some(19));
+        assert_eq!(available.as_array().map(Vec::len), Some(24));
         let _ = std::fs::remove_file(state::path(&scope));
     }
 

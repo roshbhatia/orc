@@ -6,6 +6,7 @@ fn command(state: &Path, scope: &Path, arguments: &[&str]) -> std::process::Outp
     Command::new(env!("CARGO_BIN_EXE_orc"))
         .env("XDG_STATE_HOME", state)
         .env("XDG_CONFIG_HOME", state.join("config"))
+        .env("ORC_DAEMON_AUTOSTART", "false")
         .env_remove("ORC_SESSION_ID")
         .args(arguments)
         .args(["--scope", scope.to_str().unwrap()])
@@ -47,6 +48,7 @@ fn command_with_provider(
         .env("XDG_STATE_HOME", state)
         .env("XDG_CONFIG_HOME", state.join("config"))
         .env("ORC_PROVIDER_DIR", providers)
+        .env("ORC_DAEMON_AUTOSTART", "false")
         .env_remove("ORC_SESSION_ID")
         .args(arguments)
         .args(["--scope", scope.to_str().unwrap()])
@@ -537,6 +539,7 @@ spec:
         .env("XDG_CONFIG_HOME", state.path().join("config"))
         .env("ORC_PROVIDER_DIR", &providers)
         .env("MARKER", &marker)
+        .env("ORC_DAEMON_AUTOSTART", "false")
         .env_remove("ORC_SESSION_ID")
         .args([
             "apply",
@@ -555,6 +558,7 @@ spec:
             .env("XDG_CONFIG_HOME", state.path().join("config"))
             .env("ORC_PROVIDER_DIR", &providers)
             .env("MARKER", &marker)
+            .env("ORC_DAEMON_AUTOSTART", "false")
             .env_remove("ORC_SESSION_ID")
             .args(["reconcile", "--scope", scope.path().to_str().unwrap()])
             .output()
@@ -579,6 +583,7 @@ spec:
         .env("XDG_STATE_HOME", state.path())
         .env("XDG_CONFIG_HOME", state.path().join("config"))
         .env("ORC_PROVIDER_DIR", &providers)
+        .env("ORC_DAEMON_AUTOSTART", "false")
         .env_remove("ORC_SESSION_ID")
         .args([
             "logs",

@@ -2143,6 +2143,20 @@ pub(crate) fn resolve_plan_from_tracked(
                 failures.join("; ")
             )
         })?);
+        if capability == Capability::SessionLaunch
+            && let Some(receipt) = request.get("completionFile").and_then(Value::as_str)
+            && let Some(plan) = plan.as_mut()
+        {
+            let mut wrapped = vec![
+                std::env::current_exe()?.to_string_lossy().into_owned(),
+                "worker-receipt".into(),
+                "--receipt".into(),
+                receipt.into(),
+                "--".into(),
+            ];
+            wrapped.append(&mut plan.command);
+            plan.command = wrapped;
+        }
     }
     let mut plan =
         plan.ok_or_else(|| anyhow!("provider chain for {} produced no command", action.name()))?;
@@ -2256,6 +2270,25 @@ pub(crate) fn run_plan_tracked(
     run_plan_tracked_cancellable(plan, scope, tracker_directory, None)
 }
 
+pub(crate) fn worker_receipt(receipt: &Path, command: &[String]) -> Result<u8> {
+    let program = command.first().context("worker command is empty")?;
+    let code = match Command::new(program).args(&command[1..]).status() {
+        Ok(status) => status.code().unwrap_or(1).clamp(0, 255) as u8,
+        Err(error) => {
+            eprintln!("start worker {program}: {error}");
+            127
+        }
+    };
+    let parent = receipt.parent().context("worker receipt has no parent")?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    writeln!(temporary, "{code}")?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(receipt)
+        .context("persist worker completion receipt")?;
+    Ok(code)
+}
+
 pub(crate) fn run_plan_tracked_cancellable(
     plan: &CommandPlan,
     scope: &Path,
@@ -2300,8 +2333,28 @@ pub(crate) fn run_plan_tracked_cancellable(
     drop(tracker_guard);
     let stdout = drain_bounded(child.stdout.take().context("command plan stdout")?);
     let stderr = drain_bounded(child.stderr.take().context("command plan stderr")?);
-    let status = child.wait()?;
+    let waited = (|| -> Result<_> {
+        loop {
+            if let Some(check) = cancelled
+                && check()?
+            {
+                bail!("command plan cancelled");
+            }
+            if let Some(status) = child.wait_timeout(Duration::from_millis(25))? {
+                return Ok(status);
+            }
+        }
+    })();
     finish_process_control(&mut tracker, &mut process_group, tracker_directory)?;
+    let status = match waited {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = child.wait();
+            discard_drain(stdout);
+            discard_drain(stderr);
+            return Err(error);
+        }
+    };
     Ok(CommandResult {
         code: status.code().unwrap_or(1),
         stdout: finish_drain(stdout)?,

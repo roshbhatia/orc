@@ -197,6 +197,8 @@ pub enum CompletionTarget {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub enum JudgePolicy {
     #[default]
+    #[serde(rename = "none")]
+    None,
     #[serde(rename = "llm")]
     Llm,
     #[serde(rename = "human")]
@@ -482,6 +484,8 @@ pub enum GateAuthority {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingGate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_attempt: Option<u32>,
     pub id: String,
     pub before: String,
     pub reason: String,

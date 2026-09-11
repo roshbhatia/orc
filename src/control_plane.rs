@@ -1056,6 +1056,66 @@ pub fn diff(scope: &Path, resources: &[Resource]) -> Result<Vec<ResourceChange>>
     Ok(changes)
 }
 
+pub fn apply_validated(
+    config: &Config,
+    scope: &Path,
+    resources: Vec<Resource>,
+    field_manager: &str,
+    force_conflicts: bool,
+    dry_run: bool,
+) -> Result<ApplyResult> {
+    let providers = provider::discover(config)?;
+    for resource in &resources {
+        validate_resource(resource)?;
+        validate_provider_selection(&providers, resource.kind, &resource.spec)?;
+        if resource.kind == ResourceKind::Workflow {
+            for stage in resource.spec["stages"].as_array().into_iter().flatten() {
+                validate_provider_selection(&providers, ResourceKind::Execution, stage)?;
+            }
+        }
+    }
+    apply(scope, resources, field_manager, force_conflicts, dry_run)
+}
+
+fn validate_provider_selection(
+    providers: &[Manifest],
+    kind: ResourceKind,
+    spec: &Value,
+) -> Result<()> {
+    let capability = match kind {
+        ResourceKind::Execution => Capability::ExecutionEnsure,
+        ResourceKind::Session => Capability::SessionObserve,
+        ResourceKind::EventBinding => Capability::EventDeliver,
+        _ => return Ok(()),
+    };
+    let selected = spec.get("provider").and_then(Value::as_str);
+    let candidates = providers
+        .iter()
+        .filter(|provider| selected.is_none_or(|name| provider.name == name))
+        .collect::<Vec<_>>();
+    if !candidates
+        .iter()
+        .any(|provider| provider.supports(capability) && provider.available_on_host())
+    {
+        bail!(
+            "no available provider {} advertises {capability}",
+            selected.unwrap_or("(automatic)")
+        );
+    }
+    if let Some(actions) = spec.get("actions").and_then(Value::as_object) {
+        for name in actions.keys() {
+            let capability: Capability = serde_json::from_value(json!(name))?;
+            if !candidates
+                .iter()
+                .any(|provider| provider.supports(capability))
+            {
+                bail!("selected provider does not advertise {capability}");
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn apply(
     scope: &Path,
     resources: Vec<Resource>,
@@ -2040,11 +2100,31 @@ fn invoke_provider(
     request: Value,
     scope: &Path,
 ) -> Result<ActionOutput> {
+    let resource: Resource = serde_json::from_value(request["resource"].clone())?;
     let invocation = provider::invoke_capability(config, providers, capability, request)?;
     let mut value = invocation.value;
     if let Some(plan) = invocation.plan {
-        let output = provider::capture_plan(&plan, scope, config.provider_timeout())?;
-        value = parse_action_observation(&output)?;
+        let started = Instant::now();
+        let cancelled = || -> Result<bool> {
+            if started.elapsed() >= config.provider_timeout() {
+                bail!("provider command timed out");
+            }
+            Ok(read_store(scope)?
+                .resource(&resource.key())
+                .is_none_or(|current| {
+                    current.metadata.uid != resource.metadata.uid
+                        || current.metadata.generation != resource.metadata.generation
+                }))
+        };
+        let output = provider::run_plan_tracked_cancellable(&plan, scope, None, Some(&cancelled))?;
+        if !plan.accepts(output.code) {
+            bail!(
+                "provider command exited with {}: {}",
+                output.code,
+                output.stderr
+            );
+        }
+        value = parse_action_observation(&output.stdout)?;
     }
     Ok(ActionOutput {
         provider: invocation.provider,
@@ -2097,7 +2177,6 @@ fn action_for(resource: &Resource) -> Option<Capability> {
         ResourceKind::Execution => match desired_state(resource) {
             "cancelled" if execution_is_terminal(resource) => None,
             "cancelled" => Some(Capability::ExecutionCancel),
-            _ if resource.status.phase == "Failed" => Some(Capability::ExecutionEnsure),
             _ if resource.status.observed_generation < resource.metadata.generation => {
                 Some(Capability::ExecutionEnsure)
             }
@@ -2233,77 +2312,91 @@ fn reconcile_with(
     mut invoke: impl FnMut(Capability, Value) -> Result<ActionOutput>,
 ) -> Result<ReconcileResult> {
     let scope = state::resolve_scope(scope)?;
-    let mut operation = |store: &mut ControlStore| {
-        let mut actions = Vec::new();
-        let mut attempted = BTreeSet::new();
-        let mut attempted_events = BTreeSet::new();
-        let mut passes = 0;
-        for pass in 0..max_passes {
-            passes = pass + 1;
+    let mut preview = read_store(&scope)?;
+    let mut actions = Vec::new();
+    let mut attempted = BTreeSet::new();
+    let mut attempted_events = BTreeSet::new();
+    let mut passes = 0;
+    for pass in 0..max_passes {
+        passes = pass + 1;
+        let prepare = |store: &mut ControlStore| -> Result<_> {
             let mut changed = reconcile_runs(store)?;
             changed |= finalize_execution_deletions(store);
-            let levels = execution_levels(store)?;
             let mut ordered = store
                 .resources
                 .values()
                 .filter(|resource| resource.kind == ResourceKind::Session)
                 .map(Resource::key)
                 .collect::<Vec<_>>();
-            ordered.extend(levels.into_iter().flatten());
-            for key in ordered {
-                let resource = store
-                    .resource(&key)
-                    .context("resource disappeared")?
-                    .clone();
-                if resource.kind == ResourceKind::Execution && !dependency_ready(store, &resource) {
-                    continue;
-                }
-                let Some(capability) = action_for(&resource) else {
-                    continue;
+            ordered.extend(execution_levels(store)?.into_iter().flatten());
+            Ok((changed, ordered))
+        };
+        let (mut changed, ordered) = if dry_run {
+            prepare(&mut preview)?
+        } else {
+            update_store(&scope, prepare)?
+        };
+        for key in ordered {
+            let store = if dry_run {
+                preview.clone()
+            } else {
+                read_store(&scope)?
+            };
+            let Some(resource) = store.resource(&key).cloned() else {
+                continue;
+            };
+            let Some(capability) = action_for(&resource) else {
+                continue;
+            };
+            if capability != Capability::ExecutionCancel
+                && resource.kind == ResourceKind::Execution
+                && !dependency_ready(&store, &resource)
+            {
+                continue;
+            }
+            if !attempted.insert((key.clone(), capability)) {
+                continue;
+            }
+            let operation_id = operation_id(&resource, capability);
+            if dry_run {
+                provider_request(&store, &scope, &resource, capability, None)?;
+                actions.push(ProviderAction {
+                    operation_id,
+                    capability,
+                    resource: key,
+                    provider: None,
+                    changed: false,
+                    error: None,
+                });
+                continue;
+            }
+            let lock_path = control_path(&scope)
+                .with_extension("")
+                .join(format!("{}-{capability}", resource.metadata.uid));
+            let Some(_claim) = state::try_action_lock(&lock_path)? else {
+                continue;
+            };
+            let current = read_store(&scope)?;
+            if current.resource(&key) != Some(&resource) {
+                continue;
+            }
+            let result = provider_request(&current, &scope, &resource, capability, None)
+                .and_then(|request| invoke(capability, request));
+            let action = update_store(&scope, |store| {
+                let Some(current) = store.resource(&key) else {
+                    return Ok(None);
                 };
-                if !attempted.insert((key.clone(), capability)) {
-                    continue;
+                if current.metadata.uid != resource.metadata.uid
+                    || current.metadata.generation != resource.metadata.generation
+                    || current.status != resource.status
+                {
+                    return Ok(None);
                 }
-                let operation_id = operation_id(&resource, capability);
-                let request = match provider_request(store, &scope, &resource, capability, None) {
-                    Ok(request) => request,
-                    Err(error) if dry_run => return Err(error),
-                    Err(error) => {
-                        let message = format!("{error:#}");
-                        let resource = store.resource_mut(&key).context("resource disappeared")?;
-                        resource.status.phase = "Failed".into();
-                        resource.status.observed_generation = resource.metadata.generation;
-                        resource.status.message = Some(message.clone());
-                        store.emit("Warning", "ReconcileFailed", key.clone(), message.clone());
-                        actions.push(ProviderAction {
-                            operation_id,
-                            capability,
-                            resource: key,
-                            provider: None,
-                            changed: true,
-                            error: Some(message),
-                        });
-                        changed = true;
-                        write_store(&scope, store)?;
-                        continue;
-                    }
-                };
-                if dry_run {
-                    actions.push(ProviderAction {
-                        operation_id,
-                        capability,
-                        resource: key,
-                        provider: None,
-                        changed: false,
-                        error: None,
-                    });
-                    continue;
-                }
-                match invoke(capability, request) {
+                let (provider, action_changed, error) = match result {
                     Ok(output) => {
                         let provider = Some(output.provider.clone());
-                        let action_changed = apply_action_output(store, &key, capability, output)?;
-                        if action_changed {
+                        let changed = apply_action_output(store, &key, capability, output)?;
+                        if changed {
                             store.emit(
                                 "Normal",
                                 "Reconciled",
@@ -2311,15 +2404,7 @@ fn reconcile_with(
                                 format!("{key} reconciled through {capability}"),
                             );
                         }
-                        changed |= action_changed;
-                        actions.push(ProviderAction {
-                            operation_id,
-                            capability,
-                            resource: key,
-                            provider,
-                            changed: action_changed,
-                            error: None,
-                        });
+                        (provider, changed, None)
                     }
                     Err(error) => {
                         let message = format!("{error:#}");
@@ -2330,53 +2415,44 @@ fn reconcile_with(
                         }
                         resource.status.message = Some(message.clone());
                         store.emit("Warning", "ReconcileFailed", key.clone(), message.clone());
-                        actions.push(ProviderAction {
-                            operation_id,
-                            capability,
-                            resource: key,
-                            provider: None,
-                            changed: true,
-                            error: Some(message),
-                        });
-                        changed = true;
+                        (None, true, Some(message))
                     }
-                }
-                write_store(&scope, store)?;
-            }
-            if !dry_run {
-                changed |= deliver_events(
-                    store,
-                    &scope,
-                    &mut invoke,
-                    &mut actions,
-                    &mut attempted_events,
-                )?;
-            }
-            if !changed || dry_run {
-                break;
+                };
+                Ok(Some(ProviderAction {
+                    operation_id,
+                    capability,
+                    resource: key,
+                    provider,
+                    changed: action_changed,
+                    error,
+                }))
+            })?;
+            if let Some(action) = action {
+                changed |= action.changed;
+                actions.push(action);
             }
         }
-        Ok(ReconcileResult {
-            dry_run,
-            passes,
-            actions,
-        })
-    };
-    if dry_run {
-        let mut store = read_store(&scope)?;
-        operation(&mut store)
-    } else {
-        update_store(&scope, operation)
+        if !dry_run {
+            changed |= deliver_events(&scope, &mut invoke, &mut actions, &mut attempted_events)?;
+        }
+        if !changed || dry_run {
+            break;
+        }
     }
+    Ok(ReconcileResult {
+        dry_run,
+        passes,
+        actions,
+    })
 }
 
 fn deliver_events(
-    store: &mut ControlStore,
     scope: &Path,
     invoke: &mut impl FnMut(Capability, Value) -> Result<ActionOutput>,
     actions: &mut Vec<ProviderAction>,
     attempted: &mut BTreeSet<(String, u64)>,
 ) -> Result<bool> {
+    let store = read_store(scope)?;
     let bindings = store
         .resources
         .values()
@@ -2396,7 +2472,7 @@ fn deliver_events(
                 continue;
             }
             let mut request = provider_request(
-                store,
+                &store,
                 scope,
                 &binding,
                 Capability::EventDeliver,
@@ -2409,55 +2485,158 @@ fn deliver_events(
             );
             request["operationId"] = Value::String(operation_id.clone());
             let key = binding.key();
-            match invoke(Capability::EventDeliver, request) {
-                Ok(output) => {
-                    let resource = store
-                        .resource_mut(&key)
-                        .context("event binding disappeared")?;
-                    resource.status.provider = Some(output.provider.clone());
-                    resource.status.phase = "Active".into();
-                    resource.status.observed_generation = resource.metadata.generation;
-                    resource.status.delivered_events.push(event.sequence);
-                    actions.push(ProviderAction {
-                        operation_id,
-                        capability: Capability::EventDeliver,
-                        resource: key,
-                        provider: Some(output.provider),
-                        changed: true,
-                        error: None,
-                    });
+            let lock_path = control_path(scope).with_extension("").join(&operation_id);
+            let Some(_claim) = state::try_action_lock(&lock_path)? else {
+                continue;
+            };
+            let latest = read_store(scope)?;
+            if latest.resource(&key).is_none_or(|current| {
+                current.metadata.uid != binding.metadata.uid
+                    || current.metadata.generation != binding.metadata.generation
+                    || current.status.delivered_events.contains(&event.sequence)
+            }) {
+                continue;
+            }
+            let result = invoke(Capability::EventDeliver, request);
+            update_store(scope, |store| {
+                if store.resource(&key).is_none_or(|current| {
+                    current.metadata.uid != binding.metadata.uid
+                        || current.metadata.generation != binding.metadata.generation
+                }) {
+                    return Ok(());
                 }
-                Err(error) => {
-                    let message = format!("{error:#}");
-                    {
+                match result {
+                    Ok(output) => {
                         let resource = store
                             .resource_mut(&key)
                             .context("event binding disappeared")?;
-                        resource.status.phase = "Failed".into();
+                        resource.status.provider = Some(output.provider.clone());
+                        resource.status.phase = "Active".into();
                         resource.status.observed_generation = resource.metadata.generation;
-                        resource.status.message = Some(message.clone());
+                        resource.status.delivered_events.push(event.sequence);
+                        actions.push(ProviderAction {
+                            operation_id,
+                            capability: Capability::EventDeliver,
+                            resource: key,
+                            provider: Some(output.provider),
+                            changed: true,
+                            error: None,
+                        });
                     }
-                    store.emit(
-                        "Warning",
-                        "EventDeliveryFailed",
-                        key.clone(),
-                        message.clone(),
-                    );
-                    actions.push(ProviderAction {
-                        operation_id,
-                        capability: Capability::EventDeliver,
-                        resource: key,
-                        provider: None,
-                        changed: true,
-                        error: Some(message),
-                    });
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        {
+                            let resource = store
+                                .resource_mut(&key)
+                                .context("event binding disappeared")?;
+                            resource.status.phase = "Failed".into();
+                            resource.status.observed_generation = resource.metadata.generation;
+                            resource.status.message = Some(message.clone());
+                        }
+                        store.emit(
+                            "Warning",
+                            "EventDeliveryFailed",
+                            key.clone(),
+                            message.clone(),
+                        );
+                        actions.push(ProviderAction {
+                            operation_id,
+                            capability: Capability::EventDeliver,
+                            resource: key,
+                            provider: None,
+                            changed: true,
+                            error: Some(message),
+                        });
+                    }
                 }
-            }
-            write_store(scope, store)?;
+                Ok(())
+            })?;
             changed = true;
         }
     }
     Ok(changed)
+}
+
+pub fn pending_scopes() -> Result<Vec<PathBuf>> {
+    let root = config::state_home().join("orc/control");
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut scopes = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let store: ControlStore = serde_json::from_slice(&fs::read(&path)?)?;
+        if store.resources.values().any(|resource| {
+            action_for(resource).is_some_and(|capability| {
+                capability == Capability::ExecutionCancel
+                    || resource.kind != ResourceKind::Execution
+                    || dependency_ready(&store, resource)
+            }) || (resource.kind == ResourceKind::Run
+                && (resource.status.phase.is_empty() || desired_state(resource) == "cancelled"))
+                || (resource.kind == ResourceKind::EventBinding
+                    && store.events.iter().any(|event| {
+                        !resource.status.delivered_events.contains(&event.sequence)
+                            && event.subject != resource.key()
+                            && event.reason != "EventDeliveryFailed"
+                            && binding_matches(resource, event)
+                    }))
+        }) {
+            scopes.push(PathBuf::from(store.scope));
+        }
+    }
+    Ok(scopes)
+}
+
+pub fn project_workspace(
+    mut workspace: crate::domain::WorkspaceState,
+) -> Result<crate::domain::WorkspaceState> {
+    let store = read_store(Path::new(&workspace.scope))?;
+    for run in store
+        .resources
+        .values()
+        .filter(|resource| resource.kind == ResourceKind::Run)
+    {
+        let nodes = store.resources.values().filter(|resource| generated_for_run(resource, &run.metadata.name)).map(|execution| {
+            json!({
+                "id": execution.metadata.name, "name": execution.metadata.name,
+                "purpose": execution.spec["purpose"].as_str().unwrap_or("Declarative execution"),
+                "role": "worker", "harness": execution.spec["provider"].as_str().unwrap_or("automatic"),
+                "execution": execution.spec["provider"], "judgePolicy": "none",
+                "goal": execution.spec["goal"].as_str().unwrap_or(""), "expectedOutput": "Provider observation",
+                "completion": "orchestrator", "status": lifecycle_phase(&execution.status.phase),
+                "attempt": u32::from(execution.status.observed_generation > 0),
+                "output": execution.status, "updatedAt": execution.metadata.updated_at
+            })
+        }).collect::<Vec<_>>();
+        let edges = store.resources.values().filter(|resource| generated_for_run(resource, &run.metadata.name)).flat_map(|execution| {
+            execution.spec["dependsOn"].as_array().into_iter().flatten().filter_map(|dependency| dependency.as_str()).map(|dependency|
+                json!({"from": dependency, "to": execution.metadata.name, "relationship": "depends_on"})).collect::<Vec<_>>()
+        }).collect::<Vec<_>>();
+        let id = format!("resource:{}", run.metadata.name);
+        workspace.runs.retain(|existing| existing.id != id);
+        workspace.runs.push(serde_json::from_value(json!({
+            "id": id, "name": run.metadata.name,
+            "goal": run.spec["goal"].as_str().unwrap_or("Declarative workflow"),
+            "expectedOutput": "Succeeded provider observations", "status": lifecycle_phase(&run.status.phase),
+            "nodes": nodes, "edges": edges, "createdAt": run.metadata.created_at, "updatedAt": run.metadata.updated_at
+        }))?);
+    }
+    Ok(workspace)
+}
+
+fn lifecycle_phase(phase: &str) -> &'static str {
+    match phase {
+        "Succeeded" => "done",
+        "Failed" => "failed",
+        "Cancelled" => "cancelled",
+        "Running" | "Active" => "working",
+        _ => "pending",
+    }
 }
 
 pub fn logs(config: &Config, scope: &Path, name: &str) -> Result<String> {
@@ -3214,8 +3393,7 @@ spec:
         })
         .unwrap();
         assert_eq!(invocations, 1);
-        assert_eq!(retry.actions.len(), 1);
-        assert!(retry.actions[0].error.is_some());
+        assert!(retry.actions.is_empty());
     }
 
     #[test]
@@ -4087,13 +4265,23 @@ spec:
                 .iter()
                 .any(|event| event.reason == "ReconcileFailed")
         );
-        let failed_operation = result
-            .actions
-            .iter()
-            .find(|action| action.capability == Capability::ExecutionEnsure)
-            .unwrap()
-            .operation_id
-            .clone();
+        let retry = reconcile_with(scope.path(), 4, false, |_, _| {
+            panic!("failed generation must not run again")
+        })
+        .unwrap();
+        assert!(retry.actions.is_empty());
+        apply(
+            scope.path(),
+            vec![resource(
+                ResourceKind::Execution,
+                "build",
+                json!({"desiredState": "running", "command": ["true"]}),
+            )],
+            "test",
+            false,
+            false,
+        )
+        .unwrap();
         let retry = reconcile_with(scope.path(), 4, false, |capability, _| {
             assert_eq!(capability, Capability::ExecutionEnsure);
             Ok(ActionOutput {
@@ -4102,7 +4290,7 @@ spec:
             })
         })
         .unwrap();
-        assert_eq!(retry.actions[0].operation_id, failed_operation);
+        assert_eq!(retry.actions.len(), 1);
         assert_eq!(
             list(scope.path(), Some(ResourceKind::Execution), Some("build")).unwrap()[0]
                 .status

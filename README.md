@@ -187,9 +187,23 @@ orc events execution release-2026-09-04-verify
 
 `apply` persists desired state, checks field ownership, and reconciles active
 resources. Use `--dry-run` to calculate changes without writes or provider
-calls. Use `--no-reconcile` to stage desired state for a later
-`orc reconcile`. `--force-conflicts` explicitly transfers changed fields from
-another field manager.
+calls. `--no-reconcile` skips this command's immediate reconciliation; an
+already running daemon can still process pending resources. `--force-conflicts`
+explicitly transfers changed fields from another field manager. Admission rejects unavailable providers before either
+dry-run or apply succeeds. Exit zero means the apply operation succeeded;
+inspect resource phases to determine whether the work succeeded.
+
+The daemon observes pending resources after apply. Provider calls run outside
+the state lock, so cancellation can interrupt an in-flight command. Dependency
+failures do not prevent cancellation. A `Failed` execution remains terminal
+for its generation; changing its specification permits another attempt.
+
+Declarative runs appear in the dashboard, `orc run list`, and MCP run queries
+as `resource:<name>`. These views read the resource store without copying it
+into workspace state. Use resource apply for edits, or run cancel for deletion.
+MCP exposes `orc_resource_list`, `orc_resource_apply`, `orc_resource_delete`,
+`orc_resource_reconcile`, and `orc_resource_logs` under the same session identity
+and orchestrator authority checks as the existing workflow tools.
 
 Workflows declare dependency-ordered stages. A `Run` references a workflow.
 Reconciliation materializes each stage as an `Execution`, processes ready
@@ -269,6 +283,19 @@ An orchestrator can also propose and start definitions through Orc's MCP tools.
 Orc validates the proposal before it commits the YAML definition. Ready nodes
 run concurrently. Each agent node chooses a harness, model, execution provider,
 and judge policy. A nested workflow node composes another definition.
+
+Managed workers write an atomic exit-code receipt. Closing a display or
+finishing a terminal attach command does not complete the worker. Runtime
+limits and cancellation remain active while Orc waits for that receipt.
+
+`judge_policy` defaults to `none`, which accepts successful execution without
+review. Explicit `llm`, `human`, and `llm+human` policies create review gates
+after execution. They require orchestrator approval, user approval, or both in
+that order. Successors wait for review. Approval completes the stage without
+running it again. Criteria are review instructions, not executable assertions;
+reviewers must inspect the output before approving. Existing definitions with
+explicit judge policies now wait for those approvals.
+
 The MCP server advertises no tools until `ORC_SCOPE` and `ORC_SESSION_ID`
 identify an active Orc session. Direct harness use remains independent of Orc.
 

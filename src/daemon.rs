@@ -414,6 +414,69 @@ fn acquire_lock(path: &Path, timeout: Duration) -> Result<File> {
     Ok(file)
 }
 
+#[derive(Default)]
+struct ResourceReconcilers {
+    children: std::collections::BTreeMap<PathBuf, std::process::Child>,
+}
+
+impl ResourceReconcilers {
+    fn tick(&mut self) -> Result<usize> {
+        let mut finished = Vec::new();
+        for (scope, child) in &mut self.children {
+            if let Some(status) = child.try_wait()? {
+                if !status.success() {
+                    append_log(&format!(
+                        "resource reconciliation failed for {}: {status}",
+                        scope.display()
+                    ))?;
+                }
+                finished.push(scope.clone());
+            }
+        }
+        for scope in finished {
+            self.children.remove(&scope);
+        }
+        let scopes = crate::control_plane::pending_scopes()?;
+        let pending = scopes.len();
+        for scope in scopes {
+            if self.children.contains_key(&scope) || self.children.len() >= 32 {
+                continue;
+            }
+            let log = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(directory().join("resources.log"))?;
+            let mut command = Command::new(std::env::current_exe()?);
+            command
+                .args(["reconcile", "--max-passes", "16", "--scope"])
+                .arg(&scope)
+                .env_remove("ORC_SESSION_ID")
+                .env_remove("ORC_SCOPE")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(log));
+            #[cfg(unix)]
+            command.process_group(0);
+            self.children.insert(scope, command.spawn()?);
+        }
+        Ok(pending + self.children.len())
+    }
+}
+
+impl Drop for ResourceReconcilers {
+    fn drop(&mut self) {
+        for child in self.children.values_mut() {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGTERM);
+            }
+            #[cfg(not(unix))]
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 pub fn run(config: &Config) -> Result<()> {
     let daemon_lock = DaemonLock::acquire()?;
     let identity = daemon_identity(config)?;
@@ -433,12 +496,22 @@ pub fn run(config: &Config) -> Result<()> {
     let _ = fs::remove_file(&stop_request);
     write_status(&status)?;
     let mut idle_since = None;
+    let mut resources = ResourceReconcilers::default();
     let mut last_failures = Vec::new();
     loop {
         if let Some(launcher) = claim_stop(&daemon_lock.token)? {
             return shutdown(daemon_lock, launcher, &stop_request);
         }
-        let report = safe_sweep(config, Utc::now());
+        let mut report = safe_sweep(config, Utc::now());
+        match resources.tick() {
+            Ok(pending) => report.monitored += pending,
+            Err(error) => {
+                report.unreadable += 1;
+                report
+                    .failures
+                    .push(format!("reconcile declarative resources: {error:#}"));
+            }
+        }
         status.last_sweep_at = Some(Utc::now());
         write_status(&status)?;
         if report.failures != last_failures {
@@ -453,7 +526,7 @@ pub fn run(config: &Config) -> Result<()> {
                 && since.elapsed() >= Duration::from_secs(config.daemon.idle_shutdown_seconds)
             {
                 let launcher = acquire_blocking_lock(&launcher_lock_path())?;
-                if report_is_idle(&safe_sweep(config, Utc::now())) {
+                if report_is_idle(&safe_sweep(config, Utc::now())) && resources.tick()? == 0 {
                     return shutdown(daemon_lock, launcher, &stop_request);
                 }
                 drop(launcher);

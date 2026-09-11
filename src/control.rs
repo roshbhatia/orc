@@ -153,7 +153,7 @@ pub fn inferred_session_id(harness: &str, native_id: &str) -> String {
 
 pub fn read_workspace(scope: &Path) -> Result<WorkspaceState> {
     let scope = state::resolve_scope(scope)?;
-    state::read(&scope)
+    crate::control_plane::project_workspace(state::read(&scope)?)
 }
 
 pub fn doctor(config: &Config, scope: &Path, repair: bool) -> Result<DoctorReport> {
@@ -1998,7 +1998,7 @@ pub fn upsert_node(scope: &Path, run_id: &str, spec: NodeSpec) -> Result<Workflo
             .unwrap_or(0);
         let judge_policy = judge_policy
             .or_else(|| current.as_ref().map(|node| node.judge_policy))
-            .unwrap_or(JudgePolicy::Llm);
+            .unwrap_or_default();
         if !status.valid_for(LifecycleSubject::Node) {
             bail!("invalid node lifecycle state: {status}");
         }
@@ -5917,7 +5917,7 @@ printf '%s\n' '{"version":"orc.provider/v1","command":["true"]}'
 
         assert_eq!(node.status, LifecycleStatus::Queued);
         assert_eq!(node.attempt, 0);
-        assert_eq!(node.judge_policy, JudgePolicy::Llm);
+        assert_eq!(node.judge_policy, JudgePolicy::None);
         let _ = std::fs::remove_file(state::path(&scope));
     }
 

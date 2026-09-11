@@ -1439,6 +1439,7 @@ impl App {
         self.rebind_current_pending = false;
         thread::spawn(move || {
             let result = control::reconcile_with_current(&config, &scope, rebind_current)
+                .and_then(crate::control_plane::project_workspace)
                 .map_err(|error| format!("{error:#}"));
             let _ = tx.send(BackgroundResult::Enrichment {
                 generation,
@@ -6828,6 +6829,13 @@ pub fn run(config: Config, scope: &Path) -> Result<()> {
             None
         }
     };
+    let _resource_watcher = watch_state_path(
+        &crate::config::state_home()
+            .join("orc/control")
+            .join(format!("{}.json", crate::state::scope_key(&app.scope))),
+        tx.clone(),
+    )
+    .ok();
     app.request_refresh(&tx);
     app.request_provider_refresh(&tx);
     let mut last_tick = Instant::now();
@@ -8539,6 +8547,7 @@ mod tests {
         let mut app = app();
         let mut run = workflow_run();
         run.pending_gates.push(crate::domain::PendingGate {
+            review_attempt: None,
             id: "ship".into(),
             before: "release".into(),
             reason: "approval required".into(),
@@ -9236,6 +9245,7 @@ actions:
         node.judge_policy = JudgePolicy::LlmAndHuman;
         run.nodes.push(node);
         run.pending_gates.push(crate::domain::PendingGate {
+            review_attempt: None,
             id: "approve".into(),
             before: "implement".into(),
             reason: "Review the migration boundary".into(),
@@ -9285,6 +9295,7 @@ actions:
         node.success_criteria = (0..24).map(|index| format!("criterion {index}")).collect();
         run.nodes.push(node);
         run.pending_gates.push(crate::domain::PendingGate {
+            review_attempt: None,
             id: "approve".into(),
             before: "implement".into(),
             reason: "Review the migration boundary".into(),

@@ -66,6 +66,7 @@
     },
     "JudgePolicy": {
       "enum": [
+        "none",
         "llm",
         "human",
         "llm+human"
@@ -111,6 +112,14 @@
         "recommendation": {
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "reviewAttempt": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
             "null"
           ]
         }
@@ -573,7 +582,7 @@
         },
         "judgePolicy": {
           "$ref": "#/$defs/JudgePolicy",
-          "default": "llm"
+          "default": "none"
         },
         "model": {
           "type": [

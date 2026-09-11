@@ -5,6 +5,8 @@
   lib,
   makeWrapper,
   procps,
+  python3,
+  zmx,
   rustPlatform,
   stdenv,
   unixtools,
@@ -20,6 +22,9 @@ rustPlatform.buildRustPackage {
       ./assets
       ./extras/lib/provider.sh
       ./extras/local/provider.sh
+      ./extras/harness/provider.sh
+      ./extras/zmx/provider.sh
+      ./extras/zmx/process_tree.py
       ./src
       ./templates
       ./tests
@@ -45,6 +50,8 @@ rustPlatform.buildRustPackage {
   nativeCheckInputs = [
     git
     jq
+    (python3.withPackages (packages: [ packages.psutil ]))
+    zmx
   ]
   ++ lib.optionals stdenv.hostPlatform.isDarwin [ unixtools.ps ]
   ++ lib.optionals stdenv.hostPlatform.isLinux [ procps ];

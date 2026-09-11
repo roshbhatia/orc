@@ -173,7 +173,7 @@ impl Default for Step {
             expected_output: "A verified result".into(),
             success_criteria: Vec::new(),
             completion: CompletionTarget::Orchestrator,
-            judge_policy: JudgePolicy::Llm,
+            judge_policy: JudgePolicy::None,
             review_by: None,
             runtime: Runtime::default(),
             prompt: None,
@@ -1463,6 +1463,7 @@ fn required_gate(definition: &Definition, step: &Step, run: &WorkflowRun) -> Opt
         return None;
     }
     Some(PendingGate {
+        review_attempt: None,
         id,
         before: step.name.clone(),
         reason: explicit.map_or_else(
@@ -2579,9 +2580,38 @@ Success criteria:
                 request["providers"][provider::Capability::ExecutionRun.to_string()] =
                     serde_json::Value::String(execution.clone());
             }
+            fs::create_dir_all(tracker_directory)?;
+            let completion = tempfile::tempdir_in(tracker_directory)?;
+            let receipt = completion.path().join("exit-code");
+            request["completionFile"] = json!(receipt);
+            let started = Instant::now();
             let launched: Result<_> = (|| {
                 daemon::ensure_running(config)?;
-                let cancelled = || run_cancelled(scope, &run.id, context.workflow_deadline);
+                let cancelled = || -> Result<bool> {
+                    if run_cancelled(scope, &run.id, context.workflow_deadline)? {
+                        return Ok(true);
+                    }
+                    let runtime = step
+                        .timeout_seconds
+                        .unwrap_or(config.lifecycle.runtime_timeout_seconds);
+                    if runtime > 0 && started.elapsed() >= Duration::from_secs(runtime) {
+                        bail!("managed worker runtime limit exceeded");
+                    }
+                    let current = state::read(scope)?;
+                    Ok(current
+                        .sessions
+                        .iter()
+                        .find(|item| item.id == session.id)
+                        .is_none_or(|item| {
+                            matches!(
+                                item.status,
+                                LifecycleStatus::Failed
+                                    | LifecycleStatus::Cancelled
+                                    | LifecycleStatus::Terminating
+                                    | LifecycleStatus::Archived
+                            )
+                        }))
+                };
                 let plan = provider::resolve_plan_tracked(
                     config,
                     providers,
@@ -2590,12 +2620,37 @@ Success criteria:
                     tracker_directory,
                     &cancelled,
                 )?;
-                let result = provider::run_plan_tracked_cancellable(
+                let mut result = provider::run_plan_tracked_cancellable(
                     &plan,
                     scope,
                     Some(tracker_directory),
                     Some(&cancelled),
                 )?;
+                if !plan.accepts(result.code) {
+                    bail!(
+                        "managed launch exited with {}: {}",
+                        result.code,
+                        result.stderr.trim()
+                    );
+                }
+                loop {
+                    if cancelled()? {
+                        bail!("managed worker cancelled");
+                    }
+                    match fs::read_to_string(&receipt) {
+                        Ok(code) => {
+                            result.code = code
+                                .trim()
+                                .parse()
+                                .context("invalid worker completion receipt")?;
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            thread::sleep(Duration::from_millis(25));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
                 Ok((plan, result))
             })();
             let (plan, result) = match launched {
@@ -2848,6 +2903,14 @@ pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRu
 
 #[cfg(not(test))]
 pub fn execute(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRun> {
+    if run_id.starts_with("resource:") {
+        crate::control_plane::reconcile(config, scope, 16, false)?;
+        return control::read_workspace(scope)?
+            .runs
+            .into_iter()
+            .find(|run| run.id == run_id)
+            .with_context(|| format!("unknown declarative run: {run_id}"));
+    }
     if std::env::var_os(EXECUTION_LEASE_ENV).is_some() {
         return execute_owned(config, scope, run_id);
     }
@@ -3275,16 +3338,45 @@ fn execute_owned(config: &Config, scope: &Path, run_id: &str) -> Result<Workflow
                 match result {
                     Ok(outcome) => {
                         node.status = outcome.status;
+                        if outcome.status == LifecycleStatus::Done
+                            && step.judge_policy != JudgePolicy::None
+                        {
+                            node.status = LifecycleStatus::Waiting;
+                            let authority = match step.judge_policy {
+                                JudgePolicy::Human => GateAuthority::User,
+                                JudgePolicy::LlmAndHuman => GateAuthority::OrchestratorThenUser,
+                                JudgePolicy::Llm => GateAuthority::Orchestrator,
+                                JudgePolicy::None => unreachable!(),
+                            };
+                            run.pending_gates.push(PendingGate {
+                                review_attempt: Some(node.attempt),
+                                id: format!("review:{}:{}", step.name, node.attempt),
+                                before: step.name.clone(),
+                                reason: format!(
+                                    "Review {} output against its success criteria",
+                                    step.name
+                                ),
+                                authority,
+                                recommendation: None,
+                                created_at: Utc::now(),
+                            });
+                        }
                         node.retry_after = None;
                         node.output = Some(outcome.output.clone());
                         node.session_id.clone_from(&outcome.session_id);
                         node.record_activity(
-                            if outcome.status == LifecycleStatus::Waiting {
+                            if node.status == LifecycleStatus::Waiting {
                                 "waiting"
                             } else {
                                 "completed"
                             },
-                            outcome.summary.clone(),
+                            if node.status == LifecycleStatus::Waiting
+                                && outcome.status == LifecycleStatus::Done
+                            {
+                                "execution completed; review required".into()
+                            } else {
+                                outcome.summary.clone()
+                            },
                         );
                     }
                     Err(error) if node.attempt <= step.retry.attempts => {
@@ -4125,6 +4217,15 @@ pub fn approve_as(
             .position(|gate| gate_id.is_none_or(|id| gate.id == id))
             .context("run has no matching pending gate")?;
         let gate = run.pending_gates[index].clone();
+        if let Some(attempt) = gate.review_attempt
+            && !run.nodes.iter().any(|node| {
+                node.id == gate.before
+                    && node.attempt == attempt
+                    && node.status == LifecycleStatus::Waiting
+            })
+        {
+            bail!("review gate no longer matches the completed stage attempt");
+        }
         let approval_key = gate_approval_key(&gate.id, run.revision.as_deref());
         let orchestrator_key = format!("{approval_key}:orchestrator");
         let completed = match (gate.authority, actor) {
@@ -4165,7 +4266,11 @@ pub fn approve_as(
         run.pending_gates.remove(index);
         run.approved_gates.push(approval_key);
         if let Some(node) = run.nodes.iter_mut().find(|node| node.id == gate.before) {
-            node.status = LifecycleStatus::Queued;
+            node.status = if gate.review_attempt == Some(node.attempt) {
+                LifecycleStatus::Done
+            } else {
+                LifecycleStatus::Queued
+            };
             node.record_activity("approved", "gate approved");
         }
         run.status = LifecycleStatus::Queued;
@@ -4181,6 +4286,23 @@ pub fn approve_as(
 
 pub fn cancel(config: &Config, scope: &Path, run_id: &str) -> Result<WorkflowRun> {
     let scope = state::resolve_scope(scope)?;
+    if let Some(name) = run_id.strip_prefix("resource:") {
+        let mut run = control::read_workspace(&scope)?
+            .runs
+            .into_iter()
+            .find(|run| run.id == run_id)
+            .with_context(|| format!("unknown declarative run: {run_id}"))?;
+        crate::control_plane::delete(&scope, crate::control_plane::ResourceKind::Run, name, false)?;
+        crate::control_plane::reconcile(config, &scope, 16, false)?;
+        run.status =
+            if crate::control_plane::exists(&scope, crate::control_plane::ResourceKind::Run, name)?
+            {
+                LifecycleStatus::Terminating
+            } else {
+                LifecycleStatus::Cancelled
+            };
+        return Ok(run);
+    }
     let initial = find_run(&scope, run_id)?;
     if !initial.status.active() {
         return Ok(initial);
@@ -6037,6 +6159,7 @@ actions:
                 .find(|candidate| candidate.id == run.id)
                 .expect("run");
             run.pending_gates.push(PendingGate {
+                review_attempt: None,
                 id: "before-wait".into(),
                 before: "wait".into(),
                 reason: "review wait".into(),
@@ -6092,6 +6215,7 @@ actions:
                 .find(|candidate| candidate.id == run.id)
                 .expect("run");
             run.pending_gates.push(PendingGate {
+                review_attempt: None,
                 id: "before-second".into(),
                 before: "second".into(),
                 reason: "review dependency".into(),
@@ -6206,6 +6330,7 @@ actions:
             run.status = LifecycleStatus::Waiting;
             run.nodes[0].status = LifecycleStatus::Waiting;
             run.pending_gates.push(PendingGate {
+                review_attempt: None,
                 id: "old-gate".into(),
                 before: "wait".into(),
                 reason: "old workflow approval".into(),
@@ -6554,6 +6679,7 @@ actions:
             run.status = LifecycleStatus::Waiting;
             run.nodes[0].status = LifecycleStatus::Waiting;
             run.pending_gates.push(PendingGate {
+                review_attempt: None,
                 id: "user-only".into(),
                 before: "wait".into(),
                 reason: "user decision".into(),
@@ -6594,6 +6720,7 @@ actions:
             run.status = LifecycleStatus::Waiting;
             run.nodes[0].status = LifecycleStatus::Waiting;
             run.pending_gates.push(PendingGate {
+                review_attempt: None,
                 id: "dual".into(),
                 before: "wait".into(),
                 reason: "two approvals".into(),
@@ -7182,6 +7309,7 @@ steps:
                 .expect("run");
             run.status = LifecycleStatus::Failed;
             run.pending_gates.push(PendingGate {
+                review_attempt: None,
                 id: "stale-approval".into(),
                 before: "wait".into(),
                 reason: "stale gate".into(),
@@ -7354,6 +7482,7 @@ steps:
             run.current_node = Some("wait".into());
             run.nodes[0].status = LifecycleStatus::Working;
             run.pending_gates.push(PendingGate {
+                review_attempt: None,
                 id: "approval".into(),
                 before: "wait".into(),
                 reason: "test".into(),

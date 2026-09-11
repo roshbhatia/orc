@@ -95,6 +95,7 @@
     },
     "JudgePolicy": {
       "enum": [
+        "none",
         "llm",
         "human",
         "llm+human"
@@ -322,7 +323,7 @@
         },
         "judge_policy": {
           "$ref": "#/$defs/JudgePolicy",
-          "default": "llm"
+          "default": "none"
         },
         "maxDepth": {
           "default": null,

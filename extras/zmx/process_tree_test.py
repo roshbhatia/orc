@@ -115,7 +115,7 @@ class StopTreeTest(unittest.TestCase):
                         self.child.pid,
                         self.created,
                         self.identity,
-                        0.5,
+                        5.0,
                     )
         time.sleep(0.05)
         self.assertTrue(self.process.is_running())
