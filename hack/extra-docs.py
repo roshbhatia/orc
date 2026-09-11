@@ -43,7 +43,8 @@ def main():
         if data.get("runtime_note"):
             text += data["runtime_note"] + "\n\n"
         if data.get("status") == "pending":
-            text += "## Demo\n\nLive recording pending. The previous recording did not demonstrate the complete runtime workflow and has been withdrawn.\n"
+            pending_note = data.get("pending_note", "Live recording pending. The previous recording did not demonstrate the complete runtime workflow and has been withdrawn.")
+            text += "## Demo\n\n" + pending_note + "\n"
         else:
             text += "## Demo\n\n![" + data["summary"] + "](demo.gif)\n\n[Tape source](demo.tape) · [Task script](demo.sh)\n\n"
             text += "Run `nix develop -c bash extras/" + extra + "/demo.sh` to run the task without recording.\n"

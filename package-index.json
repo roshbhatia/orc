@@ -25,6 +25,31 @@
       "status": "pending"
     },
     {
+      "name": "github-aw",
+      "summary": "Track a real factory task through GitHub Actions",
+      "replay": false,
+      "core": "orc",
+      "nix": "github:roshbhatia/orc?dir=extras#provider-github-aw",
+      "brew": "orc-provider-github-aw",
+      "binary": "orc-provider-github-aw",
+      "dependencies": [
+        "bash",
+        "coreutils",
+        "gh",
+        "jq"
+      ],
+      "libexec_assets": [
+        "lib/provider.sh"
+      ],
+      "script_environment": {
+        "ORC_PROVIDER_LIB": "lib/provider.sh"
+      },
+      "manifest_path": "share/orc/providers/github-aw.yaml",
+      "status": "pending",
+      "pending_note": "The first live recording requires an authenticated factory run. [Tape source](demo.tape) and [task script](demo.sh) are available.",
+      "runtime_note": "See [usage and dispatch receipts](usage.md). The first live recording requires an authenticated factory run."
+    },
+    {
       "name": "harness",
       "summary": "Prepare the token parser review session",
       "replay": false,
@@ -173,6 +198,30 @@
         "coreutils",
         "jq",
         "roshbhatia/tap/changes"
+      ],
+      "libexec_assets": [
+        "lib/provider.sh"
+      ],
+      "script_environment": {
+        "ORC_PROVIDER_LIB": "lib/provider.sh"
+      }
+    },
+    {
+      "name": "orc-provider-github-aw",
+      "kind": "provider",
+      "binary": "orc-provider-github-aw",
+      "description": "Track a real factory task through GitHub Actions",
+      "archive": "orc_provider_github-aw_%{version}_%{os}_%{arch}.tar.gz",
+      "share": [
+        "share/orc/providers/github-aw.yaml"
+      ],
+      "python_script": false,
+      "checksum": "sidecar",
+      "dependencies": [
+        "bash",
+        "coreutils",
+        "gh",
+        "jq"
       ],
       "libexec_assets": [
         "lib/provider.sh"

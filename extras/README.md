@@ -42,6 +42,7 @@ contract.
 | Extra | Task | Demo |
 |---|---|---|
 | [changes](changes/README.md) | Prepare a diff inspection for the token parser repair | Pending |
+| [github-aw](github-aw/README.md) | Track a real factory task through GitHub Actions | Pending |
 | [harness](harness/README.md) | Prepare the token parser review session | Pending |
 | [local](local/README.md) | Prepare the token parser test command | Pending |
 | [traces](traces/README.md) | Read the repair session activity | Pending |

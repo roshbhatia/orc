@@ -1,0 +1,14 @@
+version: orc.provider/v1
+name: github-aw
+description: Run GitHub Agentic Workflows and observe their Actions results
+kind: execution
+command: orc-provider-github-aw
+actions:
+  provider.validate: Validate GitHub CLI availability
+  execution.ensure: Dispatch a workflow once from this control plane
+  execution.observe: Read the correlated workflow run
+  execution.cancel: Request cancellation of the correlated workflow run
+  execution.logs: Read the correlated workflow logs
+requires:
+  commands: [gh, jq]
+priority: 0
