@@ -25,7 +25,8 @@ chmod +x "$test_root/bin/gh"
 request='{"version":"orc.provider/v1","scope":"/tmp","resource":{"metadata":{"uid":"factory-test","generation":1},"spec":{"repository":"owner/repo","workflow":"factory.lock.yml","ref":"main","inputs":{"task":"Fix README links"}}}}'
 
 invoke() {
-  jq --arg capability "$1" '. + {capability: $capability}' <<< "$request" | "$provider"
+  jq --arg capability "$1" '. + {capability: $capability}' <<< "$request" | "$provider" |
+    jq -e 'if .version == "orc.provider/v1" then . else error("missing protocol version") end'
 }
 
 invoke execution.ensure | jq -e '.status == "Pending"' > /dev/null

@@ -45,7 +45,7 @@ mkdir -p "$(dirname -- "$receipt")"
 
 emit_pending() {
   jq -n --arg message "$1" --arg ref "github-aw:${correlation}" \
-    '{status: "Pending", externalRef: $ref, message: $message}'
+    '{version: "orc.provider/v1", status: "Pending", externalRef: $ref, message: $message}'
 }
 
 find_run() {
@@ -90,17 +90,18 @@ if [[ -f $receipt/cancel && $run_status != completed ]]; then
     gh run cancel "$run_id" --repo "$repository" >&2
     touch "$receipt/cancel-sent"
   fi
-  jq -n --arg url "$run_url" '{status: "Running", externalRef: $url, message: "Cancellation requested; awaiting GitHub confirmation."}'
+  jq -n --arg url "$run_url" '{version: "orc.provider/v1", status: "Running", externalRef: $url, message: "Cancellation requested; awaiting GitHub confirmation."}'
   exit 0
 fi
 
 if [[ $capability == execution.logs ]]; then
   logs=$(gh run view "$run_id" --repo "$repository" --log)
-  jq -n --arg url "$run_url" --arg logs "$logs" '{externalRef: $url, outputs: {logs: $logs}}'
+  jq -n --arg url "$run_url" --arg logs "$logs" '{version: "orc.provider/v1", externalRef: $url, outputs: {logs: $logs}}'
   exit 0
 fi
 
 jq -n --argjson run "$run" '{
+  version: "orc.provider/v1",
   status: (if $run.status != "completed" then "Running"
     elif $run.conclusion == "success" then "Succeeded"
     elif $run.conclusion == "cancelled" then "Cancelled" else "Failed" end),
