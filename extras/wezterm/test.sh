@@ -198,7 +198,7 @@ jq -e '
   and .binding.label == "WezTerm pane 88"
 ' <<< "$open_receipt" > /dev/null
 
-printf '\n' | bash "$provider_script" hold true > "$test_scope/short-success.txt"
+bash "$provider_script" hold true <<< '' > "$test_scope/short-success.txt"
 grep -Fq 'Command exited with 0. Press Enter to close.' \
   "$test_scope/short-success.txt"
 
@@ -250,7 +250,7 @@ expect "$expect_script" "$provider_script" run 0 0.1 "$real_sleep"
 expect "$expect_script" "$provider_script" run 19 0.1 "$real_sleep"
 
 set +e
-printf '\n' | bash "$provider_script" hold false > "$test_scope/failure.txt"
+bash "$provider_script" hold false <<< '' > "$test_scope/failure.txt"
 failure_code=$?
 set -e
 test "$failure_code" -eq 1
